@@ -1,0 +1,8 @@
+[
+  {
+    "name": "Certbot + Cloudflare DNS",
+    "file": "certbot-cloudflare-setup.sh",
+    "description": "Set up Let's Encrypt certificates via Cloudflare DNS-01. No inbound ports required.",
+    "requires_root": true
+  }
+]
