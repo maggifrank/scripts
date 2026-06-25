@@ -8,13 +8,25 @@
   {
     "name": "Ubuntu Server Hardening",
     "file": "ubuntu-server-hardening.sh",
-    "description": "Apply security best practices to a fresh Ubuntu Server install.",
+    "description": "Apply security best practices to a fresh Ubuntu Server install (VM or bare metal).",
+    "requires_root": true
+  },
+  {
+    "name": "LXC Container Hardening",
+    "file": "lxc-hardening.sh",
+    "description": "Lightweight hardening for Ubuntu/Debian LXC containers. Skips kernel and firewall changes.",
     "requires_root": true
   },
   {
     "name": "BIND9 Local DNS + Forwarder",
     "file": "bind9-setup.sh",
     "description": "Install and configure BIND9 as a local DNS server with upstream forwarder and split-horizon.",
+    "requires_root": true
+  },
+  {
+    "name": "Create Proxmox LXC",
+    "file": "create-lxc.sh",
+    "description": "Interactively create a Proxmox LXC container. Must be run on the Proxmox host.",
     "requires_root": true
   }
 ]
