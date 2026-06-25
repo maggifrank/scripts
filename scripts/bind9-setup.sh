@@ -43,28 +43,84 @@ while true; do
   warn "Invalid domain format. Try again."
 done
 
-# Server IP (this machine)
-while true; do
-  read -rp "IP address of this DNS server (e.g. 10.0.0.53): " SERVER_IP
-  if [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-    break
+# Server IP — collect all non-loopback IPs and let user pick
+mapfile -t ALL_IPS < <(ip -o -f inet addr show | awk '{print $4}' | grep -v '^127\.' | cut -d'/' -f1)
+
+if [ "${#ALL_IPS[@]}" -eq 0 ]; then
+  warn "Could not detect any IP addresses."
+  while true; do
+    read -rp "Enter server IP manually (e.g. 10.0.0.53): " SERVER_IP
+    [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+    warn "Invalid IP address. Try again."
+  done
+elif [ "${#ALL_IPS[@]}" -eq 1 ]; then
+  SERVER_IP="${ALL_IPS[0]}"
+  info "Detected server IP: ${SERVER_IP}"
+  read -rp "Use ${SERVER_IP}? [Y/n]: " IP_CONFIRM
+  if [ "${IP_CONFIRM,,}" = "n" ]; then
+    while true; do
+      read -rp "Enter server IP manually: " SERVER_IP
+      [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+      warn "Invalid IP address. Try again."
+    done
   fi
-  warn "Invalid IP address. Try again."
-done
+else
+  info "Multiple IP addresses detected:"
+  for i in "${!ALL_IPS[@]}"; do
+    echo -e "  ${CYAN}$((i+1)))${NC} ${ALL_IPS[$i]}"
+  done
+  echo -e "  ${CYAN}$((${#ALL_IPS[@]}+1)))${NC} Enter manually"
+  echo ""
+  while true; do
+    read -rp "Select IP to use [1-$((${#ALL_IPS[@]}+1))]: " IPCHOICE
+    if [[ "$IPCHOICE" =~ ^[0-9]+$ ]] && [ "$IPCHOICE" -ge 1 ] && [ "$IPCHOICE" -le "${#ALL_IPS[@]}" ]; then
+      SERVER_IP="${ALL_IPS[$((IPCHOICE-1))]}"
+      break
+    elif [ "$IPCHOICE" -eq "$((${#ALL_IPS[@]}+1))" ]; then
+      while true; do
+        read -rp "Enter server IP manually: " SERVER_IP
+        [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
+        warn "Invalid IP address. Try again."
+      done
+      break
+    fi
+    warn "Invalid selection."
+  done
+fi
+info "Using server IP: ${SERVER_IP}"
 
 # Derive reverse zone from IP (e.g. 10.0.0.x → 0.0.10.in-addr.arpa)
 IFS='.' read -r oct1 oct2 oct3 oct4 <<< "$SERVER_IP"
 REVERSE_ZONE="${oct3}.${oct2}.${oct1}.in-addr.arpa"
 NETWORK_PREFIX="${oct1}.${oct2}.${oct3}"
 
-# Subnet allowed to query this server
-while true; do
-  read -rp "Local subnet to allow queries from (e.g. 10.0.0.0/24): " LOCAL_SUBNET
-  if [[ "$LOCAL_SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-    break
+# Subnet allowed to query this server (auto-detect)
+DETECTED_SUBNET=$(ip -o -f inet addr show | awk -v ip="$SERVER_IP" '$4 ~ ip {print $4}' | head -1 | sed 's|/[0-9]*||')
+DETECTED_PREFIX=$(ip -o -f inet addr show | awk -v ip="$SERVER_IP" '$4 ~ ip {print $4}' | head -1 | cut -d'/' -f2)
+
+if [[ -n "$DETECTED_SUBNET" && -n "$DETECTED_PREFIX" ]]; then
+  # Build network address from IP + prefix
+  DETECTED_NETWORK="${oct1}.${oct2}.${oct3}.0/${DETECTED_PREFIX}"
+  info "Detected local subnet: ${DETECTED_NETWORK}"
+  read -rp "Use ${DETECTED_NETWORK}? [Y/n]: " SUBNET_CONFIRM
+  SUBNET_CONFIRM=${SUBNET_CONFIRM,,}
+  if [ "$SUBNET_CONFIRM" = "n" ]; then
+    while true; do
+      read -rp "Enter subnet manually (e.g. 10.0.0.0/24): " LOCAL_SUBNET
+      [[ "$LOCAL_SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] && break
+      warn "Invalid format. Use CIDR notation e.g. 10.0.0.0/24"
+    done
+  else
+    LOCAL_SUBNET="$DETECTED_NETWORK"
   fi
-  warn "Invalid subnet. Try again (CIDR format e.g. 10.0.0.0/24)."
-done
+else
+  warn "Could not auto-detect subnet."
+  while true; do
+    read -rp "Local subnet to allow queries from (e.g. 10.0.0.0/24): " LOCAL_SUBNET
+    [[ "$LOCAL_SUBNET" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] && break
+    warn "Invalid format. Use CIDR notation e.g. 10.0.0.0/24"
+  done
+fi
 
 # Forwarders
 echo ""

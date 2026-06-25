@@ -13,9 +13,9 @@ Installs and configures BIND9 as a local DNS server with split-horizon. Internal
 
 | Prompt | Example | Notes |
 |---|---|---|
-| Local domain | `home.lan` or `home.example.com` | Used for all internal records |
-| Server IP | `10.0.0.53` | The IP of this machine |
-| Local subnet | `10.0.0.0/24` | Only this subnet can query the server |
+| Local domain | `talva.lan`, `talva.is`, `home.talva.is` | Any valid domain format. Used for all internal records |
+| Server IP | `10.0.0.53` | Auto-detected. If one IP found, shown for confirmation. If multiple, shown as a numbered list to pick from. Manual entry always available |
+| Local subnet | `10.0.0.0/24` | Auto-detected from server IP. Shown for confirmation, can be overridden |
 | Forwarder IPs | `1.1.1.1`, `8.8.8.8` | Upstream DNS for unknown names. Defaults to Cloudflare + Google if left blank |
 | Initial A records | `proxmox 10.0.0.10` | hostname + IP pairs, one per line. Empty line to finish |
 
