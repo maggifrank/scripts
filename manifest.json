@@ -4,5 +4,11 @@
     "file": "certbot-cloudflare-setup.sh",
     "description": "Set up Let's Encrypt certificates via Cloudflare DNS-01. No inbound ports required.",
     "requires_root": true
+  },
+  {
+    "name": "Ubuntu Server Hardening",
+    "file": "ubuntu-server-hardening.sh",
+    "description": "Apply security best practices to a fresh Ubuntu Server install.",
+    "requires_root": true
   }
 ]

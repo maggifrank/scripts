@@ -1,6 +1,6 @@
 #!/bin/bash
 # install.sh — Magnús's homelab script installer
-# One-liner: bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOURUSERNAME/YOURREPO/main/install.sh)"
+# One-liner: bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
 
 set -euo pipefail
 
@@ -20,36 +20,36 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl bash; do
-  command -v "$cmd" &>/dev/null || { echo -e "${RED}[ERROR]${NC} Required command not found: $cmd"; exit 1; }
+  command -v "$cmd" &>/dev/null || error "Required command not found: $cmd"
 done
 
-# ── Fetch manifest ────────────────────────────────────────────────────────────
-MANIFEST=$(curl -fsSL --max-time 10 "$MANIFEST_URL") || {
-  echo -e "${RED}[ERROR]${NC} Could not fetch script manifest. Check your internet connection."
-  exit 1
-}
-
-# Parse manifest with pure bash (no jq dependency)
-# Manifest format: [{"name":"...","file":"...","description":"...","requires_root":true}, ...]
-parse_field() {
-  local json="$1" field="$2"
-  echo "$json" | grep -o "\"${field}\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
-}
-
-parse_bool() {
-  local json="$1" field="$2"
-  echo "$json" | grep -o "\"${field}\":[a-z]*" | head -1 | cut -d':' -f2
-}
-
-# Split manifest into individual entries
-mapfile -t ENTRIES < <(echo "$MANIFEST" | grep -o '{[^}]*}')
-
-if [ "${#ENTRIES[@]}" -eq 0 ]; then
-  echo -e "${RED}[ERROR]${NC} Manifest is empty or malformed."
-  exit 1
+# ── Ensure jq is available ────────────────────────────────────────────────────
+if ! command -v jq &>/dev/null; then
+  info "jq not found — installing..."
+  apt-get update -q && apt-get install -y -q jq || error "Failed to install jq. Please install it manually: apt install jq"
 fi
+
+# ── Fetch manifest ────────────────────────────────────────────────────────────
+MANIFEST=$(curl -fsSL --max-time 10 "$MANIFEST_URL") || error "Could not fetch manifest. Check your internet connection."
+
+# Validate it's valid JSON
+echo "$MANIFEST" | jq empty 2>/dev/null || error "Manifest is not valid JSON. Check ${MANIFEST_URL}"
+
+# Count entries
+ENTRY_COUNT=$(echo "$MANIFEST" | jq 'length')
+[ "$ENTRY_COUNT" -eq 0 ] && error "Manifest is empty."
+
+# ── Parse entries with jq ─────────────────────────────────────────────────────
+parse_field() {
+  local idx="$1" field="$2"
+  echo "$MANIFEST" | jq -r ".[${idx}].${field}"
+}
 
 # ── Draw menu ─────────────────────────────────────────────────────────────────
 clear
@@ -59,28 +59,18 @@ echo -e "${BOLD}║           Homelab Script Installer                   ║${NC
 echo -e "${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-declare -a SCRIPT_FILES
-declare -a SCRIPT_NAMES
-declare -a SCRIPT_ROOTS
-
-i=1
-for entry in "${ENTRIES[@]}"; do
-  name=$(parse_field "$entry" "name")
-  file=$(parse_field "$entry" "file")
-  desc=$(parse_field "$entry" "description")
-  root=$(parse_bool  "$entry" "requires_root")
-
-  SCRIPT_FILES+=("$file")
-  SCRIPT_NAMES+=("$name")
-  SCRIPT_ROOTS+=("$root")
+for ((idx=0; idx<ENTRY_COUNT; idx++)); do
+  name=$(parse_field "$idx" "name")
+  desc=$(parse_field "$idx" "description")
+  root=$(parse_field "$idx" "requires_root")
+  num=$((idx + 1))
 
   root_tag=""
   [ "$root" = "true" ] && root_tag=" ${YELLOW}[root]${NC}"
 
-  echo -e "  ${CYAN}${i})${NC} ${BOLD}${name}${NC}${root_tag}"
+  echo -e "  ${CYAN}${num})${NC} ${BOLD}${name}${NC}${root_tag}"
   echo -e "     ${desc}"
   echo ""
-  ((i++))
 done
 
 echo -e "  ${CYAN}0)${NC} Exit"
@@ -88,11 +78,11 @@ echo ""
 
 # ── Get selection ─────────────────────────────────────────────────────────────
 while true; do
-  read -rp "Select a script to run [0-$((i-1))]: " CHOICE
-  if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 0 ] && [ "$CHOICE" -lt "$i" ]; then
+  read -rp "Select a script to run [0-${ENTRY_COUNT}]: " CHOICE
+  if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 0 ] && [ "$CHOICE" -le "$ENTRY_COUNT" ]; then
     break
   fi
-  echo -e "${YELLOW}[WARN]${NC}  Invalid choice. Enter a number between 0 and $((i-1))."
+  warn "Invalid choice. Enter a number between 0 and ${ENTRY_COUNT}."
 done
 
 if [ "$CHOICE" -eq 0 ]; then
@@ -100,46 +90,39 @@ if [ "$CHOICE" -eq 0 ]; then
   exit 0
 fi
 
-# ── Resolve selection (1-indexed) ─────────────────────────────────────────────
+# ── Resolve selection (1-indexed → 0-indexed) ─────────────────────────────────
 IDX=$((CHOICE - 1))
-SELECTED_FILE="${SCRIPT_FILES[$IDX]}"
-SELECTED_NAME="${SCRIPT_NAMES[$IDX]}"
-SELECTED_ROOT="${SCRIPT_ROOTS[$IDX]}"
+SELECTED_NAME=$(parse_field "$IDX" "name")
+SELECTED_FILE=$(parse_field "$IDX" "file")
+SELECTED_ROOT=$(parse_field "$IDX" "requires_root")
 SCRIPT_URL="${RAW_BASE}/${SELECTED_FILE}"
 
 echo ""
 echo -e "${BLUE}──── Selected: ${SELECTED_NAME} ────${NC}"
 echo ""
 
-# ── Root warning ──────────────────────────────────────────────────────────────
+# ── Root check ────────────────────────────────────────────────────────────────
 if [ "$SELECTED_ROOT" = "true" ] && [ "$EUID" -ne 0 ]; then
-  echo -e "${YELLOW}[WARN]${NC}  This script requires root. Re-launching with sudo..."
+  warn "This script requires root. Re-launching with sudo..."
   exec sudo bash -c "$(curl -fsSL "$SCRIPT_URL")"
 fi
 
 # ── Confirm before running ────────────────────────────────────────────────────
-echo -e "${YELLOW}[WARN]${NC}  You are about to run:"
+warn "You are about to run:"
 echo -e "       ${SCRIPT_URL}"
 echo ""
 read -rp "Proceed? [y/N]: " CONFIRM
-CONFIRM=${CONFIRM,,}
-if [ "$CONFIRM" != "y" ]; then
-  echo "Aborted."
-  exit 0
-fi
+[ "${CONFIRM,,}" = "y" ] || { echo "Aborted."; exit 0; }
 
 # ── Fetch and run ─────────────────────────────────────────────────────────────
 echo ""
-echo -e "${GREEN}[INFO]${NC}  Fetching and running ${SELECTED_NAME}..."
+info "Fetching and running ${SELECTED_NAME}..."
 echo ""
 
 TMPSCRIPT=$(mktemp /tmp/homelab-XXXXXX.sh)
 trap 'shred -u "$TMPSCRIPT" 2>/dev/null || rm -f "$TMPSCRIPT"' EXIT
 
-curl -fsSL --max-time 30 "$SCRIPT_URL" -o "$TMPSCRIPT" || {
-  echo -e "${RED}[ERROR]${NC} Failed to download script."
-  exit 1
-}
+curl -fsSL --max-time 30 "$SCRIPT_URL" -o "$TMPSCRIPT" || error "Failed to download script."
 
 chmod +x "$TMPSCRIPT"
 bash "$TMPSCRIPT"
