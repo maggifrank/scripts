@@ -40,7 +40,7 @@ read -rp "Proceed? [y/N]: " CONFIRM
 # ── Gather input ──────────────────────────────────────────────────────────────
 step "Configuration"
 
-read -rp "Is this container internet-facing? [y/N]: " INTERNET_FACING
+read -rp "Does this container accept inbound connections from the internet? (e.g. web server, VPN endpoint) [y/N]: " INTERNET_FACING
 INTERNET_FACING=${INTERNET_FACING,,}
 
 read -rp "Harden SSH? (only if you SSH directly into this container) [y/N]: " HARDEN_SSH

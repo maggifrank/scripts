@@ -37,7 +37,7 @@ step "Configuration"
 # Local domain
 while true; do
   read -rp "Local domain name (e.g. home.lan or home.yourdomain.com): " LOCAL_DOMAIN
-  if [[ "$LOCAL_DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-\.]{0,61}[a-zA-Z0-9])?$ ]]; then
+  if [[ "$LOCAL_DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
     break
   fi
   warn "Invalid domain format. Try again."
