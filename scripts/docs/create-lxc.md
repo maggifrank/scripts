@@ -36,7 +36,7 @@ pveam download local ubuntu-24.04-standard_24.04-2_amd64.tar.zst
 | Container type | Unprivileged | Unprivileged is recommended for security |
 | Nesting | No | Enable if running Docker inside the container |
 | Root password | — | Silent input, confirmed twice |
-| SSH public key | — | Optional. Added to root's authorized_keys |
+| SSH public key | — | Optional. Written to a temp file and passed to `pct create`, then deleted |
 
 ## What It Does
 

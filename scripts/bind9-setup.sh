@@ -346,8 +346,12 @@ named-checkzone "$REVERSE_ZONE" "/etc/bind/zones/db.${REVERSE_ZONE}" && info "Re
 # ── Enable and start ──────────────────────────────────────────────────────────
 step "10. Starting BIND9"
 
-# Detect correct service name — Ubuntu uses 'named', some systems use 'bind9'
-if systemctl list-unit-files named.service &>/dev/null | grep -q "named.service"; then
+# Detect correct service name
+# bind9.service is often just an alias/symlink for named.service on Ubuntu
+# Check if bind9 is an alias — if so, use named directly
+if systemctl list-unit-files bind9.service 2>/dev/null | grep -qE "alias|linked"; then
+  BIND_SVC="named"
+elif systemctl list-unit-files named.service 2>/dev/null | grep -qE "enabled|disabled|static"; then
   BIND_SVC="named"
 else
   BIND_SVC="bind9"

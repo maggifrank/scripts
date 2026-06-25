@@ -196,6 +196,14 @@ read -rp "Create container? [y/N]: " FINAL_CONFIRM
 # ── Create container ──────────────────────────────────────────────────────────
 step "Creating container"
 
+# Write SSH key to temp file if provided
+TMPKEY=""
+if [ -n "${SSH_PUBKEY:-}" ]; then
+  TMPKEY=$(mktemp /tmp/lxc-pubkey-XXXXXX)
+  echo "$SSH_PUBKEY" > "$TMPKEY"
+  trap 'rm -f "$TMPKEY"' EXIT
+fi
+
 PCT_ARGS=(
   "$VMID"
   --hostname "$HOSTNAME"
@@ -214,10 +222,11 @@ PCT_ARGS=(
   --onboot 1
 )
 
-[ -n "${SSH_PUBKEY:-}" ] && PCT_ARGS+=(--ssh-public-keys <(echo "$SSH_PUBKEY"))
+[ -n "$TMPKEY" ] && PCT_ARGS+=(--ssh-public-keys "$TMPKEY")
 
 pct create "${PCT_ARGS[@]}"
 unset ROOT_PASS
+[ -n "$TMPKEY" ] && rm -f "$TMPKEY"
 
 info "Container $VMID created."
 
