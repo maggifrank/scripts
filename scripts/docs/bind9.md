@@ -101,6 +101,13 @@ journalctl -u bind9 -f
 
 ## Troubleshooting
 
+**BIND9 fails to start — service name mismatch**
+On some Ubuntu versions the service is called `named` rather than `bind9`. The script detects this automatically, but if you're running commands manually check which one applies:
+```bash
+systemctl status named   # try this first
+systemctl status bind9   # or this
+```
+
 **BIND9 fails to start on LXC**
 Check AppArmor — the script handles this automatically, but if it persists:
 ```bash

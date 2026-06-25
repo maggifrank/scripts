@@ -345,10 +345,19 @@ named-checkzone "$REVERSE_ZONE" "/etc/bind/zones/db.${REVERSE_ZONE}" && info "Re
 
 # ── Enable and start ──────────────────────────────────────────────────────────
 step "10. Starting BIND9"
-systemctl enable bind9
-systemctl restart bind9
+
+# Detect correct service name — Ubuntu uses 'named', some systems use 'bind9'
+if systemctl list-unit-files named.service &>/dev/null | grep -q "named.service"; then
+  BIND_SVC="named"
+else
+  BIND_SVC="bind9"
+fi
+info "Using service name: ${BIND_SVC}"
+
+systemctl enable "$BIND_SVC"
+systemctl restart "$BIND_SVC"
 sleep 2
-systemctl is-active bind9 &>/dev/null && info "BIND9 is running." || error "BIND9 failed to start. Check: journalctl -xe -u bind9"
+systemctl is-active "$BIND_SVC" &>/dev/null && info "BIND9 is running." || error "BIND9 failed to start. Check: journalctl -xe -u ${BIND_SVC}"
 
 # ── Test resolution ───────────────────────────────────────────────────────────
 step "11. Testing DNS resolution"
@@ -436,10 +445,11 @@ info "Point your devices/router DNS to: ${SERVER_IP}"
 echo ""
 info "Useful commands:"
 echo "  Add a record:       dns-add <hostname> <ip>"
-echo "  Check BIND status:  systemctl status bind9"
+echo "  Check BIND status:  systemctl status ${BIND_SVC}"
 echo "  Reload after edits: rndc reload"
 echo "  Test resolution:    dig @${SERVER_IP} hostname.${LOCAL_DOMAIN}"
 echo "  Check config:       named-checkconf && named-checkzone ${LOCAL_DOMAIN} /etc/bind/zones/db.${LOCAL_DOMAIN}"
+echo "  View logs:          journalctl -u ${BIND_SVC} -f"
 echo ""
 info "Zone files:         /etc/bind/zones/"
 info "Log saved to:       $LOGFILE"
