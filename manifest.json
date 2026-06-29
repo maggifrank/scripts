@@ -28,5 +28,11 @@
     "file": "create-lxc.sh",
     "description": "Interactively create a Proxmox LXC container. Must be run on the Proxmox host.",
     "requires_root": true
+  },
+  {
+    "name": "Setup Caddy ",
+    "file": "caddy-setup.sh",
+    "description": "Install and configure Caddy as a reverse proxy and web server.",
+    "requires_root": true
   }
 ]
