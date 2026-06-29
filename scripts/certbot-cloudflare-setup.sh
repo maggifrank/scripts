@@ -34,6 +34,9 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# ── Force interactive terminal (required when piped via curl) ─────────────────
+[ ! -t 0 ] && exec < /dev/tty
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl apt-get shred; do
   command -v "$cmd" &>/dev/null || error "Required command not found: $cmd"

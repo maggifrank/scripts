@@ -122,13 +122,31 @@ esac
 
 # Download pre-built Caddy with Cloudflare DNS plugin from CaddyBuilds
 # This is a community-maintained repo that builds Caddy + Cloudflare plugin on every release
-info "Fetching latest Caddy + Cloudflare release..."
-CADDY_VERSION=$(curl -fsSL https://api.github.com/repos/CaddyBuilds/caddy-cloudflare/releases/latest | jq -r '.tag_name')
-info "Latest version: ${CADDY_VERSION}"
-
-CADDY_URL="https://github.com/CaddyBuilds/caddy-cloudflare/releases/download/${CADDY_VERSION}/caddy-cloudflare-linux-${CADDY_ARCH}"
 info "Downloading Caddy with Cloudflare DNS plugin..."
-curl -fsSL --max-time 60 "$CADDY_URL" -o /usr/bin/caddy || error "Failed to download Caddy from CaddyBuilds."
+CADDY_DOWNLOAD_URL="https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}&p=github.com%2Fcaddy-dns%2Fcloudflare"
+
+TMPBINARY=$(mktemp /tmp/caddy-XXXXXX)
+
+# Try official Caddy download API first (timeout 120s)
+if curl -fsSL --max-time 120 --connect-timeout 10 "$CADDY_DOWNLOAD_URL" -o "$TMPBINARY" 2>/dev/null && [ -s "$TMPBINARY" ]; then
+  info "Downloaded from Caddy API."
+else
+  warn "Caddy API download failed or timed out — falling back to xcaddy build..."
+  rm -f "$TMPBINARY"
+
+  # Install Go and xcaddy as fallback
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -q golang-go
+  go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+  export PATH=$PATH:$(go env GOPATH)/bin
+
+  TMPBINARY=$(mktemp /tmp/caddy-XXXXXX)
+  xcaddy build \
+    --with github.com/caddy-dns/cloudflare \
+    --output "$TMPBINARY" || error "xcaddy build also failed. Check internet connectivity."
+  info "Built with xcaddy."
+fi
+
+mv "$TMPBINARY" /usr/bin/caddy
 chmod +x /usr/bin/caddy
 info "Caddy installed: $(caddy version)"
 
@@ -152,6 +170,13 @@ info "Port binding capability granted."
 # ── Store Cloudflare token securely ──────────────────────────────────────────
 step "5. Storing Cloudflare credentials"
 CF_ENV="/etc/caddy/cloudflare.env"
+
+# Shred old credentials file if it exists
+if [ -f "$CF_ENV" ]; then
+  shred -u "$CF_ENV"
+  info "Shredded old credentials file."
+fi
+
 cat > "$CF_ENV" << EOF
 CLOUDFLARE_API_TOKEN=${CF_TOKEN}
 EOF
@@ -214,7 +239,7 @@ Type=notify
 User=caddy
 Group=caddy
 EnvironmentFile=/etc/caddy/cloudflare.env
-ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile
 ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
 TimeoutStopSec=5s
 LimitNOFILE=1048576

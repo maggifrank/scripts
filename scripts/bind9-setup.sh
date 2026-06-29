@@ -21,6 +21,9 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Root check ────────────────────────────────────────────────────────────────
 [ "$EUID" -ne 0 ] && error "Please run as root (sudo ./bind9-setup.sh)"
 
+# ── Force interactive terminal (required when piped via curl) ─────────────────
+[ ! -t 0 ] && exec < /dev/tty
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/bind9-setup-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1

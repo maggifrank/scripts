@@ -24,6 +24,9 @@ info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
+# ── Force interactive terminal (required when piped via curl) ─────────────────
+[ ! -t 0 ] && exec < /dev/tty
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl bash; do
   command -v "$cmd" &>/dev/null || error "Required command not found: $cmd"
@@ -104,7 +107,11 @@ echo ""
 # ── Root check ────────────────────────────────────────────────────────────────
 if [ "$SELECTED_ROOT" = "true" ] && [ "$EUID" -ne 0 ]; then
   warn "This script requires root. Re-launching with sudo..."
-  exec sudo bash -c "$(curl -fsSL "$SCRIPT_URL")"
+  TMPSCRIPT=$(mktemp /tmp/homelab-XXXXXX.sh)
+  trap 'shred -u "$TMPSCRIPT" 2>/dev/null || rm -f "$TMPSCRIPT"' EXIT
+  curl -fsSL --max-time 30 "$SCRIPT_URL" -o "$TMPSCRIPT" || error "Failed to download script."
+  chmod +x "$TMPSCRIPT"
+  exec sudo bash "$TMPSCRIPT"
 fi
 
 # ── Confirm before running ────────────────────────────────────────────────────
