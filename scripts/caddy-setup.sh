@@ -127,7 +127,7 @@ done
 # ── Install dependencies ──────────────────────────────────────────────────────
 step "2. Installing dependencies"
 apt-get update -q
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl jq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q curl jq gpg apt-transport-https
 info "Dependencies installed."
 
 # ── Install Caddy with Cloudflare DNS plugin ──────────────────────────────────
