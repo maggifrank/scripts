@@ -27,6 +27,35 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode ───────────────────────────────────────────────────────────────
+if command -v step-ca &>/dev/null && [ -d /etc/step-ca ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     step-ca — Update Mode                            ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing step-ca installation detected."
+  info "Current version: $(step-ca version 2>&1 | head -1)"
+  step "Updating step CLI and step-ca"
+  STEP_VERSION=$(curl -fsSL https://api.github.com/repos/smallstep/cli/releases/latest | jq -r '.tag_name' | tr -d 'v')
+  STEPCA_VERSION=$(curl -fsSL https://api.github.com/repos/smallstep/certificates/releases/latest | jq -r '.tag_name' | tr -d 'v')
+  ARCH=$(dpkg --print-architecture)
+  case "$ARCH" in
+    amd64) ARCH_SUFFIX="amd64" ;;
+    arm64) ARCH_SUFFIX="arm64" ;;
+    armhf) ARCH_SUFFIX="armv7" ;;
+    *)     error "Unsupported architecture: $ARCH" ;;
+  esac
+  systemctl stop step-ca
+  curl -fsSL "https://dl.smallstep.com/cli/docs-cli-install/latest/step-cli_${STEP_VERSION}_${ARCH_SUFFIX}.deb" -o /tmp/step-cli.deb && dpkg -i /tmp/step-cli.deb && rm /tmp/step-cli.deb
+  curl -fsSL "https://dl.smallstep.com/certificates/docs-ca-install/latest/step-ca_${STEPCA_VERSION}_${ARCH_SUFFIX}.deb" -o /tmp/step-ca.deb && dpkg -i /tmp/step-ca.deb && rm /tmp/step-ca.deb
+  setcap CAP_NET_BIND_SERVICE=+eip "$(which step-ca)"
+  systemctl start step-ca
+  systemctl is-active step-ca &>/dev/null && info "step-ca updated and running: $(step-ca version 2>&1 | head -1)" || warn "step-ca failed to restart — check: journalctl -xe -u step-ca"
+  echo ""
+  exit 0
+fi
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/step-ca-setup-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1

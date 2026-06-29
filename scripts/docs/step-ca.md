@@ -92,6 +92,16 @@ Run the certbot or ACME client with `--ca-bundle` pointing to the root cert, or 
 | `/etc/step-ca/certs/intermediate_ca.crt` | Intermediate CA certificate |
 | `/etc/step-ca/secrets/` | Encrypted CA keys (never share) |
 
+## Updating
+
+Run the script again on the same system — it will detect the existing installation and run an update instead of a fresh install:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
+```
+
+Select the same script from the menu. No configuration prompts — just updates packages and restarts services.
+
 ## Useful Commands
 
 ```bash

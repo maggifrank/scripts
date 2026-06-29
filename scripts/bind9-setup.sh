@@ -24,6 +24,29 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode ───────────────────────────────────────────────────────────────
+if [ -f /etc/bind/named.conf.local ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     BIND9 — Update Mode                              ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing BIND9 installation detected."
+  step "Updating BIND9"
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q bind9 bind9utils
+  # Detect service name
+  if systemctl list-unit-files bind9.service 2>/dev/null | grep -qE "alias|linked"; then
+    BIND_SVC="named"
+  else
+    BIND_SVC="bind9"
+  fi
+  systemctl restart "$BIND_SVC"
+  systemctl is-active "$BIND_SVC" &>/dev/null && info "BIND9 updated and running." || warn "BIND9 failed to restart — check: journalctl -xe -u ${BIND_SVC}"
+  echo ""
+  exit 0
+fi
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/bind9-setup-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -435,6 +458,138 @@ HELPER
 chmod +x /usr/local/bin/dns-add
 info "dns-add helper installed at /usr/local/bin/dns-add"
 
+# ── Helper script: remove DNS record ─────────────────────────────────────────
+cat > /usr/local/bin/dns-remove << HELPER
+#!/bin/bash
+# dns-remove — remove an A record and its PTR record from BIND9
+# Usage: dns-remove <hostname>
+
+set -euo pipefail
+
+LOCAL_DOMAIN="${LOCAL_DOMAIN}"
+FORWARD_ZONE="/etc/bind/zones/db.${LOCAL_DOMAIN}"
+REVERSE_ZONE_FILE="/etc/bind/zones/db.${REVERSE_ZONE}"
+NETWORK_PREFIX="${NETWORK_PREFIX}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+[ "\$EUID" -ne 0 ] && { echo -e "\${RED}[ERROR]\${NC} Run as root."; exit 1; }
+[ "\$#" -ne 1 ] && { echo "Usage: dns-remove <hostname>"; exit 1; }
+
+HOST="\$1"
+
+# Check it exists
+if ! grep -q "^\${HOST}[[:space:]]" "\$FORWARD_ZONE"; then
+  echo -e "\${YELLOW}[WARN]\${NC}  \$HOST not found in forward zone."
+  exit 1
+fi
+
+# Get the IP before removing so we can remove the PTR too
+IP=\$(grep "^\${HOST}[[:space:]]" "\$FORWARD_ZONE" | awk '{print \$NF}')
+
+# Remove A record
+sed -i "/^\${HOST}[[:space:]]/d" "\$FORWARD_ZONE"
+echo -e "\${GREEN}[INFO]\${NC}  Removed A record: \${HOST}.\${LOCAL_DOMAIN}"
+
+# Remove PTR record if IP was in same subnet
+if [ -n "\$IP" ]; then
+  IP_PREFIX=\$(echo "\$IP" | cut -d'.' -f1-3)
+  if [ "\$IP_PREFIX" = "\$NETWORK_PREFIX" ]; then
+    LAST=\$(echo "\$IP" | cut -d'.' -f4)
+    sed -i "/^\${LAST}[[:space:]]/d" "\$REVERSE_ZONE_FILE"
+    echo -e "\${GREEN}[INFO]\${NC}  Removed PTR record: \${LAST} → \${HOST}.\${LOCAL_DOMAIN}"
+  fi
+fi
+
+# Bump serial
+SERIAL=\$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/\${SERIAL}        ; Serial/" "\$FORWARD_ZONE"
+sed -i "s/[0-9]\{10\}.*; Serial/\${SERIAL}        ; Serial/" "\$REVERSE_ZONE_FILE"
+
+# Validate and reload
+named-checkzone "\$LOCAL_DOMAIN" "\$FORWARD_ZONE" > /dev/null || { echo -e "\${RED}[ERROR]\${NC} Zone validation failed — changes not applied."; exit 1; }
+rndc reload > /dev/null
+echo -e "\${GREEN}[INFO]\${NC}  BIND9 reloaded."
+HELPER
+chmod +x /usr/local/bin/dns-remove
+info "dns-remove helper installed at /usr/local/bin/dns-remove"
+
+# ── Helper script: update DNS record ─────────────────────────────────────────
+cat > /usr/local/bin/dns-update << HELPER
+#!/bin/bash
+# dns-update — update an existing A record and its PTR record in BIND9
+# Usage: dns-update <hostname> <new-ip>
+
+set -euo pipefail
+
+LOCAL_DOMAIN="${LOCAL_DOMAIN}"
+FORWARD_ZONE="/etc/bind/zones/db.${LOCAL_DOMAIN}"
+REVERSE_ZONE_FILE="/etc/bind/zones/db.${REVERSE_ZONE}"
+NETWORK_PREFIX="${NETWORK_PREFIX}"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+[ "\$EUID" -ne 0 ] && { echo -e "\${RED}[ERROR]\${NC} Run as root."; exit 1; }
+[ "\$#" -ne 2 ] && { echo "Usage: dns-update <hostname> <new-ip>"; exit 1; }
+
+HOST="\$1"
+NEW_IP="\$2"
+
+if ! [[ "\$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}\$ ]]; then
+  echo -e "\${RED}[ERROR]\${NC} Invalid IP: \$NEW_IP"
+  exit 1
+fi
+
+# Check it exists
+if ! grep -q "^\${HOST}[[:space:]]" "\$FORWARD_ZONE"; then
+  echo -e "\${YELLOW}[WARN]\${NC}  \$HOST not found in forward zone. Use dns-add instead."
+  exit 1
+fi
+
+# Get old IP to remove old PTR
+OLD_IP=\$(grep "^\${HOST}[[:space:]]" "\$FORWARD_ZONE" | awk '{print \$NF}')
+
+# Update A record
+sed -i "s/^\${HOST}[[:space:]].*$/\${HOST}     IN  A   \${NEW_IP}/" "\$FORWARD_ZONE"
+echo -e "\${GREEN}[INFO]\${NC}  Updated A record: \${HOST}.\${LOCAL_DOMAIN} → \${NEW_IP}"
+
+# Remove old PTR if in same subnet
+if [ -n "\$OLD_IP" ]; then
+  OLD_PREFIX=\$(echo "\$OLD_IP" | cut -d'.' -f1-3)
+  if [ "\$OLD_PREFIX" = "\$NETWORK_PREFIX" ]; then
+    OLD_LAST=\$(echo "\$OLD_IP" | cut -d'.' -f4)
+    sed -i "/^\${OLD_LAST}[[:space:]]/d" "\$REVERSE_ZONE_FILE"
+    echo -e "\${GREEN}[INFO]\${NC}  Removed old PTR record: \${OLD_LAST}"
+  fi
+fi
+
+# Add new PTR if in same subnet
+NEW_PREFIX=\$(echo "\$NEW_IP" | cut -d'.' -f1-3)
+if [ "\$NEW_PREFIX" = "\$NETWORK_PREFIX" ]; then
+  NEW_LAST=\$(echo "\$NEW_IP" | cut -d'.' -f4)
+  echo "\${NEW_LAST}    IN  PTR \${HOST}.\${LOCAL_DOMAIN}." >> "\$REVERSE_ZONE_FILE"
+  echo -e "\${GREEN}[INFO]\${NC}  Added new PTR record: \${NEW_LAST} → \${HOST}.\${LOCAL_DOMAIN}"
+fi
+
+# Bump serial
+SERIAL=\$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/\${SERIAL}        ; Serial/" "\$FORWARD_ZONE"
+sed -i "s/[0-9]\{10\}.*; Serial/\${SERIAL}        ; Serial/" "\$REVERSE_ZONE_FILE"
+
+# Validate and reload
+named-checkzone "\$LOCAL_DOMAIN" "\$FORWARD_ZONE" > /dev/null || { echo -e "\${RED}[ERROR]\${NC} Zone validation failed — changes not applied."; exit 1; }
+rndc reload > /dev/null
+echo -e "\${GREEN}[INFO]\${NC}  BIND9 reloaded."
+HELPER
+chmod +x /usr/local/bin/dns-update
+info "dns-update helper installed at /usr/local/bin/dns-update"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo "╔══════════════════════════════════════════════════════╗"
@@ -452,6 +607,8 @@ info "Point your devices/router DNS to: ${SERVER_IP}"
 echo ""
 info "Useful commands:"
 echo "  Add a record:       dns-add <hostname> <ip>"
+echo "  Update a record:    dns-update <hostname> <new-ip>"
+echo "  Remove a record:    dns-remove <hostname>"
 echo "  Check BIND status:  systemctl status ${BIND_SVC}"
 echo "  Reload after edits: rndc reload"
 echo "  Test resolution:    dig @${SERVER_IP} hostname.${LOCAL_DOMAIN}"

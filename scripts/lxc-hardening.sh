@@ -25,6 +25,23 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode ───────────────────────────────────────────────────────────────
+if [ -f /etc/apt/apt.conf.d/50unattended-upgrades ] && [ -f /etc/security/pwquality.conf ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     LXC Hardening — Update Mode                      ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing hardening detected — running system update only."
+  step "Updating system packages"
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q
+  apt-get autoremove -y -q
+  info "System updated."
+  echo ""
+  exit 0
+fi
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/lxc-hardening-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1

@@ -31,28 +31,36 @@ Installs and configures BIND9 as a local DNS server with split-horizon. Internal
 8. Validates config with `named-checkconf` and `named-checkzone`
 9. Starts and enables BIND9
 10. Tests local resolution and forwarder connectivity
-11. Installs the `dns-add` helper command
+11. Installs `dns-add`, `dns-update`, and `dns-remove` helper commands
 
-## Adding DNS Records After Setup
+## Managing DNS Records After Setup
 
-Use the included helper:
+Three helper commands are installed automatically:
 
+**Add a record:**
 ```bash
 dns-add <hostname> <ip>
-```
-
-Example:
-```bash
 dns-add homeassistant 10.0.0.20
 ```
 
-This adds both the A record and PTR record, bumps the zone serial, and reloads BIND9 automatically.
+**Update an existing record:**
+```bash
+dns-update <hostname> <new-ip>
+dns-update homeassistant 10.0.0.25
+```
 
-To remove or edit records manually, edit the zone files directly:
+**Remove a record:**
+```bash
+dns-remove <hostname>
+dns-remove homeassistant
+```
+
+All three helpers automatically update both the A record and PTR record, bump the zone serial, validate the zone file, and reload BIND9.
+
+To edit records manually:
 
 ```bash
 nano /etc/bind/zones/db.yourdomain
-# make changes, then:
 rndc reload
 ```
 
@@ -77,6 +85,18 @@ dig @<server-ip> google.com
 | `/etc/bind/zones/db.<domain>` | Forward zone records |
 | `/etc/bind/zones/db.<reverse>` | Reverse zone PTR records |
 | `/usr/local/bin/dns-add` | Helper to add records |
+| `/usr/local/bin/dns-update` | Helper to update records |
+| `/usr/local/bin/dns-remove` | Helper to remove records |
+
+## Updating
+
+Run the script again on the same system — it will detect the existing installation and run an update instead of a fresh install:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
+```
+
+Select the same script from the menu. No configuration prompts — just updates packages and restarts services.
 
 ## Useful Commands
 

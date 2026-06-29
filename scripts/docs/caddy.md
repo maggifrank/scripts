@@ -22,7 +22,7 @@ Installs Caddy as a reverse proxy with automatic TLS certificates from Let's Enc
 
 ## What It Does
 
-1. Downloads Caddy with the Cloudflare DNS plugin from Caddy's official download API (120s timeout). Falls back to building with `xcaddy` automatically if the download fails or times out.
+1. Installs Caddy from the official Caddy apt repository, then adds the Cloudflare DNS plugin using `caddy upgrade --plugins`. No compilation, no API timeouts — fast and reliable.
 2. Creates a dedicated `caddy` system user (no login shell)
 3. Grants Caddy the ability to bind to ports 80 and 443 without root
 4. Stores the Cloudflare API token securely at `/etc/caddy/cloudflare.env` (chmod 600)
@@ -88,6 +88,16 @@ For each service, add an A record in Cloudflare:
 | `/var/lib/caddy` | Caddy data directory (certificates stored here) |
 | `/var/log/caddy` | Log directory |
 | `/usr/local/bin/caddy-add-service` | Helper to add new services |
+
+## Updating
+
+Run the script again on the same system — it will detect the existing installation and run an update instead of a fresh install:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
+```
+
+Select the same script from the menu. No configuration prompts — just updates packages and restarts services.
 
 ## Useful Commands
 

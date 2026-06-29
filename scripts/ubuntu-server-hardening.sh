@@ -24,6 +24,25 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode ───────────────────────────────────────────────────────────────
+if [ -f /etc/ssh/sshd_config.d/99-hardening.conf ] && [ -f /etc/sysctl.d/99-hardening.conf ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     Ubuntu Hardening — Update Mode                   ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing hardening detected — running system update only."
+  step "Updating system packages"
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q
+  apt-get autoremove -y -q
+  info "System updated."
+  echo ""
+  read -rp "Reboot to apply any kernel updates? [y/N]: " REBOOT
+  [ "${REBOOT,,}" = "y" ] && reboot
+  exit 0
+fi
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/hardening-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1

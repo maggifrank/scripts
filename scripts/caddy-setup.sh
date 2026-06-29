@@ -26,6 +26,27 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode — if Caddy is already installed, update instead of reinstall ──
+if command -v caddy &>/dev/null && [ -f /etc/caddy/Caddyfile ]; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     Caddy — Update Mode                              ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing Caddy installation detected."
+  info "Current version: $(caddy version)"
+  echo ""
+  step "Updating Caddy"
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q caddy
+  caddy upgrade --plugins github.com/caddy-dns/cloudflare || warn "Plugin upgrade failed — Caddy binary updated but Cloudflare plugin may need manual refresh."
+  systemctl restart caddy
+  info "Updated to: $(caddy version)"
+  systemctl is-active caddy &>/dev/null && info "Caddy is running." || warn "Caddy failed to restart — check: journalctl -xe -u caddy"
+  echo ""
+  exit 0
+fi
+
 # ── Log everything ────────────────────────────────────────────────────────────
 LOGFILE="/var/log/caddy-setup-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -112,43 +133,20 @@ info "Dependencies installed."
 # ── Install Caddy with Cloudflare DNS plugin ──────────────────────────────────
 step "3. Installing Caddy with Cloudflare DNS plugin"
 
-ARCH=$(dpkg --print-architecture)
-case "$ARCH" in
-  amd64)  CADDY_ARCH="amd64" ;;
-  arm64)  CADDY_ARCH="arm64" ;;
-  armhf)  CADDY_ARCH="armv7" ;;
-  *)      error "Unsupported architecture: $ARCH" ;;
-esac
+# Install Caddy from official apt repo
+info "Adding Caddy apt repository..."
+curl -fsSL --max-time 30 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -fsSL --max-time 30 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  > /etc/apt/sources.list.d/caddy-stable.list
+apt-get update -q
+DEBIAN_FRONTEND=noninteractive apt-get install -y -q caddy
+info "Caddy base installed: $(caddy version)"
 
-# Download pre-built Caddy with Cloudflare DNS plugin from CaddyBuilds
-# This is a community-maintained repo that builds Caddy + Cloudflare plugin on every release
-info "Downloading Caddy with Cloudflare DNS plugin..."
-CADDY_DOWNLOAD_URL="https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}&p=github.com%2Fcaddy-dns%2Fcloudflare"
-
-TMPBINARY=$(mktemp /tmp/caddy-XXXXXX)
-
-# Try official Caddy download API first (timeout 120s)
-if curl -fsSL --max-time 120 --connect-timeout 10 "$CADDY_DOWNLOAD_URL" -o "$TMPBINARY" 2>/dev/null && [ -s "$TMPBINARY" ]; then
-  info "Downloaded from Caddy API."
-else
-  warn "Caddy API download failed or timed out — falling back to xcaddy build..."
-  rm -f "$TMPBINARY"
-
-  # Install Go and xcaddy as fallback
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q golang-go
-  go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-  export PATH=$PATH:$(go env GOPATH)/bin
-
-  TMPBINARY=$(mktemp /tmp/caddy-XXXXXX)
-  xcaddy build \
-    --with github.com/caddy-dns/cloudflare \
-    --output "$TMPBINARY" || error "xcaddy build also failed. Check internet connectivity."
-  info "Built with xcaddy."
-fi
-
-mv "$TMPBINARY" /usr/bin/caddy
-chmod +x /usr/bin/caddy
-info "Caddy installed: $(caddy version)"
+# Add Cloudflare DNS plugin via caddy upgrade
+info "Adding Cloudflare DNS plugin..."
+caddy upgrade --plugins github.com/caddy-dns/cloudflare || error "Failed to add Cloudflare plugin. Check internet connectivity."
+info "Cloudflare DNS plugin added: $(caddy version)"
 
 # ── Create caddy user and directories ────────────────────────────────────────
 step "4. Setting up Caddy user and directories"

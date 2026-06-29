@@ -57,6 +57,16 @@ Lightweight hardening for Ubuntu/Debian LXC containers. Only applies what is rel
 - [ ] If SSH was hardened, verify login in a new session before closing the current one
 - [ ] Add Proxmox firewall rules for this container if needed (Datacenter → pve → VMID → Firewall)
 
+## Updating
+
+Run the script again on the same system — it will detect the existing installation and run an update instead of a fresh install:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
+```
+
+Select the same script from the menu. No configuration prompts — just updates packages and restarts services.
+
 ## Useful Commands
 
 ```bash

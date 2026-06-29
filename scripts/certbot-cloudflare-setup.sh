@@ -37,6 +37,24 @@ fi
 # ── Force interactive terminal (required when piped via curl) ─────────────────
 [ ! -t 0 ] && exec < /dev/tty
 
+# ── Update mode ───────────────────────────────────────────────────────────────
+if command -v certbot &>/dev/null; then
+  echo ""
+  echo "╔══════════════════════════════════════════════════════╗"
+  echo "║     Certbot — Update Mode                            ║"
+  echo "╚══════════════════════════════════════════════════════╝"
+  echo ""
+  info "Existing Certbot installation detected."
+  step "Updating Certbot"
+  apt-get update -q
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q certbot python3-certbot-dns-cloudflare
+  info "Certbot updated: $(certbot --version 2>&1)"
+  step "Renewing certificates"
+  certbot renew --quiet && info "Certificates renewed successfully." || warn "Renewal encountered issues — check: journalctl -xe"
+  echo ""
+  exit 0
+fi
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 for cmd in curl apt-get shred; do
   command -v "$cmd" &>/dev/null || error "Required command not found: $cmd"
