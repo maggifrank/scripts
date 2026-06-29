@@ -1,112 +1,87 @@
-# Homelab Scripts
+# Create Proxmox LXC
 
-A collection of setup and maintenance scripts for self-hosted infrastructure. Run any script via the interactive installer with a single command.
+Interactively creates a Proxmox LXC container with sensible defaults. Automatically updates the container and installs `curl` and `wget` after creation so it is immediately ready to use.
 
-## Quick Start
+> **Must be run on the Proxmox host**, not inside a container.
+
+## Prerequisites
+
+- Proxmox VE host
+- Root access on the host
+- At least one Ubuntu or Debian template downloaded in local storage
+
+### Downloading a template (if needed)
+
+```bash
+pveam update
+pveam available --section system | grep ubuntu
+pveam download local ubuntu-24.04-standard_24.04-2_amd64.tar.zst
+```
+
+## What the Script Asks For
+
+| Prompt | Default | Notes |
+|---|---|---|
+| Container ID | Next available | Auto-suggested via `pvesh get /cluster/nextid` |
+| Hostname | — | Letters, numbers, and hyphens only |
+| Template | — | Lists available Ubuntu/Debian templates to pick from |
+| Storage pool | `local-lvm` | Where the container disk is stored |
+| Disk size | `8GB` | — |
+| RAM | `512MB` | — |
+| Swap | `512MB` | — |
+| CPU cores | `1` | — |
+| Network bridge | `vmbr0` | — |
+| IP configuration | DHCP | Choose DHCP or static IP with gateway |
+| DNS server | `10.100.53.73` | Default is your local BIND9 server |
+| Container type | Unprivileged | Unprivileged is recommended for security |
+| Nesting | No | Enable if running Docker inside the container |
+| Root password | — | Silent input, confirmed twice |
+| SSH public key | — | Optional. Written to a temp file and passed to `pct create`, then deleted |
+
+## What It Does
+
+1. Suggests the next available VMID
+2. Lists available templates to choose from
+3. Walks through all configuration options with sensible defaults
+4. Shows a full review summary before creating anything
+5. Creates the container and starts it
+6. Waits for the container to be running
+7. Runs `apt update`, `apt upgrade`, and installs `curl` and `wget` inside the container automatically
+
+## After Creation
+
+The container is started automatically and set to start on boot (`--onboot 1`).
+
+```bash
+# Open a shell inside the container
+pct enter <vmid>
+
+# Check container status
+pct status <vmid>
+
+# Stop the container
+pct stop <vmid>
+
+# Start the container
+pct start <vmid>
+
+# View container config
+cat /etc/pve/lxc/<vmid>.conf
+
+# Destroy the container (stop it first)
+pct stop <vmid> && pct destroy <vmid>
+```
+
+## Network Notes
+
+- **DHCP:** The container will get an IP from your router. Check your router's DHCP leases to find the assigned IP.
+- **Static IP:** Use CIDR notation e.g. `10.0.0.50/24` and provide the gateway IP.
+
+## Recommended Next Step
+
+Once the container is running, harden it with the LXC hardening script:
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
+# Select: LXC Container Hardening
 ```
-
-A menu will appear — select a number to run a script. That's it.
-
-> Some scripts require root. The installer will escalate automatically if needed.
-
----
-
-## Available Scripts
-
-| Script | Description | Docs |
-|---|---|---|
-| Certbot + Cloudflare DNS | Let's Encrypt certificates via Cloudflare DNS-01 | [docs](scripts/docs/certbot-cloudflare.md) |
-| Ubuntu Server Hardening | Security best practices for fresh Ubuntu installs (VM or bare metal) | [docs](scripts/docs/ubuntu-hardening.md) |
-| LXC Container Hardening | Lightweight hardening for LXC containers | [docs](scripts/docs/lxc-hardening.md) |
-| BIND9 Local DNS | Local DNS server with forwarder and split-horizon | [docs](scripts/docs/bind9.md) |
-| Create Proxmox LXC | Interactively create a Proxmox LXC container (run on Proxmox host) | [docs](scripts/docs/create-lxc.md) |
-
----
-
-## Adding a New Script
-
-### 1. Create the script
-
-Add your script to `scripts/`:
-
-```
-scripts/my-new-script.sh
-```
-
-Make sure it:
-- Has a shebang: `#!/bin/bash`
-- Handles its own dependencies and errors
-- Does not assume prior state
-
-### 2. Add a doc file
-
-Create `scripts/docs/my-new-script.md` describing what it does, what it asks for, and any post-setup steps. Use the existing docs as a template.
-
-### 3. Register it in `manifest.json`
-
-```json
-{
-  "name": "My New Script",
-  "file": "my-new-script.sh",
-  "description": "One-line description shown in the menu.",
-  "requires_root": true
-}
-```
-
-| Field | Type | Description |
-|---|---|---|
-| `name` | string | Display name in the menu |
-| `file` | string | Filename inside `scripts/` |
-| `description` | string | One-line description |
-| `requires_root` | bool | Auto-escalates to sudo if true |
-
-### 4. Push to GitHub
-
-```bash
-git add scripts/my-new-script.sh scripts/docs/my-new-script.md manifest.json
-git commit -m "Add my-new-script"
-git push
-```
-
-The menu picks it up automatically.
-
----
-
-## Repository Structure
-
-```
-scripts/
-├── install.sh          # Entrypoint — the one-liner target
-├── manifest.json       # Script registry
-├── README.md           # This file
-└── scripts/
-    ├── certbot-cloudflare-setup.sh
-    ├── ubuntu-server-hardening.sh
-    ├── lxc-hardening.sh
-    ├── bind9-setup.sh
-    ├── create-lxc.sh
-    └── docs/
-        ├── certbot-cloudflare.md
-        ├── ubuntu-hardening.md
-        ├── lxc-hardening.md
-        ├── bind9.md
-        └── create-lxc.md
-```
-
----
-
-## Security
-
-- Scripts are downloaded to a temp file, executed, then shredded on exit
-- The full script URL is shown and confirmed before anything runs
-- No secrets are stored in this repo — scripts prompt for sensitive input at runtime
-- API tokens and passwords are never echoed to the terminal
-
----
-
-## License
-
-MIT

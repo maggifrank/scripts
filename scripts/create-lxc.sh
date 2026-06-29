@@ -137,8 +137,8 @@ else
   NET_CONFIG="ip=dhcp"
 fi
 
-read -rp "DNS server [default: 1.1.1.1]: " DNS
-DNS=${DNS:-1.1.1.1}
+read -rp "DNS server [default: 10.100.53.73]: " DNS
+DNS=${DNS:-10.100.53.73}
 
 # ── Step 7: Security ──────────────────────────────────────────────────────────
 step "7. Security"
@@ -156,6 +156,12 @@ NESTING=${NESTING,,}
 # ── Step 8: Password ──────────────────────────────────────────────────────────
 step "8. Root password"
 warn "This is the root password for the container console."
+
+# Force interactive terminal — required when script is piped via curl
+if [ ! -t 0 ]; then
+  exec < /dev/tty
+fi
+
 while true; do
   read -rsp "Root password: " ROOT_PASS
   echo ""
@@ -165,6 +171,8 @@ while true; do
   warn "Passwords do not match. Try again."
 done
 unset ROOT_PASS_CONFIRM
+
+[ -z "${ROOT_PASS:-}" ] && error "Password cannot be empty."
 
 # ── Step 9: SSH key (optional) ────────────────────────────────────────────────
 step "9. SSH public key (optional)"
@@ -201,30 +209,42 @@ TMPKEY=""
 if [ -n "${SSH_PUBKEY:-}" ]; then
   TMPKEY=$(mktemp /tmp/lxc-pubkey-XXXXXX)
   echo "$SSH_PUBKEY" > "$TMPKEY"
-  trap 'rm -f "$TMPKEY"' EXIT
 fi
 
-PCT_ARGS=(
-  "$VMID"
-  --hostname "$HOSTNAME"
-  --ostemplate "$TEMPLATE"
-  --storage "$STORAGE"
-  --rootfs "${STORAGE}:${DISK}"
-  --memory "$RAM"
-  --swap "$SWAP"
-  --cores "$CORES"
-  --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}"
-  --nameserver "$DNS"
-  --unprivileged "$UNPRIVILEGED"
-  --features "nesting=${NESTING_FLAG}"
-  --password "$ROOT_PASS"
-  --start 1
-  --onboot 1
-)
+# Build and run pct create directly
+if [ -n "$TMPKEY" ]; then
+  pct create "$VMID" "$TEMPLATE" \
+    --hostname "$HOSTNAME" \
+    --storage "$STORAGE" \
+    --rootfs "${STORAGE}:${DISK}" \
+    --memory "$RAM" \
+    --swap "$SWAP" \
+    --cores "$CORES" \
+    --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}" \
+    --nameserver "$DNS" \
+    --unprivileged "$UNPRIVILEGED" \
+    --features "nesting=${NESTING_FLAG}" \
+    --password "$ROOT_PASS" \
+    --ssh-public-keys "$TMPKEY" \
+    --start 1 \
+    --onboot 1
+else
+  pct create "$VMID" "$TEMPLATE" \
+    --hostname "$HOSTNAME" \
+    --storage "$STORAGE" \
+    --rootfs "${STORAGE}:${DISK}" \
+    --memory "$RAM" \
+    --swap "$SWAP" \
+    --cores "$CORES" \
+    --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}" \
+    --nameserver "$DNS" \
+    --unprivileged "$UNPRIVILEGED" \
+    --features "nesting=${NESTING_FLAG}" \
+    --password "$ROOT_PASS" \
+    --start 1 \
+    --onboot 1
+fi
 
-[ -n "$TMPKEY" ] && PCT_ARGS+=(--ssh-public-keys "$TMPKEY")
-
-pct create "${PCT_ARGS[@]}"
 unset ROOT_PASS
 [ -n "$TMPKEY" ] && rm -f "$TMPKEY"
 
