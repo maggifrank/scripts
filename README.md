@@ -19,8 +19,12 @@ A menu will appear — select a number to run a script. That's it.
 | Script | Description | Docs |
 |---|---|---|
 | Certbot + Cloudflare DNS | Let's Encrypt certificates via Cloudflare DNS-01 | [docs](scripts/docs/certbot-cloudflare.md) |
-| Ubuntu Server Hardening | Security best practices for fresh Ubuntu installs | [docs](scripts/docs/ubuntu-hardening.md) |
+| Ubuntu Server Hardening | Security best practices for fresh Ubuntu installs (VM or bare metal) | [docs](scripts/docs/ubuntu-hardening.md) |
+| LXC Container Hardening | Lightweight hardening for LXC containers | [docs](scripts/docs/lxc-hardening.md) |
 | BIND9 Local DNS | Local DNS server with forwarder and split-horizon | [docs](scripts/docs/bind9.md) |
+| Create Proxmox LXC | Interactively create a Proxmox LXC container (run on Proxmox host) | [docs](scripts/docs/create-lxc.md) |
+| step-ca Internal CA | Internal CA with ACME support for automatic TLS certificates | [docs](scripts/docs/step-ca.md) |
+| Caddy Reverse Proxy | Reverse proxy with automatic Let's Encrypt TLS via Cloudflare DNS-01 | [docs](scripts/docs/caddy.md) |
 
 ---
 
@@ -83,11 +87,19 @@ scripts/
 └── scripts/
     ├── certbot-cloudflare-setup.sh
     ├── ubuntu-server-hardening.sh
+    ├── lxc-hardening.sh
     ├── bind9-setup.sh
+    ├── create-lxc.sh
+    ├── step-ca-setup.sh
+    ├── caddy-setup.sh
     └── docs/
         ├── certbot-cloudflare.md
         ├── ubuntu-hardening.md
-        └── bind9.md
+        ├── lxc-hardening.md
+        ├── bind9.md
+        ├── create-lxc.md
+        ├── step-ca.md
+        └── caddy.md
 ```
 
 ---
