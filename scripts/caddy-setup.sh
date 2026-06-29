@@ -39,7 +39,7 @@ if command -v caddy &>/dev/null && [ -f /etc/caddy/Caddyfile ]; then
   step "Updating Caddy"
   apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q caddy
-  caddy upgrade --plugins github.com/caddy-dns/cloudflare || warn "Plugin upgrade failed — Caddy binary updated but Cloudflare plugin may need manual refresh."
+  caddy upgrade || warn "Caddy binary upgrade failed — may need manual intervention."
   systemctl restart caddy
   info "Updated to: $(caddy version)"
   systemctl is-active caddy &>/dev/null && info "Caddy is running." || warn "Caddy failed to restart — check: journalctl -xe -u caddy"
@@ -143,9 +143,9 @@ apt-get update -q
 DEBIAN_FRONTEND=noninteractive apt-get install -y -q caddy
 info "Caddy base installed: $(caddy version)"
 
-# Add Cloudflare DNS plugin via caddy upgrade
+# Add Cloudflare DNS plugin via caddy add-package
 info "Adding Cloudflare DNS plugin..."
-caddy upgrade --plugins github.com/caddy-dns/cloudflare || error "Failed to add Cloudflare plugin. Check internet connectivity."
+caddy add-package github.com/caddy-dns/cloudflare || error "Failed to add Cloudflare plugin. Check internet connectivity."
 info "Cloudflare DNS plugin added: $(caddy version)"
 
 # ── Create caddy user and directories ────────────────────────────────────────
