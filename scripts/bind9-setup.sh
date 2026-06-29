@@ -618,3 +618,9 @@ echo ""
 info "Zone files:         /etc/bind/zones/"
 info "Log saved to:       $LOGFILE"
 echo ""
+
+# Ensure /usr/local/bin is in PATH
+if ! grep -q '/usr/local/bin' /root/.bashrc 2>/dev/null; then
+  echo 'export PATH=$PATH:/usr/local/bin' >> /root/.bashrc
+  info "Added /usr/local/bin to PATH — run: source /root/.bashrc"
+fi
