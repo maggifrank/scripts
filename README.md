@@ -24,7 +24,8 @@ A menu will appear — select a number to run a script. That's it.
 | BIND9 Local DNS | Local DNS server with forwarder and split-horizon | [docs](scripts/docs/bind9.md) |
 | Create Proxmox LXC | Interactively create a Proxmox LXC container (run on Proxmox host) | [docs](scripts/docs/create-lxc.md) |
 | step-ca Internal CA | Internal CA with ACME support for automatic TLS certificates | [docs](scripts/docs/step-ca.md) |
-| Caddy Reverse Proxy | Reverse proxy with automatic Let's Encrypt TLS via Cloudflare DNS-01 | [docs](scripts/docs/caddy.md) |
+| Caddy Reverse Proxy (Internal) | Reverse proxy with Let's Encrypt TLS via Cloudflare DNS-01 | [docs](scripts/docs/caddy.md) |
+| Caddy Reverse Proxy (Public) | Reverse proxy with automatic Let's Encrypt TLS via HTTP-01 | [docs](scripts/docs/caddy-public.md) |
 
 ---
 
@@ -92,6 +93,7 @@ scripts/
     ├── create-lxc.sh
     ├── step-ca-setup.sh
     ├── caddy-setup.sh
+    ├── caddy-public-setup.sh
     └── docs/
         ├── certbot-cloudflare.md
         ├── ubuntu-hardening.md
@@ -99,7 +101,8 @@ scripts/
         ├── bind9.md
         ├── create-lxc.md
         ├── step-ca.md
-        └── caddy.md
+        ├── caddy.md
+        └── caddy-public.md
 ```
 
 ---

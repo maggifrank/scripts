@@ -22,14 +22,19 @@ Installs Caddy as a reverse proxy with automatic TLS certificates from Let's Enc
 
 ## What It Does
 
-1. Installs Caddy from the official Caddy apt repository, then adds the Cloudflare DNS plugin using `caddy upgrade --plugins`. No compilation, no API timeouts — fast and reliable.
-2. Creates a dedicated `caddy` system user (no login shell)
-3. Grants Caddy the ability to bind to ports 80 and 443 without root
-4. Stores the Cloudflare API token securely at `/etc/caddy/cloudflare.env` (chmod 600)
-5. Writes a `Caddyfile` with per-site `tls { dns cloudflare }` blocks and a reverse proxy directive
-6. Validates the Caddyfile before starting
-7. Creates and enables a hardened systemd service with auto-restart
-8. Installs the `caddy-add-service` helper command
+1. Adds the official Caddy and xcaddy apt repositories
+2. Installs Caddy (base) and xcaddy from apt
+3. Installs Go from the official Go distribution (required by xcaddy)
+4. Builds Caddy with the Cloudflare DNS plugin using xcaddy — **this takes 3-5 minutes**
+5. Creates a dedicated `caddy` system user (no login shell)
+6. Grants Caddy the ability to bind to ports 80 and 443 without root
+7. Stores the Cloudflare API token securely at `/etc/caddy/cloudflare.env` (chmod 600)
+8. Writes a `Caddyfile` with per-site `tls { dns cloudflare }` blocks and a reverse proxy directive
+9. Validates the Caddyfile before starting
+10. Creates and enables a hardened systemd service with auto-restart
+11. Installs the `caddy-add-service` helper command
+
+> **Note:** The xcaddy build step is silent for several minutes while Go compiles — this is normal, do not interrupt it.
 
 ## Adding Services After Setup
 

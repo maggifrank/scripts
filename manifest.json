@@ -30,9 +30,21 @@
     "requires_root": true
   },
   {
-    "name": "Setup Caddy ",
+    "name": "step-ca Internal CA",
+    "file": "step-ca-setup.sh",
+    "description": "Install and configure step-ca as an internal CA with ACME support for automatic TLS certificates.",
+    "requires_root": true
+  },
+  {
+    "name": "Caddy Reverse Proxy (Internal)",
     "file": "caddy-setup.sh",
-    "description": "Install and configure Caddy as a reverse proxy and web server.",
+    "description": "Reverse proxy with Let's Encrypt TLS via Cloudflare DNS-01. No inbound ports required.",
+    "requires_root": true
+  },
+  {
+    "name": "Caddy Reverse Proxy (Public)",
+    "file": "caddy-public-setup.sh",
+    "description": "Reverse proxy with automatic Let's Encrypt TLS via HTTP-01. Requires ports 80 and 443 open.",
     "requires_root": true
   }
 ]
