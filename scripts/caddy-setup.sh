@@ -120,10 +120,15 @@ case "$ARCH" in
   *)      error "Unsupported architecture: $ARCH" ;;
 esac
 
-# Download pre-built Caddy with Cloudflare DNS plugin from Caddy's download API
+# Download pre-built Caddy with Cloudflare DNS plugin from CaddyBuilds
+# This is a community-maintained repo that builds Caddy + Cloudflare plugin on every release
+info "Fetching latest Caddy + Cloudflare release..."
+CADDY_VERSION=$(curl -fsSL https://api.github.com/repos/CaddyBuilds/caddy-cloudflare/releases/latest | jq -r '.tag_name')
+info "Latest version: ${CADDY_VERSION}"
+
+CADDY_URL="https://github.com/CaddyBuilds/caddy-cloudflare/releases/download/${CADDY_VERSION}/caddy-cloudflare-linux-${CADDY_ARCH}"
 info "Downloading Caddy with Cloudflare DNS plugin..."
-CADDY_URL="https://caddyserver.com/api/download?os=linux&arch=${CADDY_ARCH}&p=github.com%2Fcaddy-dns%2Fcloudflare"
-curl -fsSL "$CADDY_URL" -o /usr/bin/caddy || error "Failed to download Caddy."
+curl -fsSL --max-time 60 "$CADDY_URL" -o /usr/bin/caddy || error "Failed to download Caddy from CaddyBuilds."
 chmod +x /usr/bin/caddy
 info "Caddy installed: $(caddy version)"
 

@@ -22,7 +22,7 @@ Installs Caddy as a reverse proxy with automatic TLS certificates from Let's Enc
 
 ## What It Does
 
-1. Downloads a pre-built Caddy binary with the Cloudflare DNS plugin from Caddy's official download API — no Go compiler needed
+1. Downloads a pre-built Caddy binary with the Cloudflare DNS plugin from [CaddyBuilds/caddy-cloudflare](https://github.com/CaddyBuilds/caddy-cloudflare) — a community repo that auto-builds on every Caddy release. Fast direct download, no compilation needed.
 2. Creates a dedicated `caddy` system user (no login shell)
 3. Grants Caddy the ability to bind to ports 80 and 443 without root
 4. Stores the Cloudflare API token securely at `/etc/caddy/cloudflare.env` (chmod 600)
