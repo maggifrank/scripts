@@ -46,5 +46,11 @@
     "file": "caddy-public-setup.sh",
     "description": "Reverse proxy with automatic Let's Encrypt TLS via HTTP-01. Requires ports 80 and 443 open.",
     "requires_root": true
+  },
+  {
+    "name": "allssh",
+    "file": "allssh.sh",
+    "description": "Install allssh and allssh-add. Run commands across multiple servers over SSH, sequentially or in parallel.",
+    "requires_root": false
   }
 ]

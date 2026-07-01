@@ -137,8 +137,8 @@ else
   NET_CONFIG="ip=dhcp"
 fi
 
-read -rp "DNS server [default: 10.100.53.73]: " DNS
-DNS=${DNS:-10.100.53.73}
+read -rp "DNS server [default: 10.100.53.36]: " DNS
+DNS=${DNS:-10.100.53.36}
 
 # ── Step 7: Security ──────────────────────────────────────────────────────────
 step "7. Security"
