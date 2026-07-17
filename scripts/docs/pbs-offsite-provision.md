@@ -23,7 +23,7 @@ The script prints a summary and asks for confirmation before creating anything, 
 ## What it does
 
 1. Checks `pve-data-tpool` free space and asks you to confirm there's room
-2. Downloads the Debian 12 CT template if not already cached
+2. Downloads the Debian 13 CT template if not already cached
 3. Creates the unprivileged CT with the given network settings
 4. Installs `nfs-kernel-server` inside the CT
 5. Creates `/data` as the export directory

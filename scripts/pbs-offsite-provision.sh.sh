@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# lxc-nfs-setup.sh
+# pbs-offsite-provision.sh
 #
-# Set up an LXC container with NFS mounting for PBS offsite backups.
+# Provisions an unprivileged LXC CT on the local-lvm thin pool to serve
+# an NFS export used as a PBS offsite-DR datastore target.
 #
 # Pattern: no spare/dedicated disk on the Proxmox host, so the export
 # lives on a CT rootfs volume carved out of the existing thin pool
@@ -21,7 +22,7 @@ VMID=                      # leave blank to auto-assign the next available VMID
 HOSTNAME="pbs-nfs"          # CT hostname
 BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+TEMPLATE=                   # leave blank to auto-resolve the current debian-13 template
 ROOTFS_STORAGE="local-lvm"
 
 DNS_ZONE="talva.is"
@@ -88,9 +89,27 @@ echo
 read -rp "Confirm there is enough free space in pve-data-tpool for ${CT_SIZE_GB}G. Continue? [y/N] " ok
 [ "$ok" = "y" ] || { echo "Aborted."; exit 1; }
 
+echo "==> Resolving current debian-13 template..."
+pveam update >/dev/null
+
+if [ -z "$TEMPLATE" ]; then
+  TEMPLATE="$(pveam available --section system | awk '{print $2}' | grep '^debian-13-standard_' | sort -V | tail -1)"
+  if [ -z "$TEMPLATE" ]; then
+    echo "ERROR: could not find a debian-13-standard template in 'pveam available'." >&2
+    exit 1
+  fi
+  echo "    Using: $TEMPLATE"
+fi
+
 echo "==> Downloading template (if not already cached)..."
-pveam update
-pveam download "$TEMPLATE_STORAGE" "$TEMPLATE" || true
+if ! pveam list "$TEMPLATE_STORAGE" | grep -q "$TEMPLATE"; then
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
+fi
+
+if ! pveam list "$TEMPLATE_STORAGE" | grep -q "$TEMPLATE"; then
+  echo "ERROR: template $TEMPLATE is not present on $TEMPLATE_STORAGE after download attempt." >&2
+  exit 1
+fi
 
 echo "==> Creating CT $VMID ($HOSTNAME)..."
 pct create "$VMID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
