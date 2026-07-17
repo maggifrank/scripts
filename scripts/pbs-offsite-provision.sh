@@ -20,7 +20,6 @@ set -euo pipefail
 ### --- Static config: edit if it differs per box ------------------------
 VMID=                      # leave blank to auto-assign the next available VMID
 HOSTNAME="pbs-nfs"          # CT hostname
-BRIDGE="vmbr0"
 TEMPLATE_STORAGE="local"
 TEMPLATE=                   # leave blank to auto-resolve the current debian-13 template
 ROOTFS_STORAGE="local-lvm"
@@ -42,6 +41,29 @@ if [ -z "$VMID" ]; then
   VMID="$(pvesh get /cluster/nextid)"
   echo "==> No VMID set, auto-assigned next available: $VMID"
 fi
+
+echo
+echo "==> Available bridges on this host:"
+mapfile -t AVAILABLE_BRIDGES < <(ip -o link show type bridge | awk -F': ' '{print $2}' | sort)
+if [ "${#AVAILABLE_BRIDGES[@]}" -eq 0 ]; then
+  echo "ERROR: no bridges found via 'ip -o link show type bridge'." >&2
+  exit 1
+fi
+for i in "${!AVAILABLE_BRIDGES[@]}"; do
+  printf "  %d) %s\n" "$((i+1))" "${AVAILABLE_BRIDGES[$i]}"
+done
+BRIDGE_DEFAULT_IDX=0
+for i in "${!AVAILABLE_BRIDGES[@]}"; do
+  [ "${AVAILABLE_BRIDGES[$i]}" = "vmbr0" ] && BRIDGE_DEFAULT_IDX=$((i+1))
+done
+read -rp "  Select bridge [${BRIDGE_DEFAULT_IDX:-1}]: " bridge_choice
+bridge_choice="${bridge_choice:-$BRIDGE_DEFAULT_IDX}"
+if ! [[ "$bridge_choice" =~ ^[0-9]+$ ]] || [ "$bridge_choice" -lt 1 ] || [ "$bridge_choice" -gt "${#AVAILABLE_BRIDGES[@]}" ]; then
+  echo "ERROR: invalid bridge selection." >&2
+  exit 1
+fi
+BRIDGE="${AVAILABLE_BRIDGES[$((bridge_choice-1))]}"
+echo "    Using bridge: $BRIDGE"
 
 echo
 echo "==> Network and volume settings for this CT:"
@@ -73,6 +95,7 @@ echo
 echo "==> Summary:"
 echo "    VMID:          $VMID"
 echo "    Hostname:      $HOSTNAME"
+echo "    Bridge:        $BRIDGE"
 echo "    Volume size:   ${CT_SIZE_GB}G"
 echo "    IP/mask:       $CT_IP"
 echo "    Gateway:       $CT_GW"
@@ -124,7 +147,56 @@ pct create "$VMID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
 
 echo "==> Starting CT..."
 pct start "$VMID"
-sleep 5
+
+echo "==> Waiting for network to come up inside the CT..."
+NET_READY=0
+for i in $(seq 1 30); do
+  if pct exec "$VMID" -- ping -c1 -W2 "$CT_GW" >/dev/null 2>&1; then
+    NET_READY=1
+    break
+  fi
+  sleep 2
+done
+
+if [ "$NET_READY" -ne 1 ]; then
+  echo "ERROR: CT $VMID cannot reach its gateway ($CT_GW) after 60s." >&2
+  echo "  This usually means the wrong bridge was selected, or the gateway/IP" >&2
+  echo "  don't actually belong to that bridge's network. Check with:" >&2
+  echo "    pct exec $VMID -- ip addr" >&2
+  echo "    pct exec $VMID -- ip route" >&2
+  echo "  Fix networking (pct set $VMID --net0 ...), then re-run this script's" >&2
+  echo "  remaining steps manually against CT $VMID rather than re-running the" >&2
+  echo "  whole script, which would create a second CT." >&2
+  exit 1
+fi
+echo "    Gateway reachable."
+
+if ! pct exec "$VMID" -- getent hosts deb.debian.org >/dev/null 2>&1; then
+  echo "WARNING: gateway is reachable but DNS resolution is failing inside the CT." >&2
+  echo "  Check: pct exec $VMID -- cat /etc/resolv.conf" >&2
+  echo "  and confirm the nameservers (${CT_NS}) are reachable from this CT's subnet." >&2
+  read -rp "Continue anyway and attempt apt install? [y/N] " dns_continue
+  [ "$dns_continue" = "y" ] || { echo "Stopped. CT $VMID exists but is not yet configured - fix DNS and re-run remaining steps manually."; exit 1; }
+fi
+
+echo "==> Setting root password (needed for console access)..."
+while true; do
+  read -rsp "  Root password for this CT: " ct_root_pw
+  echo
+  read -rsp "  Confirm password: " ct_root_pw_confirm
+  echo
+  if [ -z "$ct_root_pw" ]; then
+    echo "  Password cannot be empty."
+    continue
+  fi
+  if [ "$ct_root_pw" != "$ct_root_pw_confirm" ]; then
+    echo "  Passwords did not match, try again."
+    continue
+  fi
+  break
+done
+pct exec "$VMID" -- bash -c "echo 'root:${ct_root_pw}' | chpasswd"
+unset ct_root_pw ct_root_pw_confirm
 
 echo "==> Installing nfs-kernel-server inside CT..."
 pct exec "$VMID" -- bash -c "apt update && apt install -y nfs-kernel-server"
