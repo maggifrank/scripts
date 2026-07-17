@@ -49,6 +49,7 @@ VMID=                        # leave blank to auto-assign the next available VMI
 VM_NAME="pbs-nfs"             # VM name / guest hostname
 VM_MEMORY_MB=1024
 VM_CORES=1
+OS_DISK_SIZE_GB=8              # small, fixed - the export lives on a separate data disk, not here
 DISK_STORAGE="local-lvm"
 SNIPPET_STORAGE="local"       # must support the 'snippets' content type
 
@@ -98,7 +99,7 @@ echo "    Using bridge: $BRIDGE"
 
 echo
 echo "==> Network and volume settings for this VM:"
-read -rp "  Disk size in GB: " CT_SIZE_GB
+read -rp "  Data disk size in GB (separate from the OS disk, this is what gets exported via NFS): " CT_SIZE_GB
 read -rp "  IP address (no mask): " CT_IPADDR
 read -rp "  Subnet mask bits [24]: " CT_MASK
 CT_MASK="${CT_MASK:-24}"
@@ -140,16 +141,27 @@ while true; do
 done
 
 echo
+read -rp "  SSH public key for root (optional, paste the full 'ssh-ed25519 AAAA...' line, or leave blank to skip): " SSH_PUBKEY
+if [ -n "$SSH_PUBKEY" ]; then
+  if ! [[ "$SSH_PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]]; then
+    echo "WARNING: that doesn't look like a valid SSH public key (expected it to start with ssh-ed25519/ssh-rsa/ecdsa-sha2-...). Skipping key setup." >&2
+    SSH_PUBKEY=""
+  fi
+fi
+
+echo
 echo "==> Summary:"
 echo "    VMID:          $VMID"
 echo "    Name:          $VM_NAME"
 echo "    Bridge:        $BRIDGE"
-echo "    Disk size:     ${CT_SIZE_GB}G"
+echo "    OS disk:       ${OS_DISK_SIZE_GB}G"
+echo "    Data disk:     ${CT_SIZE_GB}G (mounted at /data, exported via NFS)"
 echo "    IP/mask:       $CT_IP"
 echo "    Gateway:       $CT_GW"
 echo "    Nameserver:    $CT_NS"
 echo "    Search domain: $CT_SEARCHDOMAIN"
 echo "    NFS client:    $NFS_CLIENT_IP"
+echo "    SSH key:       $([ -n "$SSH_PUBKEY" ] && echo "yes" || echo "no (password login only)")"
 read -rp "Proceed with these settings? [y/N] " confirm_settings
 [ "$confirm_settings" = "y" ] || { echo "Aborted."; exit 1; }
 
@@ -157,16 +169,17 @@ echo "==> Checking thin pool headroom before allocating..."
 pvesm status
 lvs -a | grep pve-data || true
 echo
+TOTAL_REQUESTED_GB=$((OS_DISK_SIZE_GB + CT_SIZE_GB))
 AVAIL_KIB="$(pvesm status | awk -v s="$DISK_STORAGE" '$1==s {print $5}')"
 if [ -n "$AVAIL_KIB" ]; then
   AVAIL_GIB=$((AVAIL_KIB / 1024 / 1024))
-  if [ "$CT_SIZE_GB" -gt "$AVAIL_GIB" ]; then
-    echo "WARNING: requested ${CT_SIZE_GB}G exceeds the ~${AVAIL_GIB}G currently available on ${DISK_STORAGE}." >&2
+  if [ "$TOTAL_REQUESTED_GB" -gt "$AVAIL_GIB" ]; then
+    echo "WARNING: requested ${OS_DISK_SIZE_GB}G (OS) + ${CT_SIZE_GB}G (data) = ${TOTAL_REQUESTED_GB}G exceeds the ~${AVAIL_GIB}G currently available on ${DISK_STORAGE}." >&2
     echo "  Thin provisioning allows this, but the pool will report itself oversubscribed" >&2
     echo "  and you risk running it out of real space if usage grows into the overcommitted amount." >&2
   fi
 fi
-read -rp "Confirm there is enough free space in ${DISK_STORAGE} for ${CT_SIZE_GB}G. Continue? [y/N] " ok
+read -rp "Confirm there is enough free space in ${DISK_STORAGE} for ${TOTAL_REQUESTED_GB}G total. Continue? [y/N] " ok
 [ "$ok" = "y" ] || { echo "Aborted."; exit 1; }
 
 echo "==> Ensuring 'snippets' content type is enabled on ${SNIPPET_STORAGE}..."
@@ -187,7 +200,7 @@ else
   echo "    Using cached image: $IMG_FILE"
 fi
 
-echo "==> Writing cloud-init vendor-data snippet (packages + NFS export config)..."
+echo "==> Writing cloud-init vendor-data snippet (data disk mount + NFS export config)..."
 SNIPPET_DIR="/var/lib/vz/snippets"
 mkdir -p "$SNIPPET_DIR"
 SNIPPET_FILE="${SNIPPET_DIR}/pbs-nfs-${VMID}.yaml"
@@ -198,6 +211,17 @@ packages:
   - nfs-kernel-server
   - qemu-guest-agent
 ssh_pwauth: true
+disk_setup:
+  /dev/sdb:
+    table_type: gpt
+    layout: false
+    overwrite: false
+fs_setup:
+  - device: /dev/sdb
+    filesystem: ext4
+    overwrite: false
+mounts:
+  - [ /dev/sdb, /data, ext4, "defaults,nofail", "0", "2" ]
 write_files:
   - path: /etc/exports
     owner: root:root
@@ -205,7 +229,6 @@ write_files:
     content: |
       /data ${NFS_CLIENT_IP}(rw,sync,no_subtree_check,no_root_squash)
 runcmd:
-  - mkdir -p /data
   - chown nobody:nogroup /data
   - exportfs -ra
   - systemctl enable --now nfs-kernel-server
@@ -228,15 +251,24 @@ qm set "$VMID" --scsi0 "${DISK_STORAGE}:vm-${VMID}-disk-0"
 qm set "$VMID" --ide2 "${DISK_STORAGE}:cloudinit"
 qm set "$VMID" --boot order=scsi0
 qm set "$VMID" --serial0 socket --vga serial0
-qm resize "$VMID" scsi0 "${CT_SIZE_GB}G"
+qm resize "$VMID" scsi0 "${OS_DISK_SIZE_GB}G"
+
+echo "==> Creating separate ${CT_SIZE_GB}G data disk (scsi1) for /data..."
+qm set "$VMID" --scsi1 "${DISK_STORAGE}:${CT_SIZE_GB}"
 
 qm set "$VMID" --ipconfig0 "ip=${CT_IP},gw=${CT_GW}"
 qm set "$VMID" --nameserver "$CT_NS"
 qm set "$VMID" --searchdomain "$CT_SEARCHDOMAIN"
 qm set "$VMID" --ciuser root
 qm set "$VMID" --cipassword "$vm_root_pw"
+if [ -n "$SSH_PUBKEY" ]; then
+  SSH_KEY_TMPFILE="$(mktemp)"
+  echo "$SSH_PUBKEY" > "$SSH_KEY_TMPFILE"
+  qm set "$VMID" --sshkeys "$SSH_KEY_TMPFILE"
+  rm -f "$SSH_KEY_TMPFILE"
+fi
 qm set "$VMID" --cicustom "vendor=${SNIPPET_STORAGE}:snippets/pbs-nfs-${VMID}.yaml"
-unset vm_root_pw vm_root_pw_confirm
+unset vm_root_pw vm_root_pw_confirm SSH_PUBKEY
 
 echo "==> Starting VM..."
 qm start "$VMID"
