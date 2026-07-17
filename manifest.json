@@ -52,5 +52,11 @@
     "file": "allssh.sh",
     "description": "Install allssh and allssh-add. Run commands across multiple servers over SSH, sequentially or in parallel.",
     "requires_root": false
+  },
+  {
+    "name": "LXC Container with NFS, used for PBS offsite backups",
+    "file": "lxc-nfs-setup.sh",
+    "description": "Set up an LXC container with NFS mounting for PBS offsite backups.",
+    "requires_root": true
   }
 ]

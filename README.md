@@ -27,6 +27,7 @@ A menu will appear — select a number to run a script. That's it.
 | Caddy Reverse Proxy (Internal) | Reverse proxy with Let's Encrypt TLS via Cloudflare DNS-01 | [docs](scripts/docs/caddy.md) |
 | Caddy Reverse Proxy (Public) | Reverse proxy with automatic Let's Encrypt TLS via HTTP-01 | [docs](scripts/docs/caddy-public.md) |
 | allssh | Run commands across multiple servers over SSH, sequentially or in parallel | [docs](scripts/docs/allssh.md) |
+| Offsite PBS NFS Repo | Provisions an LXC + NFS export on a shared thin pool as a PBS offsite-DR datastore target (run on Proxmox host) | [docs](scripts/docs/pbs-offsite-provision.md) |
 
 ---
 
@@ -98,6 +99,7 @@ scripts/
     ├── allssh.sh
     ├── allssh
     ├── allssh-add
+    ├── pbs-offsite-provision.sh
     └── docs/
         ├── certbot-cloudflare.md
         ├── ubuntu-hardening.md
@@ -107,7 +109,8 @@ scripts/
         ├── step-ca.md
         ├── caddy.md
         ├── caddy-public.md
-        └── allssh.md
+        ├── allssh.md
+        └── pbs-offsite-provision.md
 ```
 
 ---
