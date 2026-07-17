@@ -54,9 +54,9 @@
     "requires_root": false
   },
   {
-    "name": "LXC Container with NFS, used for PBS offsite backups",
+    "name": "VM with NFS, used for PBS offsite backups",
     "file": "pbs-offsite-provision.sh",
-    "description": "Set up an LXC container with NFS mounting for PBS offsite backups.",
+    "description": "Set up a VM with NFS mounting for PBS offsite backups.",
     "requires_root": true
   }
 ]

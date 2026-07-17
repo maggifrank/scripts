@@ -23,6 +23,16 @@
 # No ZFS underneath -> relying on PBS verify jobs for integrity
 # checking, not local scrub.
 #
+# Cloud-init gotchas this script works around (learned the hard way):
+#   - `qm set --cicustom user=...` REPLACES Proxmox's auto-generated user
+#     config entirely - it does not merge with --ciuser/--cipassword. Our
+#     custom config goes in as `vendor=...` instead, which merges alongside
+#     the auto-generated user data rather than overriding it.
+#   - qemu-guest-agent is NOT preinstalled in Debian's cloud images (generic
+#     or genericcloud) - `--agent enabled=1` only opens the QEMU-side
+#     channel. The agent package has to be installed via cloud-init and
+#     explicitly enabled, or `qm agent ping` will just time out forever.
+#
 # Requirements on the Proxmox host:
 #   - Internet access to cloud.debian.org (to fetch the cloud image)
 #   - 'local' storage must have the 'snippets' content type enabled
@@ -147,6 +157,15 @@ echo "==> Checking thin pool headroom before allocating..."
 pvesm status
 lvs -a | grep pve-data || true
 echo
+AVAIL_KIB="$(pvesm status | awk -v s="$DISK_STORAGE" '$1==s {print $5}')"
+if [ -n "$AVAIL_KIB" ]; then
+  AVAIL_GIB=$((AVAIL_KIB / 1024 / 1024))
+  if [ "$CT_SIZE_GB" -gt "$AVAIL_GIB" ]; then
+    echo "WARNING: requested ${CT_SIZE_GB}G exceeds the ~${AVAIL_GIB}G currently available on ${DISK_STORAGE}." >&2
+    echo "  Thin provisioning allows this, but the pool will report itself oversubscribed" >&2
+    echo "  and you risk running it out of real space if usage grows into the overcommitted amount." >&2
+  fi
+fi
 read -rp "Confirm there is enough free space in ${DISK_STORAGE} for ${CT_SIZE_GB}G. Continue? [y/N] " ok
 [ "$ok" = "y" ] || { echo "Aborted."; exit 1; }
 
@@ -168,7 +187,7 @@ else
   echo "    Using cached image: $IMG_FILE"
 fi
 
-echo "==> Writing cloud-init snippet (packages + NFS export config)..."
+echo "==> Writing cloud-init vendor-data snippet (packages + NFS export config)..."
 SNIPPET_DIR="/var/lib/vz/snippets"
 mkdir -p "$SNIPPET_DIR"
 SNIPPET_FILE="${SNIPPET_DIR}/pbs-nfs-${VMID}.yaml"
@@ -177,6 +196,8 @@ cat > "$SNIPPET_FILE" << CIEOF
 package_update: true
 packages:
   - nfs-kernel-server
+  - qemu-guest-agent
+ssh_pwauth: true
 write_files:
   - path: /etc/exports
     owner: root:root
@@ -188,6 +209,7 @@ runcmd:
   - chown nobody:nogroup /data
   - exportfs -ra
   - systemctl enable --now nfs-kernel-server
+  - systemctl enable --now qemu-guest-agent
 CIEOF
 
 echo "==> Creating VM $VMID ($VM_NAME)..."
@@ -213,15 +235,15 @@ qm set "$VMID" --nameserver "$CT_NS"
 qm set "$VMID" --searchdomain "$CT_SEARCHDOMAIN"
 qm set "$VMID" --ciuser root
 qm set "$VMID" --cipassword "$vm_root_pw"
-qm set "$VMID" --cicustom "user=${SNIPPET_STORAGE}:snippets/pbs-nfs-${VMID}.yaml"
+qm set "$VMID" --cicustom "vendor=${SNIPPET_STORAGE}:snippets/pbs-nfs-${VMID}.yaml"
 unset vm_root_pw vm_root_pw_confirm
 
 echo "==> Starting VM..."
 qm start "$VMID"
 
-echo "==> Waiting for QEMU guest agent to respond (up to 3 min)..."
+echo "==> Waiting for QEMU guest agent to respond (up to 6 min - it has to be installed by cloud-init first, it's not preinstalled in the base image)..."
 AGENT_READY=0
-for i in $(seq 1 36); do
+for i in $(seq 1 72); do
   if qm agent "$VMID" ping >/dev/null 2>&1; then
     AGENT_READY=1
     break
@@ -230,13 +252,12 @@ for i in $(seq 1 36); do
 done
 
 if [ "$AGENT_READY" -ne 1 ]; then
-  echo "ERROR: guest agent did not respond within 3 minutes." >&2
-  echo "  This usually means the wrong bridge/IP/gateway was set, cloud-init" >&2
-  echo "  failed, or the image doesn't have qemu-guest-agent (it should, in" >&2
-  echo "  the Debian 'generic' cloud image). Check the console:" >&2
+  echo "ERROR: guest agent did not respond within 6 minutes." >&2
+  echo "  Check console output for cloud-init/network errors:" >&2
   echo "    qm terminal $VMID" >&2
-  echo "  or:" >&2
-  echo "    qm monitor $VMID" >&2
+  echo "  Login is root / the password you set. If login fails there too," >&2
+  echo "  cloud-init itself likely failed before it got to setting the" >&2
+  echo "  password - check the boot log on the console for errors." >&2
   exit 1
 fi
 echo "    Guest agent responding."
