@@ -1,0 +1,24 @@
+[Unit]
+Description=Supabase backup for %i
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/backup.sh %i
+
+# The script reads /etc/supabase-backup/%i.conf itself rather than systemd
+# using EnvironmentFile=, so the parser never has to cope with whatever
+# punctuation ends up in a database password.
+
+# Needs outbound network, one writable directory, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/backups/supabase
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true

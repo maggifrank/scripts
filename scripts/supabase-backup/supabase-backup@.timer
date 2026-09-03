@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly Supabase backup for %i
+
+[Timer]
+OnCalendar=*-*-* 03:20:00
+# Runs on next boot if the machine was down at the scheduled time.
+Persistent=true
+# Spreads multiple projects on one host, and avoids every host on a network
+# hitting Supabase at the same instant.
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

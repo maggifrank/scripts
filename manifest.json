@@ -58,5 +58,11 @@
     "file": "pbs-offsite-provision.sh",
     "description": "Set up a VM with NFS mounting for PBS offsite backups.",
     "requires_root": true
+  },
+  {
+    "name": "Supabase Backup",
+    "file": "supabase-backup-setup.sh",
+    "description": "Nightly backup of a Supabase project \u2014 schema, data, privileges, auth users and storage \u2014 into one verifiable tarball. Multiple projects per host.",
+    "requires_root": true
   }
 ]
