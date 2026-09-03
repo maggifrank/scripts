@@ -23,6 +23,7 @@ step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 IP_PREFIX="10.100.53"          # subnet scanned for a free address
 IP_SCAN_START=20               # first host octet to consider
 IP_MASK=24                     # default prefix length when none is given
+DEFAULT_GATEWAY="10.100.53.254"
 DEFAULT_DNS="10.100.53.34 10.100.53.41"
 DEFAULT_SEARCHDOMAIN="talva.is"
 
@@ -72,7 +73,8 @@ choose_from_menu() {
 }
 
 # First address at or after ${IP_PREFIX}.${IP_SCAN_START} that is absent from the
-# host's neighbour/ARP table, is not a local address, and does not answer a ping.
+# host's neighbour/ARP table, is not a local address or the gateway, and does not
+# answer a ping.
 # Prints nothing and returns 1 if the range is exhausted.
 suggest_next_ip() {
   local used candidate i
@@ -81,6 +83,7 @@ suggest_next_ip() {
       ip -4 neigh show 2>/dev/null | awk '$NF != "FAILED" && $NF != "INCOMPLETE" {print $1}'
       arp -an 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
       ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+      echo "$DEFAULT_GATEWAY"
     } | sort -u
   )
   for ((i = IP_SCAN_START; i <= 254; i++)); do
@@ -258,7 +261,8 @@ if [ "$IPCHOICE" = "2" ]; then
   done
 
   while true; do
-    read -rp "Gateway (e.g. ${IP_PREFIX}.1): " GATEWAY
+    read -rp "Gateway [default: ${DEFAULT_GATEWAY}]: " GATEWAY
+    GATEWAY=${GATEWAY:-$DEFAULT_GATEWAY}
     [[ "$GATEWAY" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
     warn "Invalid IP address."
   done
