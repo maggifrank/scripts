@@ -72,6 +72,12 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # A project name is a directory under DATA_DIR and a systemd instance name.
 # Constraining it to this shape is what makes every path and unit name below
 # safe to build by interpolation: no traversal and no escaping are expressible.
+#
+# Deliberately wider than supabase-backup-setup.sh's own rule (lowercase, digits,
+# - and _). Matching that exactly would be stricter, but this list is how an
+# operator finds out what is on the host: a directory made by hand, or by some
+# older version of the tool, should show up and be judged - not be silently
+# omitted from a page whose whole job is to say what is there.
 PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 STAMP_RE = r"\d{8}T\d{6}Z"
 

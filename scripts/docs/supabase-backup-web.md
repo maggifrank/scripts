@@ -131,6 +131,14 @@ directory and is safe to run repeatedly.
 under `DATA_DIR` and `supabase-backup@*.timer` instances. A project with
 neither does not exist as far as this is concerned.
 
+**A project shows `never` or `unreadable` although its archives are fine.** Its
+`.conf` sets `BACKUP_DIR` somewhere other than `/var/backups/supabase/<project>`.
+The console cannot follow that: `BACKUP_DIR` lives in the same file as the
+database password and the service key, and this process is deliberately unable
+to read it. `supabase-backup-setup.sh` always writes the default location, so
+this only happens to a hand-edited config. Either move the archives back, or
+point the whole console elsewhere with `DATA_DIR` in `web.env`.
+
 **It will not start: "refusing to start without authentication".**
 `WEB_PASSWORD_HASH` is empty. Generate one with
 `/opt/supabase-backup/web/server.py --hash`.
@@ -169,6 +177,10 @@ systemctl restart systemd-journald
 - Run history is only as deep as the journal, which is shallow by default.
 - Adding a project needs a re-run of the setup script before the console can
   read it. It says `unreadable` until then rather than pretending it is fine.
+- Archives are found at `DATA_DIR/<project>`, the layout
+  `supabase-backup-setup.sh` creates. A `.conf` that overrides `BACKUP_DIR` is
+  invisible to the console, because reading that file would mean reading the
+  project's credentials.
 - Verification proves an archive is intact and self-consistent. It does not
   prove it restores; only a rehearsal does that.
 - The console knows nothing about offsite copies. A green header means the
