@@ -1,0 +1,47 @@
+[Unit]
+Description=Supabase backup web console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+After=network.target
+
+[Service]
+Type=exec
+User=supabase-backup-web
+Group=supabase-backup-web
+ExecStart=/opt/supabase-backup/web/server.py
+Restart=on-failure
+RestartSec=5s
+
+EnvironmentFile=/etc/supabase-backup-web/web.env
+
+# EnvironmentFile= rather than Environment=: systemd expands $ in Environment=
+# values, and a PBKDF2 hash is $-separated, so the process would receive a
+# mangled hash and silently reject every password. EnvironmentFile does no
+# expansion.
+
+# Reading the journal is how the run history is built.
+SupplementaryGroups=systemd-journal
+
+# This process has no business reading a project's credentials. The 0600 modes
+# on those files already stop it; this makes the intent explicit and survives
+# someone loosening them by accident.
+InaccessiblePaths=-/etc/supabase-backup
+
+# Nothing here writes to disk, so nothing needs to be writable.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
