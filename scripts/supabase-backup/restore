@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# supabase-restore — guided restore of a supabase-backup archive into a target
+# Supabase project.
+#
+#   supabase-restore            pick an archive, answer the prompts
+#   supabase-restore --dry-run  everything except the writes
+#   supabase-restore --list     available archives
+#   supabase-restore --reset    DESTRUCTIVE: clear a target so a rehearsal can
+#                               be repeated. Refuses any configured source.
+#
+# Bash rather than POSIX sh, unlike backup.sh: this is interactive and runs
+# rarely, so readable prompts matter more than minimal dependencies.
+set -euo pipefail
+
+LIB_DIR="${LIB_DIR:-/opt/supabase-backup}"
+CONF_DIR="${CONF_DIR:-/etc/supabase-backup}"
+DATA_DIR="${DATA_DIR:-/var/backups/supabase}"
+WORK=""
+
+# Debian's psql is a Perl wrapper that emits a wall of locale warnings under an
+# ungenerated LANG, which some consoles hand us.
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+if [[ -t 1 ]]; then
+  B=$'\033[1m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'
+else
+  B=""; R=""; G=""; Y=""; D=""; N=""
+fi
+
+die()  { printf '\n%sERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
+info() { printf '    %s\n' "$*"; }
+ok()   { printf '    %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '    %s!%s %s\n' "$Y" "$N" "$*"; }
+
+cleanup() { [[ -n "$WORK" && -d "$WORK" ]] && printf '\n%sExtracted archive left at %s%s\n' "$D" "$WORK" "$N"; }
+trap cleanup EXIT
+
+DRY_RUN=0; RESET=0
+case "${1:-}" in
+  --dry-run) DRY_RUN=1 ;;
+  --reset)   RESET=1 ;;
+  --list)    find "$DATA_DIR" -name '*.tar.gz' -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | sort -r || echo "no archives under $DATA_DIR"; exit 0 ;;
+  --help|-h) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  "")        ;;
+  *)         die "unknown option: $1 (try --help)" ;;
+esac
+
+ask() {
+  local prompt="$1" __var="$2" val=""
+  while [[ -z "$val" ]]; do
+    read -rp "    ${prompt}: " val
+    [[ -z "$val" ]] && warn "cannot be empty"
+  done
+  printf -v "$__var" '%s' "$val"
+}
+ask_secret() {
+  local prompt="$1" __var="$2" val=""
+  while [[ -z "$val" ]]; do
+    read -rsp "    ${prompt}: " val; echo
+    [[ -z "$val" ]] && warn "cannot be empty"
+  done
+  printf -v "$__var" '%s' "$val"
+}
+confirm() { local r; read -rp "    $1 [y/N]: " r; [[ "$r" == y || "$r" == Y ]]; }
+ref_of()  { sed -E 's|.*://(postgres\.)?([a-z0-9]+)[.:/].*|\2|; s|/+$||' <<<"$1"; }
+
+# ── 0. Preflight ───────────────────────────────────────────────────────────
+step "Preflight"
+for c in psql curl jq tar sha256sum; do command -v "$c" >/dev/null || die "$c not found"; done
+ok "tools present"
+(( DRY_RUN )) && warn "DRY RUN — nothing will be written to the target"
+
+# ── 1. Archive ─────────────────────────────────────────────────────────────
+if (( RESET )); then
+  warn "RESET mode — this destroys data in a target, it restores none"
+else
+  step "Choose an archive"
+  mapfile -t ARCHIVES < <(find "$DATA_DIR" -name '*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  (( ${#ARCHIVES[@]} )) || die "no archives found under $DATA_DIR"
+  for i in "${!ARCHIVES[@]}"; do
+    printf '    %2d) %-46s %s%s%s\n' "$((i+1))" "$(basename "${ARCHIVES[$i]}")" \
+      "$D" "$(du -h "${ARCHIVES[$i]}" | cut -f1)" "$N"
+    (( i >= 14 )) && break
+  done
+  read -rp "    Number [1 = newest]: " CHOICE
+  ARCHIVE="${ARCHIVES[$(( ${CHOICE:-1} - 1 ))]:-}"
+  [[ -n "$ARCHIVE" ]] || die "no such archive"
+  ok "using $(basename "$ARCHIVE")"
+
+  step "Extract and verify"
+  WORK="$(mktemp -d /tmp/supabase-restore-XXXXXX)"
+  tar xzf "$ARCHIVE" -C "$WORK"
+  ( cd "$WORK" && sha256sum -c SHA256SUMS --quiet ) \
+    || die "checksum mismatch — this archive is damaged, use an older one"
+  ok "checksums verify"
+  for f in manifest.json schema.sql auth.sql non-public.sql; do
+    [[ -f "$WORK/$f" ]] || die "archive is missing $f — is this a supabase-backup archive?"
+  done
+  info ""
+  # String concatenation rather than \(...) interpolation: nested quotes inside
+  # an interpolation are not valid jq, and are painful to escape through bash.
+  jq -r '
+    "    project:  " + .project,
+    "    captured: " + .created_utc,
+    "    schemas:  " + (.schemas | join(", ")),
+    "    buckets:  " + (.buckets | join(", ")),
+    "    objects:  " + (.storage_objects | tostring)
+  ' "$WORK/manifest.json"
+  info ""
+  jq -r '.rows | to_entries[] | "    \(.key)\t\(.value) rows"' "$WORK/manifest.json" | expand -t 34
+fi
+
+# ── 2. Target ──────────────────────────────────────────────────────────────
+step "Target project (the one being restored INTO)"
+info "From that project's dashboard: Connect → Direct tab → Session pooler (5432)"
+info ""
+ask        "Session pooler URI (with password)" TARGET_DB_URL
+ask        "Project URL (https://<ref>.supabase.co)" TARGET_SUPABASE_URL
+ask_secret "Service key" TARGET_SERVICE_KEY
+
+DB_REF="$(ref_of "$TARGET_DB_URL")"
+URL_REF="$(ref_of "$TARGET_SUPABASE_URL")"
+
+# ── 3. Guards ──────────────────────────────────────────────────────────────
+step "Safety checks"
+
+# Both credentials must name the same project. A mismatched pair writes the
+# database of one project while uploading files to another.
+[[ "$DB_REF" == "$URL_REF" ]] \
+  || die "credentials disagree: the URI names '$DB_REF' but the project URL names '$URL_REF'"
+ok "both credentials name project '$DB_REF'"
+
+# Never write to a project this host backs up. Checked against every configured
+# project, not just the one this archive came from.
+shopt -s nullglob
+for conf in "$CONF_DIR"/*.conf; do
+  src_url="$(grep -m1 '^SUPABASE_URL=' "$conf" | cut -d= -f2-)" || continue
+  src_ref="$(ref_of "$src_url")"
+  [[ "$DB_REF" != "$src_ref" ]] \
+    || die "target is '$src_ref', a project this host backs up ($(basename "$conf" .conf)). This tool will not write to a backup source."
+done
+shopt -u nullglob
+ok "target is not a configured backup source"
+
+[[ "$TARGET_DB_URL" == *":5432/"* ]] || warn "URI is not on port 5432 — transaction mode fails partway"
+
+step "Target reachability"
+ERRF="$(mktemp)"
+if ! EXISTING="$(psql "$TARGET_DB_URL" -Atc "select count(*) from pg_tables where schemaname='public'" 2>"$ERRF")"; then
+  sed 's/^/    /' "$ERRF"; rm -f "$ERRF"
+  die "cannot connect to the target (see above)"
+fi
+rm -f "$ERRF"
+ok "connected"
+
+# ── 4. Reset ───────────────────────────────────────────────────────────────
+if (( RESET )); then
+  step "Ready"
+  info "target: $DB_REF"
+  info "will DROP every non-extension table, function and type in its user"
+  info "schemas, remove all storage buckets and their objects, and delete"
+  info "every auth user."
+  info ""
+  warn "This destroys data in project '$DB_REF'. It cannot be undone."
+  read -rp "    Type the project ref to proceed: " TYPED
+  [[ "$TYPED" == "$DB_REF" ]] || die "did not match — aborted"
+
+  # Storage first, over the API: Supabase installs a protect_delete() trigger
+  # that rejects DELETE on storage.objects, so a SQL-only reset aborts there
+  # and silently skips everything after it.
+  step "Removing storage buckets"
+  mapfile -t TBUCKETS < <(psql "$TARGET_DB_URL" -Atc "select id from storage.buckets order by id")
+  if (( ${#TBUCKETS[@]} == 0 )); then
+    ok "no buckets present"
+  else
+    for b in "${TBUCKETS[@]}"; do
+      for act in "empty" ""; do
+        m="POST"; [[ -z "$act" ]] && m="DELETE"
+        sc="$(curl -s -o /dev/null -w '%{http_code}' -X "$m" \
+              "${TARGET_SUPABASE_URL%/}/storage/v1/bucket/${b}${act:+/$act}" \
+              -H "Authorization: Bearer ${TARGET_SERVICE_KEY}" -H "apikey: ${TARGET_SERVICE_KEY}")"
+        [[ "$sc" == 200 || "$sc" == 404 ]] || die "bucket '$b': ${m} ${act:-delete} returned HTTP $sc"
+      done
+      ok "bucket '$b' emptied and removed"
+    done
+  fi
+
+  step "Dropping database objects"
+  # Extension-owned objects are skipped: pg_net installs functions into public,
+  # and dropping them breaks the extension rather than the application.
+  psql "$TARGET_DB_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+do $$
+declare r record; sch text[];
+begin
+  select array_agg(nspname) into sch from pg_namespace
+   where nspname not in ('pg_catalog','information_schema','auth','storage','realtime',
+                         'vault','cron','extensions','graphql','graphql_public','pgsodium',
+                         'pgsodium_masks','net','supabase_functions','supabase_migrations',
+                         'pgbouncer','_analytics','_realtime')
+     and nspname not like 'pg\_%';
+
+  for r in select c.oid::regclass as obj from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+           where n.nspname = any(sch) and c.relkind in ('r','p')
+             and not exists (select 1 from pg_depend d where d.objid = c.oid and d.deptype = 'e')
+  loop execute format('drop table if exists %s cascade', r.obj); end loop;
+
+  for r in select p.oid::regprocedure as obj from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = any(sch)
+             and not exists (select 1 from pg_depend d where d.objid = p.oid and d.deptype = 'e')
+  loop execute format('drop function if exists %s cascade', r.obj); end loop;
+
+  for r in select t.oid::regtype as obj from pg_type t
+            join pg_namespace n on n.oid = t.typnamespace
+           where n.nspname = any(sch) and t.typtype in ('e','c','d')
+             and not exists (select 1 from pg_depend d where d.objid = t.oid and d.deptype = 'e')
+             and not exists (select 1 from pg_class c where c.reltype = t.oid)
+  loop execute format('drop type if exists %s cascade', r.obj); end loop;
+end $$;
+delete from auth.identities;
+delete from auth.users;
+SQL
+  LEFT="$(psql "$TARGET_DB_URL" -Atc "select count(*) from auth.users")"
+  [[ "$LEFT" == 0 ]] || die "auth.users still has $LEFT row(s) — reset incomplete"
+  ok "target reset — ready for another restore"
+  exit 0
+fi
+
+# ── 5. Confirm ─────────────────────────────────────────────────────────────
+if [[ "$EXISTING" != "0" ]]; then
+  warn "target already has $EXISTING table(s) in public — this is not an empty project"
+  warn "loading schema.sql over them will fail on objects that already exist"
+  confirm "Continue anyway?" || die "aborted"
+else
+  ok "target public schema is empty"
+fi
+
+step "Ready"
+info "archive: $(basename "$ARCHIVE")"
+info "target:  $DB_REF"
+info "order:   auth → schema and data → catalog objects → $(find "$WORK/files" -type f 2>/dev/null | wc -l | tr -d ' ') storage object(s)"
+info ""
+if (( DRY_RUN )); then ok "dry run — stopping before any writes"; exit 0; fi
+warn "This writes the archive's data into project '$DB_REF'."
+read -rp "    Type the project ref to proceed: " TYPED
+[[ "$TYPED" == "$DB_REF" ]] || die "did not match — aborted"
+
+# ── 6. Restore ─────────────────────────────────────────────────────────────
+# Auth first. Application tables carry foreign keys to auth.users(id), so
+# loading the schema first creates the structure successfully and then fails
+# every COPY on a constraint violation — a project that looks complete and
+# holds no data.
+step "Loading auth users and identities"
+if psql "$TARGET_DB_URL" -q -v ON_ERROR_STOP=1 -f "$WORK/auth.sql" > "$WORK/auth.log" 2>&1; then
+  ok "loaded ($(psql "$TARGET_DB_URL" -Atc "select count(*) from auth.users") users)"
+else
+  tail -5 "$WORK/auth.log" | sed 's/^/    /'
+  die "auth load failed. Every application table references auth.users, so the
+    rest cannot succeed without it. Usually a GoTrue column-shape difference
+    between the source and target projects — see the docs for the
+    column-by-column fallback."
+fi
+
+step "Loading schema and data"
+# Deliberately no ON_ERROR_STOP: a fresh Supabase project already has a public
+# schema, so the dump's CREATE SCHEMA fails harmlessly. Dropping the schema to
+# avoid that would strip Supabase's grants to anon/authenticated and break the
+# application in ways that only surface much later.
+psql "$TARGET_DB_URL" -q -f "$WORK/schema.sql" > "$WORK/schema.log" 2>&1 || true
+OTHER="$(grep -i '^psql:.*ERROR' "$WORK/schema.log" | grep -viE 'schema "[a-z_]+" already exists' || true)"
+if [[ -n "$OTHER" ]]; then
+  printf '%s\n' "$OTHER" | head -10 | sed 's/^/    /'
+  die "unexpected errors loading schema.sql (full log: $WORK/schema.log)"
+fi
+ok "loaded (expected 'schema already exists' ignored)"
+
+step "Verifying schema"
+NORLS="$(psql "$TARGET_DB_URL" -Atc "select count(*) from pg_tables t join pg_class c on c.relname=t.tablename join pg_namespace n on n.oid=c.relnamespace and n.nspname=t.schemaname where t.schemaname='public' and not c.relrowsecurity")"
+POLS="$(psql "$TARGET_DB_URL" -Atc "select count(*) from pg_policies where schemaname='public'")"
+GRANTS="$(grep -cE '^(GRANT|REVOKE)' "$WORK/schema.sql" || true)"
+info "policies: $POLS   privilege statements applied: $GRANTS   public tables without RLS: $NORLS"
+[[ "$NORLS" == 0 ]] || die "$NORLS table(s) have RLS disabled — do not point an application at this project until fixed"
+ok "row level security enabled on every public table"
+
+step "Applying catalog objects"
+# Last, because its triggers call functions that schema.sql creates.
+psql "$TARGET_DB_URL" -q -f "$WORK/non-public.sql" > "$WORK/nonpublic.log" 2>&1 || true
+NPERR="$(grep -i '^psql:.*ERROR' "$WORK/nonpublic.log" | grep -vi 'already exists' || true)"
+if [[ -n "$NPERR" ]]; then
+  printf '%s\n' "$NPERR" | head -10 | sed 's/^/    /'
+  warn "some catalog objects failed — review $WORK/nonpublic.log"
+  confirm "Continue?" || die "aborted"
+else
+  ok "extensions, triggers, policies, buckets and jobs applied"
+fi
+
+step "Uploading storage objects"
+UP=0; FAILED=0
+if [[ -d "$WORK/files" ]]; then
+  while IFS= read -r f; do
+    rel="${f#"$WORK/files/"}"
+    bucket="${rel%%/*}"
+    path="${rel#*/}"
+    sc="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+          "${TARGET_SUPABASE_URL%/}/storage/v1/object/${bucket}/${path}" \
+          -H "Authorization: Bearer ${TARGET_SERVICE_KEY}" \
+          -H "apikey: ${TARGET_SERVICE_KEY}" \
+          -H "x-upsert: true" \
+          --data-binary "@${f}")"
+    if [[ "$sc" == 200 ]]; then UP=$((UP+1)); else
+      warn "HTTP $sc uploading ${bucket}/${path}"; FAILED=$((FAILED+1))
+    fi
+  done < <(find "$WORK/files" -type f | sort)
+fi
+(( FAILED == 0 )) || die "$FAILED object(s) failed to upload"
+ok "uploaded $UP object(s)"
+
+# ── 7. Verify against the archive's own manifest ───────────────────────────
+step "Verifying against the manifest"
+printf '    %-30s %9s %9s\n' "table" "archive" "restored"
+BAD=0
+while IFS=$'\t' read -r tbl want; do
+  [[ "$tbl" =~ ^[a-z_]+\.[a-z_]+$ ]] || { warn "skipping odd table name: $tbl"; continue; }
+  got="$(psql "$TARGET_DB_URL" -Atc "select count(*) from ${tbl}" 2>/dev/null || echo "ERR")"
+  if [[ "$got" == "$want" ]]; then
+    printf '    %-30s %9s %9s  %s✓%s\n' "$tbl" "$want" "$got" "$G" "$N"
+  else
+    printf '    %-30s %9s %9s  %s✗%s\n' "$tbl" "$want" "$got" "$R" "$N"; BAD=1
+  fi
+done < <(jq -r '.rows | to_entries[] | "\(.key)\t\(.value)"' "$WORK/manifest.json")
+(( BAD == 0 )) || die "row counts do not match the archive"
+
+WANT_OBJ="$(jq -r '.storage_objects' "$WORK/manifest.json")"
+GOT_OBJ="$(psql "$TARGET_DB_URL" -Atc "select count(*) from storage.objects")"
+printf '    %-30s %9s %9s' "storage objects" "$WANT_OBJ" "$GOT_OBJ"
+if [[ "$WANT_OBJ" == "$GOT_OBJ" ]]; then printf '  %s✓%s\n' "$G" "$N"
+else printf '  %s✗%s\n' "$R" "$N"; die "storage object count does not match the archive"; fi
+
+step "Restore complete"
+ok "project '$DB_REF' now holds the contents of $(basename "$ARCHIVE")"
+info ""
+info "Not done, and not something this tool can do — Supabase's control plane"
+info "is not reachable over SQL:"
+info "  · auth providers, email templates, JWT secret, API settings"
+info "  · Vault secret values (any restored cron job that reads one will fail"
+info "    until the secret is recreated)"
+info "  · whatever points your application at this project"
+info ""
+info "Then sign in through the application and open something that reads a"
+info "storage object. Reads through a service key prove nothing about RLS."

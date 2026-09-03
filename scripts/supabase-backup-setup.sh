@@ -78,12 +78,17 @@ install -d -m 0755 "$LIB_DIR"
 install -d -m 0700 "$CONF_DIR"
 install -d -m 0700 "$DATA_DIR"
 
-for f in backup.sh catalog.sql; do
+for f in backup.sh catalog.sql restore; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${LIB_DIR}/${f}" \
     || error "could not download ${f} from ${RAW_BASE}"
 done
-chmod 0755 "${LIB_DIR}/backup.sh"
+chmod 0755 "${LIB_DIR}/backup.sh" "${LIB_DIR}/restore"
 chmod 0644 "${LIB_DIR}/catalog.sql"
+
+# On PATH as supabase-restore. Note that the Proxmox LXC console starts bash
+# without /etc/profile, so /usr/local/bin can be missing from PATH there even
+# though an SSH login has it.
+ln -sf "${LIB_DIR}/restore" /usr/local/bin/supabase-restore
 
 for f in "supabase-backup@.service" "supabase-backup@.timer"; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
@@ -194,10 +199,15 @@ cat <<EOF
 
   Project '${PROJECT}' is backed up nightly to ${DATA_DIR}/${PROJECT}.
 
-  Run now          systemctl start supabase-backup@${PROJECT}.service
+  Run now           systemctl start supabase-backup@${PROJECT}.service
   See what happened journalctl -u supabase-backup@${PROJECT}.service
-  Next run         systemctl list-timers supabase-backup@${PROJECT}.timer
-  Add another      re-run this script
+  Next run          systemctl list-timers supabase-backup@${PROJECT}.timer
+  Add another       re-run this script
+  Restore           supabase-restore
+
+  supabase-restore refuses to write to any project configured here, so it
+  cannot overwrite the thing it backs up. Rehearse it against a throwaway
+  project before you need it.
 
   Archives live only on this machine. Back the machine up, or copy them
   elsewhere — a backup that exists in one place is one incident from being

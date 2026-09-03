@@ -139,6 +139,33 @@ password containing `@ : / ? # [ ] %`.
 
 ## Restoring
 
+```bash
+supabase-restore              # pick an archive, answer four prompts
+supabase-restore --dry-run    # everything except the writes
+supabase-restore --list       # available archives
+supabase-restore --reset      # clear a target, so a rehearsal can be repeated
+```
+
+It verifies the archive's checksums, loads everything in the right order, and
+checks the restored row and object counts against the archive's own
+`manifest.json` — not against a hardcoded list that could drift.
+
+Three things it refuses to do:
+
+- write when the target's two credentials name **different projects** — a
+  mismatched pair writes one project's database while uploading another's files
+- write to **any project configured on this host as a backup source**, so it
+  cannot overwrite the thing it exists to protect
+- continue past a target where any table lacks row level security
+
+`--reset` drops every non-extension table, function and type in the target's
+user schemas, removes its buckets, and deletes its auth users. It clears
+storage over the API rather than by SQL: Supabase installs a `protect_delete()`
+trigger that rejects `DELETE FROM storage.objects`, so a SQL-only reset aborts
+there and silently skips everything after it.
+
+### Doing it by hand
+
 Load in this order. It matters:
 
 ```bash
