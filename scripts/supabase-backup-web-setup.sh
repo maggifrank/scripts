@@ -93,6 +93,32 @@ chmod 0755 "${WEB_DIR}/server.py"
 chmod 0644 "${WEB_DIR}"/static/*
 info "console installed"
 
+# ── The privileged half ───────────────────────────────────────────────────────
+# Registering a project writes a root-owned config holding a service key and
+# enables a timer. The console cannot do any of that: it drops a request in a
+# spool directory it owns, and this oneshot - triggered by a .path unit, never
+# reachable over the network - validates and applies it.
+step "Registration helper"
+curl -fsSL --max-time 30 "${RAW_BASE}/register" -o "${LIB_DIR}/register" \
+  || error "could not download the registration helper"
+chmod 0755 "${LIB_DIR}/register"
+
+curl -fsSL --max-time 30 "${RAW_BASE}/supabase-backup-web.tmpfiles" \
+  -o /etc/tmpfiles.d/supabase-backup-web.conf || error "could not download the tmpfiles config"
+chmod 0644 /etc/tmpfiles.d/supabase-backup-web.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/supabase-backup-web.conf \
+  || error "could not create the spool directories"
+
+for f in supabase-backup-register.path supabase-backup-register.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+systemctl enable --now supabase-backup-register.path >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-register.path"
+info "registration helper installed and watching the spool"
+
 # ── Let it read the archives ──────────────────────────────────────────────────
 # The archive tree is 0700 root. The console needs to read it and nothing else,
 # so it gets group access - the per-project .conf files, which hold the service
@@ -147,6 +173,8 @@ else
   if [ "${BIND_CHOICE:-1}" = "2" ]; then
     sed -i "s|^WEB_BIND=.*|WEB_BIND=0.0.0.0:8787|" "${WEB_CONF_DIR}/web.env"
     warn "listening on all interfaces - Basic auth over plain HTTP"
+    warn "registering a project will be refused on that connection: it carries a"
+    warn "service key. Use a TLS proxy on this host, or an SSH tunnel, for that."
   fi
 fi
 
@@ -195,6 +223,7 @@ else
   echo "  Reach it with     ssh -N -L ${PORT}:127.0.0.1:${PORT} root@${HOSTIP}"
 fi
 echo "  Status            systemctl status supabase-backup-web"
+echo "  Registrations     journalctl -u supabase-backup-register -n 30"
 echo "  Logs              journalctl -u supabase-backup-web -n 30"
 echo "  Settings          ${WEB_CONF_DIR}/web.env"
 echo ""

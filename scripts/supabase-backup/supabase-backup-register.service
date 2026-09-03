@@ -1,0 +1,27 @@
+[Unit]
+Description=Apply project registrations from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/register --drain
+
+# Deliberately NOT sandboxed the way the console is: this is the privileged
+# half. It writes a 0600 config under /etc/supabase-backup, creates the
+# project's archive directory, and enables a timer - none of which the
+# network-facing process can do. It runs only when the console leaves a
+# request, is triggered by a .path unit rather than reachable over the network,
+# and re-validates every field because that request came from a process exposed
+# to the network.
+ReadWritePaths=/etc/supabase-backup /var/backups/supabase /run/supabase-backup-web
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

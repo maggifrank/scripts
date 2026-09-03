@@ -514,6 +514,176 @@ function runItem(project, run) {
   return item;
 }
 
+// ── Registering a project ──────────────────────────────────────────────────
+
+let registerBuilt = false;
+let registerPoll = null;
+
+function renderRegister(status) {
+  const section = $("register-section");
+  const host = $("register");
+  const caps = status.capabilities || {};
+  section.hidden = false;
+
+  // Refused connections get the reason rather than a form that cannot work.
+  if (!caps.register) {
+    if (host.dataset.mode === "blocked") return;
+    host.dataset.mode = "blocked";
+    registerBuilt = false;
+    host.replaceChildren(el("div", "notice", caps.register_blocked_because ||
+      "Registering a project is not available on this connection."));
+    return;
+  }
+  if (registerBuilt && host.dataset.mode === "form") return;
+  host.dataset.mode = "form";
+  registerBuilt = true;
+  buildRegisterForm(host);
+}
+
+function field(label, name, hint, type = "text", placeholder = "") {
+  const wrap = el("div", "field");
+  const id = `reg-${name}`;
+  const l = el("label", null, label);
+  l.htmlFor = id;
+  const input = document.createElement("input");
+  input.type = type;
+  input.id = id;
+  input.name = name;
+  input.placeholder = placeholder;
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  wrap.append(l, input);
+  if (hint) wrap.append(el("div", "hint", hint));
+  return wrap;
+}
+
+function buildRegisterForm(host) {
+  const form = el("div", "form");
+
+  form.append(field("Project name", "project",
+    "Lowercase letters, digits, - and _. Becomes the config name, the archive directory and the timer instance.",
+    "text", "billing"));
+
+  form.append(field("Session pooler URI", "database_url",
+    "Supabase dashboard → Connect → Direct → Session pooler. Port 5432, not 6543: transaction mode does not hold a session across statements and pg_dump fails partway.",
+    "password", "postgresql://postgres.<ref>:<password>@…pooler.supabase.com:5432/postgres"));
+
+  form.append(field("Project URL", "supabase_url",
+    "Must name the same project as the URI above — a mismatched pair dumps one project's Postgres while walking another's storage.",
+    "text", "https://<ref>.supabase.co"));
+
+  form.append(field("Service key", "service_key",
+    "Bypasses RLS. It is written to a root-owned 0600 config and the request holding it is shredded straight after.",
+    "password", ""));
+
+  const row = el("div", "row");
+  row.append(field("Keep days", "keep_days", "Prune archives older than this. 0 disables pruning.", "text", "30"));
+  const check = el("label", "check");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.id = "reg-run_now";
+  box.checked = true;
+  check.append(box, document.createTextNode("Run the first backup now"));
+  const checkField = el("div", "field");
+  checkField.append(check);
+  row.append(checkField);
+  form.append(row);
+
+  const bar = el("div", "bar");
+  const submit = el("button", "btn", "Register project");
+  const message = el("span", "bar-msg");
+  bar.append(submit, message);
+  form.append(bar);
+
+  const output = el("div");
+  form.append(output);
+
+  form.querySelector("#reg-keep_days").value = "30";
+  submit.addEventListener("click", () => submitRegistration(form, submit, message, output));
+  host.replaceChildren(form);
+}
+
+async function submitRegistration(form, submit, message, output) {
+  const value = (name) => (form.querySelector(`#reg-${name}`).value || "").trim();
+  const body = {
+    project: value("project"),
+    database_url: value("database_url"),
+    supabase_url: value("supabase_url"),
+    service_key: value("service_key"),
+    keep_days: Number(value("keep_days") || 30),
+    run_now: form.querySelector("#reg-run_now").checked,
+  };
+  if (!confirm(`Register '${body.project}' and start backing it up nightly?`)) return;
+
+  submit.disabled = true;
+  message.className = "bar-msg";
+  message.textContent = "submitting…";
+  output.replaceChildren();
+  let id;
+  try {
+    ({ id } = await api("/api/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+  } catch (error) {
+    message.className = "bar-msg err";
+    message.textContent = error.message;
+    submit.disabled = false;
+    return;
+  }
+
+  // The secrets have left the browser; do not keep them in the DOM either.
+  for (const name of ["database_url", "service_key"]) form.querySelector(`#reg-${name}`).value = "";
+  message.textContent = "applying…";
+  pollRegistration(id, form, submit, message, output);
+}
+
+function pollRegistration(id, form, submit, message, output) {
+  clearTimeout(registerPoll);
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/register/${encodeURIComponent(id)}`);
+    } catch (error) {
+      message.className = "bar-msg err";
+      message.textContent = error.message;
+      submit.disabled = false;
+      return;
+    }
+    if (result.state === "pending") {
+      registerPoll = setTimeout(tick, 1500);
+      return;
+    }
+    submit.disabled = false;
+    message.textContent = "";
+    const ok = result.state === "ok";
+    const box = el("div", `result ${ok ? "ok" : "bad"}`);
+    box.append(el("div", null, ok
+      ? "Registered. It now has a nightly timer, and its panel appears above."
+      : `Not registered — ${result.error || "the host reported a failure"}`));
+    if (Array.isArray(result.steps) && result.steps.length) {
+      const ul = el("ul", "steps");
+      for (const step of result.steps) ul.append(el("li", null, step));
+      box.append(ul);
+    }
+    if (result.state === "unknown") {
+      box.replaceChildren(el("div", null,
+        "No result came back. The privileged helper may not be installed — check " +
+        "systemctl status supabase-backup-register.path on the host."));
+    }
+    output.replaceChildren(box);
+    if (ok) {
+      form.querySelector("#reg-project").value = "";
+      form.querySelector("#reg-supabase_url").value = "";
+      projectListKey = "";          // force the project list to rebuild
+      clearTimeout(pollTimer);
+      refresh();
+    }
+  };
+  registerPoll = setTimeout(tick, 1000);
+}
+
 // ── Polling ────────────────────────────────────────────────────────────────
 
 async function refresh() {
@@ -523,6 +693,7 @@ async function refresh() {
     anyRunning = status.projects.some((p) => p.health === "running");
     renderSummary(status);
     renderProjects(status);
+    renderRegister(status);
     // Only open panels cost requests; a host with many projects stays quiet
     // until someone actually looks at one.
     for (const project of status.projects) {

@@ -26,6 +26,10 @@ SupplementaryGroups=systemd-journal
 # someone loosening them by accident.
 InaccessiblePaths=-/etc/supabase-backup
 
+# The one writable path: the spool where a registration request is left for
+# the privileged helper to pick up. Everything else stays read-only.
+ReadWritePaths=/run/supabase-backup-web/register
+
 # Nothing here writes to disk, so nothing needs to be writable.
 NoNewPrivileges=true
 PrivateTmp=true

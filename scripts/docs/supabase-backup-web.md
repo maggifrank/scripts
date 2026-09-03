@@ -39,6 +39,57 @@ otherwise show a calm, empty panel for a project whose backups are either fine
 or gone, and you could not tell which. The header shows the worst state across
 every project, so one project's failure is never hidden behind another's calm.
 
+## Registering a project
+
+The console can add a project to the host, which means writing a root-owned
+config containing a service key and enabling a timer. It does none of that
+itself. It stays unprivileged and writes exactly one thing: a request file in a
+spool directory it owns.
+
+```
+console (unprivileged, NoNewPrivileges=true)
+  └─ writes /run/supabase-backup-web/register/<id>.json, mode 0600
+       │
+  supabase-backup-register.path  (DirectoryNotEmpty)
+       ▼
+supabase-backup-register.service  (root, oneshot)
+  re-validates every field ─ the request came from a network-facing process
+  → tests the database connection and the service key before writing anything
+  → writes /etc/supabase-backup/<project>.conf, 0600
+  → creates the archive directory 0750, readable by the console
+  → enables supabase-backup@<project>.timer
+  → shreds the request, writes a result the console polls
+```
+
+The request is destroyed as soon as the helper has read it, so a crash cannot
+leave a service key sitting in `/run`. Nothing in it is trusted: the helper
+checks the project name, that both credentials name the same project, that the
+database is reachable, that `pg_dump` is new enough for the server, and that
+the storage API accepts the key — and it refuses to overwrite a project that
+already exists. A config is never written for a project that cannot be reached,
+because that is just a timer that fails every night.
+
+Registering here also gets the archive directory's group right from the start,
+so a project added this way needs no re-run of the setup script.
+
+### It will not do this over plain HTTP
+
+A service key bypasses RLS on the entire project. It is a far bigger prize than
+the console password, so the console refuses to accept one over a plain
+connection from the network: `POST /api/register` is allowed only from
+loopback, and the form is not even offered otherwise.
+
+Loopback covers both supported paths — a TLS proxy on this host forwarding to
+`127.0.0.1`, and an SSH tunnel:
+
+```sh
+ssh -N -L 8787:127.0.0.1:8787 root@<host>   # then http://localhost:8787
+```
+
+A proxy on a *different* host must be named in `WEB_TRUSTED_PROXIES` and must
+send `X-Forwarded-Proto: https`. That header is ignored from any other client,
+so it cannot be used to talk your way past the check.
+
 ## What it deliberately does not do
 
 - **Restore.** `supabase-restore` is interactive, destructive, needs the target
@@ -103,6 +154,9 @@ exactly the kind of thing that quietly expires on a host nobody logs into.
 | `DATA_DIR` | `/var/backups/supabase` | Where archives live |
 | `UNIT_PREFIX` | `supabase-backup` | Template unit name |
 | `WEB_RUN_COMMAND` | `systemctl start --no-block {unit}` | How a run is started |
+| `WEB_ALLOW_REGISTER` | `1` | Offer the "Add a project" form at all |
+| `WEB_TRUSTED_PROXIES` | — | Comma-separated proxy addresses trusted to assert `X-Forwarded-Proto` |
+| `WEB_SPOOL_DIR` | `/run/supabase-backup-web` | Spool shared with the registration helper |
 
 It refuses to start with no password configured. That is not an oversight to
 work around: `WEB_ALLOW_ANONYMOUS=1` exists for a host where something else is
@@ -159,6 +213,16 @@ tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value supabase-backup-web)/en
   | grep WEB_PASSWORD_HASH
 ```
 
+**The "Add a project" form is replaced by a notice.** You are connected over
+plain HTTP from the network, and registering sends a service key. Reach the
+console through the TLS proxy on this host or over an SSH tunnel.
+
+**A registration stays "applying…" forever.** The helper is not running. Check
+`systemctl status supabase-backup-register.path` — it must be enabled and
+active — and `journalctl -u supabase-backup-register -n 30` for what happened
+when it last fired. If the spool directory is missing, run
+`systemd-tmpfiles --create /etc/tmpfiles.d/supabase-backup-web.conf`.
+
 **"Run backup now" fails with "Interactive authentication required".** The
 polkit rule is missing, not matching, or polkit was not restarted after it was
 written. It lives at `/etc/polkit-1/rules.d/50-supabase-backup-web.rules`.
@@ -183,5 +247,7 @@ systemctl restart systemd-journald
   project's credentials.
 - Verification proves an archive is intact and self-consistent. It does not
   prove it restores; only a rehearsal does that.
+- A project can be added but not edited or removed from the console. Changing
+  credentials or retiring a project is still done on the host.
 - The console knows nothing about offsite copies. A green header means the
   local archives are good, not that anything offsite is.

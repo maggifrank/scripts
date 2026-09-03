@@ -69,6 +69,20 @@ RUN_COMMAND = env("WEB_RUN_COMMAND", "systemctl start --no-block {unit}")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+# Registering a project is the one thing here that writes anything, and the
+# only thing that handles a credential. The console still writes nothing
+# privileged: it drops a request in a spool directory it owns, and a root
+# oneshot triggered by a .path unit validates and applies it. See
+# scripts/supabase-backup/register.
+SPOOL_DIR      = Path(env("WEB_SPOOL_DIR", "/run/supabase-backup-web"))
+REGISTER_DIR   = SPOOL_DIR / "register"
+RESULT_DIR     = SPOOL_DIR / "results"
+ALLOW_REGISTER = env_bool("WEB_ALLOW_REGISTER", True)
+# A proxy terminating TLS on another host, trusted to speak for the client.
+TRUSTED_PROXIES = {h.strip() for h in env("WEB_TRUSTED_PROXIES", "").split(",") if h.strip()}
+MAX_BODY = 64 * 1024
+LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+
 # A project name is a directory under DATA_DIR and a systemd instance name.
 # Constraining it to this shape is what makes every path and unit name below
 # safe to build by interpolation: no traversal and no escaping are expressible.
@@ -657,6 +671,104 @@ def start_run(project):
     return 202, {"started": True, "unit": unit}
 
 
+# ── Registering a project ──────────────────────────────────────────────────
+
+# supabase-backup-setup.sh's own rule. A name the tool would refuse to create
+# is not one to create behind its back, so registration is held to it exactly -
+# unlike PROJECT_RE, which only has to be able to *display* what is on disk.
+NEW_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def validate_registration(body):
+    """Check a registration request before it is written to the spool.
+
+    The root side validates everything again - it has to, since it must not
+    trust a file written by a network-facing process - but rejecting the
+    obvious here gives the operator an answer immediately instead of after a
+    round trip through systemd.
+    """
+    if not isinstance(body, dict):
+        return None, "expected a JSON object"
+
+    project = (body.get("project") or "").strip()
+    if not NEW_PROJECT_RE.match(project):
+        return None, "project name: lowercase letters, digits, - and _ only, starting with a letter or digit"
+
+    database_url = (body.get("database_url") or "").strip()
+    if not database_url.startswith(("postgresql://", "postgres://")):
+        return None, "DATABASE_URL must be a postgresql:// URI"
+    if ":5432/" not in database_url:
+        return None, ("DATABASE_URL must use port 5432 (session pooler). Transaction mode "
+                      "on 6543 does not hold a session across statements and pg_dump fails partway.")
+
+    supabase_url = (body.get("supabase_url") or "").strip().rstrip("/")
+    if not re.fullmatch(r"https://[a-z0-9-]+\.supabase\.(co|com)", supabase_url):
+        return None, "project URL must look like https://<ref>.supabase.co"
+
+    service_key = (body.get("service_key") or "").strip()
+    if len(service_key) < 20:
+        return None, "service key looks too short"
+
+    # Both credentials must name the same project. A mismatched pair is exactly
+    # how a backup ends up dumping one project's Postgres while walking
+    # another's storage - an archive that looks healthy and is half wrong.
+    db_ref = re.sub(r".*://(?:postgres\.)?([a-z0-9]+)[.:/].*", r"\1", database_url)
+    url_ref = re.sub(r"https://([a-z0-9-]+)\..*", r"\1", supabase_url)
+    if db_ref != url_ref:
+        return None, f"credentials disagree: the database URI names '{db_ref}' but the project URL names '{url_ref}'"
+
+    try:
+        keep_days = int(body.get("keep_days", 30))
+    except (TypeError, ValueError):
+        return None, "keep_days must be a number"
+    if not 0 <= keep_days <= 3650:
+        return None, "keep_days must be between 0 and 3650"
+
+    return {
+        "project": project,
+        "database_url": database_url,
+        "supabase_url": supabase_url,
+        "service_key": service_key,
+        "keep_days": keep_days,
+        "run_now": bool(body.get("run_now", True)),
+    }, None
+
+
+def submit_registration(request):
+    known, _ = discover_projects()
+    if request["project"] in known:
+        return 409, {"error": f"a project named '{request['project']}' already exists on this host"}
+
+    request_id = secrets.token_hex(16)
+    request["id"] = request_id
+    request["requested_at"] = iso(time.time())
+    path = REGISTER_DIR / f"{request_id}.json"
+    try:
+        REGISTER_DIR.mkdir(parents=True, exist_ok=True)
+        # 0600 before a byte of it exists: this file holds a service key until
+        # the root side shreds it, and it must never be briefly world-readable.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(request, fh)
+    except OSError as exc:
+        return 500, {"error": f"could not write the request: {exc}. Is the spool directory present?"}
+    return 202, {"id": request_id, "project": request["project"], "state": "pending"}
+
+
+def registration_result(request_id):
+    if not REQUEST_ID_RE.match(request_id or ""):
+        return 404, {"error": "no such request"}
+    result = RESULT_DIR / f"{request_id}.json"
+    try:
+        return 200, json.loads(result.read_text())
+    except FileNotFoundError:
+        pending = (REGISTER_DIR / f"{request_id}.json").exists()
+        return 200, {"id": request_id, "state": "pending" if pending else "unknown"}
+    except (OSError, ValueError) as exc:
+        return 500, {"error": f"could not read the result: {exc}"}
+
+
 # ── HTTP ───────────────────────────────────────────────────────────────────
 
 CONTENT_TYPES = {
@@ -691,6 +803,44 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, code, payload):
         body = json.dumps(payload, indent=1).encode()
         self.send_bytes(code, body, "application/json", {"Cache-Control": "no-store"})
+
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None, "bad Content-Length"
+        if length <= 0:
+            return None, "empty request body"
+        if length > MAX_BODY:
+            return None, "request body too large"
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8")), None
+        except (OSError, ValueError, UnicodeDecodeError):
+            return None, "body is not valid JSON"
+
+    def may_register(self):
+        """Whether THIS connection may hand over a service key.
+
+        The key is the most powerful credential in the system - it bypasses RLS
+        on the whole project - so it is not allowed to cross the network in the
+        clear, whatever the console password does. Loopback covers both
+        supported paths: a TLS proxy on this host forwarding to 127.0.0.1, and
+        an SSH tunnel. A proxy elsewhere has to be named in WEB_TRUSTED_PROXIES
+        and say it terminated TLS.
+        """
+        if not ALLOW_REGISTER:
+            return False, "registration is disabled (WEB_ALLOW_REGISTER=0)"
+        client = self.client_address[0]
+        if client in LOOPBACK:
+            return True, None
+        if client in TRUSTED_PROXIES and \
+                self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            return True, None
+        return False, (
+            "registering a project sends a service key, which bypasses RLS on the whole "
+            "project, so it is refused over a plain-HTTP connection from the network. "
+            "Reach the console through the TLS proxy on this host, or over an SSH tunnel "
+            "(ssh -N -L 8787:127.0.0.1:8787 <host>), and try again from there.")
 
     def authorised(self):
         if ALLOW_ANON:
@@ -746,7 +896,11 @@ class Handler(BaseHTTPRequestHandler):
                 # unanswered request is a 404 in the log on every page load.
                 return self.serve_static("favicon.svg")
             if path == "/api/status":
-                return self.send_json(200, status())
+                payload = status()
+                allowed, why = self.may_register()
+                payload["capabilities"]["register"] = allowed
+                payload["capabilities"]["register_blocked_because"] = why
+                return self.send_json(200, payload)
             match = re.fullmatch(r"/api/projects/([^/]+)/archives", path)
             if match:
                 return self.project_endpoint("archives", match.group(1), None)
@@ -760,6 +914,10 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/projects/([^/]+)/archives/([^/]+)/(manifest|download)", path)
             if match:
                 return self.project_endpoint(match.group(3), match.group(1), match.group(2))
+            match = re.fullmatch(r"/api/register/([^/]+)", path)
+            if match:
+                code, payload = registration_result(match.group(1))
+                return self.send_json(code, payload)
         elif method == "POST":
             match = re.fullmatch(r"/api/projects/([^/]+)/run", path)
             if match:
@@ -769,6 +927,18 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/projects/([^/]+)/archives/([^/]+)/verify", path)
             if match:
                 return self.project_endpoint("verify", match.group(1), match.group(2))
+            if path == "/api/register":
+                allowed, why = self.may_register()
+                if not allowed:
+                    return self.send_json(403, {"error": why})
+                body, error = self.read_json_body()
+                if error:
+                    return self.send_json(400, {"error": error})
+                request, error = validate_registration(body)
+                if error:
+                    return self.send_json(400, {"error": error})
+                code, payload = submit_registration(request)
+                return self.send_json(code, payload)
         self.send_json(404, {"error": "not found"})
 
     def project_endpoint(self, action, project, name, limit=10):

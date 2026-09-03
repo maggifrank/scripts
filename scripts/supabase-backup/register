@@ -1,0 +1,151 @@
+#!/bin/bash
+# register — apply registration requests left in the console's spool.
+#
+#   register --drain          process every pending request (what the .path unit runs)
+#   register <request.json>   process one
+#
+# Runs as root, triggered by supabase-backup-register.path when the console
+# drops a request. The console itself has no privilege and writes nothing
+# outside its own spool directory; everything that touches a credential, a
+# root-owned config or a systemd unit happens here.
+#
+# A request file is written by a network-facing process, so nothing in it is
+# trusted: every field is validated again here, and the file is shredded as
+# soon as it has been read - it holds a service key until then.
+set -euo pipefail
+
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+LIB_DIR="${LIB_DIR:-/opt/supabase-backup}"
+CONF_DIR="${CONF_DIR:-/etc/supabase-backup}"
+DATA_DIR="${DATA_DIR:-/var/backups/supabase}"
+SPOOL_DIR="${SPOOL_DIR:-/run/supabase-backup-web}"
+REG_DIR="${SPOOL_DIR}/register"
+RES_DIR="${SPOOL_DIR}/results"
+WEB_USER="${WEB_USER:-supabase-backup-web}"
+
+STEPS=()
+note() { STEPS+=("$1"); printf '  %s\n' "$1"; }
+
+emit() {  # emit <id> <state> <error>
+  local id="$1" state="$2" error="${3:-}"
+  mkdir -p "$RES_DIR"
+  jq -nc --arg id "$id" --arg state "$state" --arg error "$error" \
+     --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     --argjson steps "$(printf '%s\n' "${STEPS[@]:-}" | jq -R -s 'split("\n") | map(select(length>0))')" \
+     '{id:$id, state:$state, error:$error, steps:$steps, finished_at:$finished}' \
+     > "${RES_DIR}/${id}.json.tmp"
+  chmod 0640 "${RES_DIR}/${id}.json.tmp"
+  chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
+  mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
+}
+
+ref_of() { sed -E 's|.*://(postgres\.)?([a-z0-9-]+)[.:/].*|\2|; s|/+$||' <<<"$1"; }
+
+process() {
+  local file="$1"
+  STEPS=()
+
+  local id
+  id="$(basename "$file" .json)"
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || { rm -f "$file"; return 0; }
+
+  # Read the whole request, then destroy it. Everything after this point works
+  # from memory, so a crash cannot leave a service key sitting in /run.
+  local body project database_url supabase_url service_key keep_days run_now
+  body="$(cat "$file")" || { emit "$id" failed "could not read the request"; rm -f "$file"; return 0; }
+  shred -u "$file" 2>/dev/null || rm -f "$file"
+
+  project="$(jq -r '.project // empty'      <<<"$body")"
+  database_url="$(jq -r '.database_url // empty' <<<"$body")"
+  supabase_url="$(jq -r '.supabase_url // empty' <<<"$body")"
+  service_key="$(jq -r '.service_key // empty'   <<<"$body")"
+  keep_days="$(jq -r '.keep_days // 30'     <<<"$body")"
+  run_now="$(jq -r '.run_now // true'       <<<"$body")"
+
+  # ── Validate, trusting nothing the console sent ──
+  [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] \
+    || { emit "$id" failed "invalid project name"; return 0; }
+  [[ "$database_url" =~ ^postgres(ql)?:// ]] \
+    || { emit "$id" failed "DATABASE_URL is not a postgresql:// URI"; return 0; }
+  [[ "$supabase_url" =~ ^https://[a-z0-9-]+\.supabase\.(co|com)$ ]] \
+    || { emit "$id" failed "project URL is not https://<ref>.supabase.co"; return 0; }
+  [[ -n "$service_key" ]] || { emit "$id" failed "no service key"; return 0; }
+  [[ "$keep_days" =~ ^[0-9]+$ ]] || { emit "$id" failed "keep_days is not a number"; return 0; }
+  [ -f "${CONF_DIR}/${project}.conf" ] \
+    && { emit "$id" failed "a project named '${project}' is already configured"; return 0; }
+  note "request accepted for '${project}'"
+
+  local db_ref url_ref
+  db_ref="$(ref_of "$database_url")"; url_ref="$(ref_of "$supabase_url")"
+  [ "$db_ref" = "$url_ref" ] \
+    || { emit "$id" failed "credentials disagree: database URI names '${db_ref}', project URL names '${url_ref}'"; return 0; }
+  note "both credentials name project '${db_ref}'"
+
+  # ── Prove the credentials work before writing anything ──
+  # A config written for an unreachable project is a timer that fails nightly.
+  local err server_ver
+  err="$(mktemp)"
+  if ! server_ver="$(psql "$database_url" -Atc 'show server_version_num' 2>"$err")"; then
+    local detail; detail="$(head -3 "$err" | tr '\n' ' ')"; rm -f "$err"
+    emit "$id" failed "cannot connect to the database: ${detail}"; return 0
+  fi
+  rm -f "$err"
+  note "connected to Postgres (server_version_num ${server_ver})"
+
+  local server_major client_major
+  server_major=$(( server_ver / 10000 ))
+  client_major="$(pg_dump --version | awk '{print $3}' | cut -d. -f1)"
+  if [ "$client_major" -lt "$server_major" ]; then
+    emit "$id" failed "pg_dump is ${client_major}, the server is ${server_major}; install a matching postgresql-client"
+    return 0
+  fi
+  note "pg_dump ${client_major} can dump a server ${server_major}"
+
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+        "${supabase_url}/storage/v1/bucket" \
+        -H "Authorization: Bearer ${service_key}" -H "apikey: ${service_key}")"
+  [ "$code" = "200" ] \
+    || { emit "$id" failed "the service key was rejected by storage (HTTP ${code})"; return 0; }
+  note "service key accepted by the storage API"
+
+  # ── Write the config ──
+  umask 077
+  cat > "${CONF_DIR}/${project}.conf" <<EOF
+# supabase-backup config for '${project}'
+# Registered from the web console. Contains a service key that bypasses RLS
+# and a database password: keep this file 0600 and out of version control.
+DATABASE_URL=${database_url}
+SUPABASE_URL=${supabase_url}
+SUPABASE_SERVICE_KEY=${service_key}
+BACKUP_DIR=${DATA_DIR}/${project}
+KEEP_DAYS=${keep_days}
+EOF
+  chmod 0600 "${CONF_DIR}/${project}.conf"
+  note "wrote ${CONF_DIR}/${project}.conf, mode 0600"
+
+  # Group-readable from the start, so the console can see this project's
+  # archives without anyone re-running the setup script.
+  install -d -m 0750 -g "$WEB_USER" "${DATA_DIR}/${project}"
+  note "created ${DATA_DIR}/${project}, readable by ${WEB_USER}"
+
+  systemctl enable --now "supabase-backup@${project}.timer" >/dev/null 2>&1 \
+    || { emit "$id" failed "could not enable supabase-backup@${project}.timer"; return 0; }
+  note "nightly timer enabled"
+
+  if [ "$run_now" = "true" ]; then
+    systemctl start --no-block "supabase-backup@${project}.service" \
+      && note "first backup started - watch it in the run history"
+  fi
+
+  emit "$id" ok ""
+}
+
+case "${1:-}" in
+  --drain|"")
+    shopt -s nullglob
+    for f in "$REG_DIR"/*.json; do process "$f"; done
+    ;;
+  *) process "$1" ;;
+esac

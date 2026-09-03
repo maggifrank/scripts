@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for project registrations from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Path]
+# The console drops a request here; this fires the root oneshot that applies
+# it. The console itself needs no privilege and never talks to root directly.
+DirectoryNotEmpty=/run/supabase-backup-web/register
+MakeDirectory=false
+
+[Install]
+WantedBy=paths.target
