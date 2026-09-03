@@ -19,6 +19,13 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 
+# ── Site defaults ─────────────────────────────────────────────────────────────
+IP_PREFIX="10.100.53"          # subnet scanned for a free address
+IP_SCAN_START=20               # first host octet to consider
+IP_MASK=24                     # default prefix length when none is given
+DEFAULT_DNS="10.100.53.34 10.100.53.41"
+DEFAULT_SEARCHDOMAIN="talva.is"
+
 # ── Prompt helpers ────────────────────────────────────────────────────────────
 # Ask for a whole number, re-prompting until it is valid.
 # Usage: ask_int <varname> <prompt> <default> <min> <max>
@@ -62,6 +69,32 @@ choose_from_menu() {
     done
     warn "Invalid selection. Enter a number from the list, or an exact name."
   done
+}
+
+# First address at or after ${IP_PREFIX}.${IP_SCAN_START} that is absent from the
+# host's neighbour/ARP table, is not a local address, and does not answer a ping.
+# Prints nothing and returns 1 if the range is exhausted.
+suggest_next_ip() {
+  local used candidate i
+  used=$(
+    {
+      ip -4 neigh show 2>/dev/null | awk '$NF != "FAILED" && $NF != "INCOMPLETE" {print $1}'
+      arp -an 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
+      ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+    } | sort -u
+  )
+  for ((i = IP_SCAN_START; i <= 254; i++)); do
+    candidate="${IP_PREFIX}.${i}"
+    if grep -qxF "$candidate" <<<"$used"; then
+      continue
+    fi
+    if ping -c 1 -W 1 "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    printf '%s' "$candidate"
+    return 0
+  done
+  return 1
 }
 
 # ── Root + Proxmox check ──────────────────────────────────────────────────────
@@ -201,13 +234,31 @@ read -rp "IP configuration [1-2, default: 1]: " IPCHOICE
 IPCHOICE=${IPCHOICE:-1}
 
 if [ "$IPCHOICE" = "2" ]; then
+  info "Looking for a free address in ${IP_PREFIX}.0/${IP_MASK} from .${IP_SCAN_START} up..."
+  SUGGESTED_IP=$(suggest_next_ip || true)
+  if [ -n "$SUGGESTED_IP" ]; then
+    info "Next free address: ${SUGGESTED_IP}"
+  else
+    warn "No free address found — enter one manually."
+  fi
+
   while true; do
-    read -rp "IP address with CIDR (e.g. 10.0.0.50/24): " STATIC_IP
+    if [ -n "$SUGGESTED_IP" ]; then
+      read -rp "IP address [default: ${SUGGESTED_IP}/${IP_MASK}]: " STATIC_IP
+      STATIC_IP=${STATIC_IP:-${SUGGESTED_IP}/${IP_MASK}}
+    else
+      read -rp "IP address (e.g. ${IP_PREFIX}.50/${IP_MASK}): " STATIC_IP
+    fi
+    # A bare address gets the default prefix length
+    if [[ "$STATIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      STATIC_IP="${STATIC_IP}/${IP_MASK}"
+    fi
     [[ "$STATIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] && break
-    warn "Invalid format. Use CIDR notation e.g. 10.0.0.50/24"
+    warn "Invalid format. Use ${IP_PREFIX}.50 or ${IP_PREFIX}.50/${IP_MASK}"
   done
+
   while true; do
-    read -rp "Gateway (e.g. 10.0.0.1): " GATEWAY
+    read -rp "Gateway (e.g. ${IP_PREFIX}.1): " GATEWAY
     [[ "$GATEWAY" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break
     warn "Invalid IP address."
   done
@@ -216,8 +267,21 @@ else
   NET_CONFIG="ip=dhcp"
 fi
 
-read -rp "DNS server [default: 10.100.53.36]: " DNS
-DNS=${DNS:-10.100.53.36}
+while true; do
+  read -rp "DNS servers, space separated [default: ${DEFAULT_DNS}]: " DNS
+  DNS=${DNS:-$DEFAULT_DNS}
+  IFS=' ' read -ra DNS_LIST <<<"$DNS"
+  DNS_OK=1
+  for d in "${DNS_LIST[@]}"; do
+    [[ "$d" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || DNS_OK=0
+  done
+  [ "$DNS_OK" = "1" ] && [ "${#DNS_LIST[@]}" -ge 1 ] && break
+  warn "Enter one or more IPv4 addresses separated by spaces."
+done
+
+read -rp "Search domain [default: ${DEFAULT_SEARCHDOMAIN}, '-' for none]: " SEARCHDOMAIN
+SEARCHDOMAIN=${SEARCHDOMAIN:-$DEFAULT_SEARCHDOMAIN}
+[ "$SEARCHDOMAIN" = "-" ] && SEARCHDOMAIN=""
 
 # ── Step 7: Security ──────────────────────────────────────────────────────────
 step "7. Security"
@@ -274,6 +338,7 @@ echo "  Cores:       $CORES"
 echo "  Bridge:      $BRIDGE"
 echo "  Network:     $NET_CONFIG"
 echo "  DNS:         $DNS"
+echo "  Search dom.: ${SEARCHDOMAIN:-(none)}"
 echo "  Unprivileged: $( [ "$UNPRIVILEGED" = "1" ] && echo "yes" || echo "no")"
 echo "  Nesting:     $( [ "$NESTING_FLAG" = "1" ] && echo "yes" || echo "no")"
 echo ""
@@ -283,60 +348,89 @@ read -rp "Create container? [y/N]: " FINAL_CONFIRM
 # ── Create container ──────────────────────────────────────────────────────────
 step "Creating container"
 
-# Write SSH key to temp file if provided
+# Write SSH key to temp file if provided. The trap covers an early exit from a
+# failed pct create, which would otherwise leave the file behind.
 TMPKEY=""
+cleanup() {
+  [ -n "${TMPKEY:-}" ] && rm -f "$TMPKEY"
+  return 0
+}
+trap cleanup EXIT
+
 if [ -n "${SSH_PUBKEY:-}" ]; then
   TMPKEY=$(mktemp /tmp/lxc-pubkey-XXXXXX)
+  chmod 600 "$TMPKEY"
   echo "$SSH_PUBKEY" > "$TMPKEY"
 fi
 
-# Build and run pct create directly
+# Note: --password is deliberately not used. It would put the root password in
+# the process table for anyone running ps. It is set over stdin after boot.
+PCT_ARGS=(
+  "$VMID" "$TEMPLATE"
+  --hostname "$HOSTNAME"
+  --storage "$STORAGE"
+  --rootfs "${STORAGE}:${DISK}"
+  --memory "$RAM"
+  --swap "$SWAP"
+  --cores "$CORES"
+  --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}"
+  --nameserver "$DNS"
+  --unprivileged "$UNPRIVILEGED"
+  --features "nesting=${NESTING_FLAG}"
+  --start 1
+  --onboot 1
+)
+if [ -n "$SEARCHDOMAIN" ]; then
+  PCT_ARGS+=(--searchdomain "$SEARCHDOMAIN")
+fi
 if [ -n "$TMPKEY" ]; then
-  pct create "$VMID" "$TEMPLATE" \
-    --hostname "$HOSTNAME" \
-    --storage "$STORAGE" \
-    --rootfs "${STORAGE}:${DISK}" \
-    --memory "$RAM" \
-    --swap "$SWAP" \
-    --cores "$CORES" \
-    --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}" \
-    --nameserver "$DNS" \
-    --unprivileged "$UNPRIVILEGED" \
-    --features "nesting=${NESTING_FLAG}" \
-    --password "$ROOT_PASS" \
-    --ssh-public-keys "$TMPKEY" \
-    --start 1 \
-    --onboot 1
-else
-  pct create "$VMID" "$TEMPLATE" \
-    --hostname "$HOSTNAME" \
-    --storage "$STORAGE" \
-    --rootfs "${STORAGE}:${DISK}" \
-    --memory "$RAM" \
-    --swap "$SWAP" \
-    --cores "$CORES" \
-    --net0 "name=eth0,bridge=${BRIDGE},${NET_CONFIG}" \
-    --nameserver "$DNS" \
-    --unprivileged "$UNPRIVILEGED" \
-    --features "nesting=${NESTING_FLAG}" \
-    --password "$ROOT_PASS" \
-    --start 1 \
-    --onboot 1
+  PCT_ARGS+=(--ssh-public-keys "$TMPKEY")
 fi
 
-unset ROOT_PASS
-[ -n "$TMPKEY" ] && rm -f "$TMPKEY"
+pct create "${PCT_ARGS[@]}"
+
+cleanup
+TMPKEY=""
 
 info "Container $VMID created."
 
 # ── Wait for container to start ───────────────────────────────────────────────
 info "Waiting for container to start..."
 sleep 3
+CT_RUNNING=0
 for i in {1..10}; do
-  pct status "$VMID" | grep -q "running" && break
+  if pct status "$VMID" | grep -q "running"; then
+    CT_RUNNING=1
+    break
+  fi
   sleep 2
 done
-pct status "$VMID" | grep -q "running" && info "Container is running." || warn "Container may not have started — check: pct status $VMID"
+if [ "$CT_RUNNING" = "1" ]; then
+  info "Container is running."
+else
+  warn "Container may not have started — check: pct status $VMID"
+fi
+
+# ── Set root password ─────────────────────────────────────────────────────────
+# Fed to chpasswd on stdin: printf is a builtin, so the password never reaches
+# another process's argv and is never written to disk.
+step "Setting root password"
+PW_SET=0
+if [ "$CT_RUNNING" = "1" ]; then
+  for i in {1..5}; do
+    if printf 'root:%s\n' "$ROOT_PASS" | pct exec "$VMID" -- chpasswd 2>/dev/null; then
+      PW_SET=1
+      break
+    fi
+    sleep 2
+  done
+fi
+unset ROOT_PASS
+if [ "$PW_SET" = "1" ]; then
+  info "Root password set."
+else
+  warn "Could not set the root password — set it manually: pct exec $VMID -- passwd root"
+fi
 
 
 # ── Bootstrap container ──────────────────────────────────────────────────────────────────────────────
