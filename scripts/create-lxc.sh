@@ -19,6 +19,51 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 step()  { echo -e "\n${BLUE}──── $1 ────${NC}"; }
 
+# ── Prompt helpers ────────────────────────────────────────────────────────────
+# Ask for a whole number, re-prompting until it is valid.
+# Usage: ask_int <varname> <prompt> <default> <min> <max>
+ask_int() {
+  local __var="$1" __prompt="$2" __default="$3" __min="$4" __max="$5" __input
+  while true; do
+    read -rp "${__prompt} [default: ${__default}]: " __input
+    __input=${__input:-$__default}
+    if [[ "$__input" =~ ^[0-9]+$ ]] && [ "$__input" -ge "$__min" ] && [ "$__input" -le "$__max" ]; then
+      printf -v "$__var" '%s' "$__input"
+      return 0
+    fi
+    warn "Enter a whole number between ${__min} and ${__max}."
+  done
+}
+
+# Numbered menu over MENU_VALUES (what gets used) and MENU_LABELS (what is shown).
+# Accepts a list number or an exact value; re-prompts on anything else.
+# Usage: MENU_VALUES=(...); MENU_LABELS=(...); choose_from_menu <varname> <prompt> <preferred-default>
+choose_from_menu() {
+  local __var="$1" __prompt="$2" __preferred="$3" __i __choice __default=1
+  for __i in "${!MENU_VALUES[@]}"; do
+    [ "${MENU_VALUES[$__i]}" = "$__preferred" ] && __default=$((__i+1))
+  done
+  for __i in "${!MENU_LABELS[@]}"; do
+    echo -e "  ${CYAN}$((__i+1)))${NC} ${MENU_LABELS[$__i]}"
+  done
+  echo ""
+  while true; do
+    read -rp "${__prompt} [1-${#MENU_VALUES[@]}, default: ${__default} = ${MENU_VALUES[$((__default-1))]}]: " __choice
+    __choice=${__choice:-$__default}
+    if [[ "$__choice" =~ ^[0-9]+$ ]] && [ "$__choice" -ge 1 ] && [ "$__choice" -le "${#MENU_VALUES[@]}" ]; then
+      printf -v "$__var" '%s' "${MENU_VALUES[$((__choice-1))]}"
+      return 0
+    fi
+    for __i in "${MENU_VALUES[@]}"; do
+      if [ "$__choice" = "$__i" ]; then
+        printf -v "$__var" '%s' "$__i"
+        return 0
+      fi
+    done
+    warn "Invalid selection. Enter a number from the list, or an exact name."
+  done
+}
+
 # ── Root + Proxmox check ──────────────────────────────────────────────────────
 [ "$EUID" -ne 0 ] && error "Please run as root on the Proxmox host."
 command -v pct &>/dev/null || error "pct not found — this script must run on the Proxmox host."
@@ -89,30 +134,64 @@ info "Template: $TEMPLATE"
 
 # ── Step 4: Storage ───────────────────────────────────────────────────────────
 step "4. Storage"
-info "Available storage pools:"
-pvesm status | awk 'NR>1 {print NR-1") "$1" ("$2")"}' || true
-echo ""
-read -rp "Storage pool for container disk [default: local-lvm]: " STORAGE
-STORAGE=${STORAGE:-local-lvm}
+
+# Only list storage that can actually hold a container rootfs
+mapfile -t STORAGE_ROWS < <(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 {print $1"|"$2"|"$3}')
+
+if [ "${#STORAGE_ROWS[@]}" -eq 0 ]; then
+  warn "No storage pools reporting support for container disks (content type: rootdir)."
+  read -rp "Storage pool for container disk [default: local-lvm]: " STORAGE
+  STORAGE=${STORAGE:-local-lvm}
+else
+  MENU_VALUES=()
+  MENU_LABELS=()
+  for row in "${STORAGE_ROWS[@]}"; do
+    sname="${row%%|*}"
+    srest="${row#*|}"
+    MENU_VALUES+=("$sname")
+    MENU_LABELS+=("${sname} (${srest%%|*}, ${srest#*|})")
+  done
+  info "Available storage pools:"
+  choose_from_menu STORAGE "Select storage" "local-lvm"
+fi
+info "Storage: $STORAGE"
 
 # ── Step 5: Resources ─────────────────────────────────────────────────────────
 step "5. Resources"
-read -rp "Disk size in GB [default: 8]: " DISK
-DISK=${DISK:-8}
-
-read -rp "RAM in MB [default: 512]: " RAM
-RAM=${RAM:-512}
-
-read -rp "Swap in MB [default: 512]: " SWAP
-SWAP=${SWAP:-512}
-
-read -rp "CPU cores [default: 1]: " CORES
-CORES=${CORES:-1}
+HOST_CORES=$(nproc 2>/dev/null || echo 128)
+ask_int DISK  "Disk size in GB" 8 1 65536
+ask_int RAM   "RAM in MB" 512 16 1048576
+ask_int SWAP  "Swap in MB" 512 0 1048576
+ask_int CORES "CPU cores" 1 1 "$HOST_CORES"
 
 # ── Step 6: Network ───────────────────────────────────────────────────────────
 step "6. Network"
-read -rp "Network bridge [default: vmbr0]: " BRIDGE
-BRIDGE=${BRIDGE:-vmbr0}
+
+# Linux bridges expose /sys/class/net/<if>/bridge; OVS bridges do not
+mapfile -t BRIDGES < <(
+  {
+    for d in /sys/class/net/*; do
+      if [ -d "$d/bridge" ]; then
+        basename "$d"
+      fi
+    done
+    if command -v ovs-vsctl >/dev/null 2>&1; then
+      ovs-vsctl list-br 2>/dev/null || true
+    fi
+  } | sort -u
+)
+
+if [ "${#BRIDGES[@]}" -eq 0 ]; then
+  warn "No network bridges detected on this host."
+  read -rp "Network bridge [default: vmbr0]: " BRIDGE
+  BRIDGE=${BRIDGE:-vmbr0}
+else
+  MENU_VALUES=("${BRIDGES[@]}")
+  MENU_LABELS=("${BRIDGES[@]}")
+  info "Available network bridges:"
+  choose_from_menu BRIDGE "Select bridge" "vmbr0"
+fi
+info "Bridge: $BRIDGE"
 
 echo ""
 echo -e "  ${CYAN}1)${NC} DHCP"
