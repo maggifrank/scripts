@@ -248,7 +248,7 @@ def journal_runs(project, limit=10, max_lines=4000):
     if out.returncode != 0:
         return {"available": False, "runs": [], "error": out.stderr.strip()[:300]}
 
-    runs, order = {}, []
+    runs, order, loose = {}, [], []
     for line in out.stdout.splitlines():
         try:
             rec = json.loads(line)
@@ -259,22 +259,57 @@ def journal_runs(project, limit=10, max_lines=4000):
             message = bytes(message).decode("utf-8", "replace")
         if not isinstance(message, str):
             continue
-        inv = rec.get("_SYSTEMD_INVOCATION_ID") or "unknown"
         try:
             ts = int(rec.get("__REALTIME_TIMESTAMP", 0)) / 1e6
         except (TypeError, ValueError):
             ts = 0
+        try:
+            priority = int(rec.get("PRIORITY", 6))
+        except (TypeError, ValueError):
+            priority = 6
+        entry = {"t": iso(ts), "m": message, "err": priority <= 3}
+
+        inv = rec.get("_SYSTEMD_INVOCATION_ID")
+        if not inv:
+            # systemd's own lines about the unit - "Starting...", "Finished...",
+            # "Failed with result ..." - are logged by PID 1, not by the script,
+            # and carry no invocation id. Grouping them by that id invented a
+            # phantom run holding every one of them. Set them aside and attach
+            # each to the run it actually belongs to, below: "Failed with
+            # result" is sometimes the only evidence a run died.
+            loose.append((ts, entry))
+            continue
+
         if inv not in runs:
             runs[inv] = {"id": inv, "started": ts, "ended": ts, "lines": []}
             order.append(inv)
         run = runs[inv]
         run["ended"] = max(run["ended"], ts)
         run["started"] = min(run["started"], ts) if run["started"] else ts
-        try:
-            priority = int(rec.get("PRIORITY", 6))
-        except (TypeError, ValueError):
-            priority = 6
-        run["lines"].append({"t": iso(ts), "m": message, "err": priority <= 3})
+        run["lines"].append(entry)
+
+    # Attach each stray line to the run it sits inside, or to one starting just
+    # after it ("Starting..." precedes the script's first output). Anything that
+    # matches no run is bookkeeping from a run the journal no longer holds, and
+    # is dropped rather than shown as a run of its own.
+    GRACE = 120.0
+    for ts, entry in loose:
+        best = None
+        for inv in order:
+            run = runs[inv]
+            if run["started"] - GRACE <= ts <= run["ended"] + GRACE:
+                distance = 0 if run["started"] <= ts <= run["ended"] else min(
+                    abs(ts - run["started"]), abs(ts - run["ended"]))
+                if best is None or distance < best[0]:
+                    best = (distance, inv)
+        if best is not None:
+            run = runs[best[1]]
+            run["lines"].append(entry)
+            run["ended"] = max(run["ended"], ts)
+            run["started"] = min(run["started"], ts)
+
+    for run in runs.values():
+        run["lines"].sort(key=lambda l: l["t"] or "")
 
     result = []
     for inv in order[-limit:]:
