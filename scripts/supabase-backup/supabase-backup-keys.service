@@ -1,0 +1,23 @@
+[Unit]
+Description=Apply encryption changes from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/keys --drain
+
+# Writes the recipients a project encrypts to, and clears or sets
+# ALLOW_PLAINTEXT in that project's config to match. It never reads a
+# credential and never handles a private key: the identity that opens these
+# archives is not on this host, which is the entire reason they are worth
+# encrypting.
+ReadWritePaths=/etc/supabase-backup-keys /etc/supabase-backup /run/supabase-backup-web
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

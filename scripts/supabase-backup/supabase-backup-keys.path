@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for encryption changes from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Path]
+# The console drops a request here; this fires the root oneshot that applies
+# it. The console can read a project's recipients - they are public keys - but
+# only root may decide what they are.
+DirectoryNotEmpty=/run/supabase-backup-web/encryption
+MakeDirectory=false
+
+[Install]
+WantedBy=paths.target

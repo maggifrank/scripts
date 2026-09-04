@@ -1,0 +1,166 @@
+#!/bin/bash
+# keys — apply encryption changes left by the web console.
+#
+#   keys --drain          process every pending request (what the .path unit runs)
+#   keys <request.json>   process one
+#
+# Runs as root, triggered by supabase-backup-keys.path. It writes one thing: a
+# project's age recipients file, which decides who can read every archive
+# written from then on.
+#
+# Nothing in a request is a secret — an age recipient is a public key, and the
+# whole design turns on the private half never being here — so unlike a
+# registration this handles no credential and the file is not shredded. It is
+# still written by a network-facing process, so nothing in it is trusted:
+# every field is validated again here, and age itself is made to accept the
+# result before it replaces anything.
+set -euo pipefail
+
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+CONF_DIR="${CONF_DIR:-/etc/supabase-backup}"
+KEYS_DIR="${KEYS_DIR:-/etc/supabase-backup-keys}"
+SPOOL_DIR="${SPOOL_DIR:-/run/supabase-backup-web}"
+REQ_DIR="${SPOOL_DIR}/encryption"
+RES_DIR="${SPOOL_DIR}/results"
+WEB_USER="${WEB_USER:-supabase-backup-web}"
+AGE_BIN="${AGE_BIN:-age}"
+
+# An age recipient, or an SSH public key age also accepts. Anything else is
+# refused before it can reach a file that backup.sh feeds to age unattended.
+AGE_RE='^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$'
+SSH_RE='^ssh-(ed25519|rsa) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]{0,200})?$'
+
+STEPS=()
+note() { STEPS+=("$1"); printf '  %s\n' "$1"; }
+
+emit() {  # emit <id> <state> <error>
+  local id="$1" state="$2" error="${3:-}"
+  mkdir -p "$RES_DIR"
+  jq -nc --arg id "$id" --arg state "$state" --arg error "$error" \
+     --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     --argjson steps "$(printf '%s\n' "${STEPS[@]:-}" | jq -R -s 'split("\n") | map(select(length>0))')" \
+     '{id:$id, state:$state, error:$error, steps:$steps, finished_at:$finished}' \
+     > "${RES_DIR}/${id}.json.tmp"
+  chmod 0640 "${RES_DIR}/${id}.json.tmp"
+  chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
+  mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
+}
+
+# ALLOW_PLAINTEXT is backup.sh's answer to "the recipients file is gone and
+# there are encrypted archives here" — it refuses, rather than quietly writing
+# the next one in the clear. Turning encryption off from the console IS that
+# deliberate act, so it sets the flag; turning it on clears it again, so the
+# guard is armed for the case it exists for, which is the file disappearing
+# when nobody meant it to.
+set_allow_plaintext() {
+  local conf="$1" want="$2"
+  [ -f "$conf" ] || return 0
+  local tmp; tmp="$(mktemp "${conf}.XXXXXX")"
+  chmod 0600 "$tmp"
+  grep -v '^ALLOW_PLAINTEXT=' "$conf" > "$tmp" || true
+  [ "$want" = "1" ] && printf 'ALLOW_PLAINTEXT=1\n' >> "$tmp"
+  mv -f "$tmp" "$conf"
+  chmod 0600 "$conf"
+}
+
+process() {
+  local file="$1"
+  STEPS=()
+
+  local id
+  id="$(basename "$file" .json)"
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || { rm -f "$file"; return 0; }
+
+  local body project count
+  body="$(cat "$file")" || { emit "$id" failed "could not read the request"; rm -f "$file"; return 0; }
+  rm -f "$file"
+
+  project="$(jq -r '.project // empty' <<<"$body")"
+  [[ "$project" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]] \
+    || { emit "$id" failed "invalid project name"; return 0; }
+  # Only a project this host actually backs up. Writing recipients for anything
+  # else creates a file that nothing reads and that nobody will think to remove.
+  [ -f "${CONF_DIR}/${project}.conf" ] \
+    || { emit "$id" failed "no project named '${project}' is configured on this host"; return 0; }
+
+  jq -e '.recipients | type == "array"' <<<"$body" >/dev/null \
+    || { emit "$id" failed "recipients must be a list"; return 0; }
+  count="$(jq -r '.recipients | length' <<<"$body")"
+  [ "$count" -le 32 ] || { emit "$id" failed "too many recipients (${count})"; return 0; }
+
+  install -d -m 0755 "$KEYS_DIR"
+  local target="${KEYS_DIR}/${project}.recipients"
+
+  # ── Disabling ──
+  if [ "$count" -eq 0 ]; then
+    if [ -f "$target" ]; then
+      rm -f "$target"
+      note "removed ${target} — new archives will be written in the clear"
+    else
+      note "${project} was not encrypted; nothing to remove"
+    fi
+    set_allow_plaintext "${CONF_DIR}/${project}.conf" 1
+    note "set ALLOW_PLAINTEXT=1 so the next run does not refuse the downgrade"
+    note "archives already written stay encrypted, and still need their identity"
+    emit "$id" ok ""
+    return 0
+  fi
+
+  # ── Enabling, or replacing the list ──
+  command -v "$AGE_BIN" >/dev/null 2>&1 \
+    || { emit "$id" failed "age is not installed on this host, so nothing could encrypt with these keys (apt-get install age)"; return 0; }
+
+  local tmp bad=""
+  tmp="$(mktemp "${target}.XXXXXX")"
+  chmod 0644 "$tmp"
+  {
+    printf '# age recipients for supabase-backup project %s\n' "$project"
+    printf '# Written by the web console at %s. Public keys only:\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '# the identity that opens these archives is deliberately not on this host.\n'
+  } > "$tmp"
+
+  local r
+  while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    if [[ "$r" =~ $AGE_RE ]] || [[ "$r" =~ $SSH_RE ]]; then
+      printf '%s\n' "$r" >> "$tmp"
+    else
+      bad="$r"; break
+    fi
+  done < <(jq -r '.recipients[]' <<<"$body")
+
+  if [ -n "$bad" ]; then
+    rm -f "$tmp"
+    emit "$id" failed "not an age recipient or an SSH public key: $(cut -c1-60 <<<"$bad")"
+    return 0
+  fi
+
+  # age is the authority on what age accepts. A list this script is happy with
+  # and age is not would be found at 03:20, by a backup that does not happen.
+  local err; err="$(mktemp)"
+  if ! printf '' | "$AGE_BIN" -R "$tmp" >/dev/null 2>"$err"; then
+    local detail; detail="$(head -2 "$err" | tr '\n' ' ')"
+    rm -f "$tmp" "$err"
+    emit "$id" failed "age rejected the recipients: ${detail}"
+    return 0
+  fi
+  rm -f "$err"
+
+  mv -f "$tmp" "$target"
+  chmod 0644 "$target"
+  note "wrote ${target} with ${count} recipient(s)"
+  note "age accepts them — the next run will encrypt to those keys"
+
+  set_allow_plaintext "${CONF_DIR}/${project}.conf" 0
+  note "this host holds no identity for them; restoring needs the private key"
+  emit "$id" ok ""
+}
+
+case "${1:-}" in
+  --drain|"")
+    shopt -s nullglob
+    for f in "$REQ_DIR"/*.json; do process "$f"; done
+    ;;
+  *) process "$1" ;;
+esac
