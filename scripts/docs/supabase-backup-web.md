@@ -3,7 +3,9 @@
 A browser view of what [supabase-backup](supabase-backup.md) has actually
 produced on a host: every project, its archives and their manifests, the run
 history, the next scheduled run, and a verify that re-checks an archive against
-its own checksums and its own inventory. It can start a run.
+its own checksums and its own inventory. It can start a run, change its own
+password and settings, set who a project's archives are encrypted to, and — if
+the host was set up for it — ask for a restore.
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
@@ -90,16 +92,157 @@ A proxy on a *different* host must be named in `WEB_TRUSTED_PROXIES` and must
 send `X-Forwarded-Proto: https`. That header is ignored from any other client,
 so it cannot be used to talk your way past the check.
 
+## Changing the console's own settings
+
+The **Console settings** panel edits `web.env` — the password first of all —
+and the console can do neither half of that itself: it cannot write the file
+that configures it, and it cannot restart itself. So it asks, exactly the way
+it asks for a project to be registered.
+
+```
+console (unprivileged, /etc/supabase-backup-web is read-only to it)
+  └─ writes /run/supabase-backup-web/settings/<id>.json, mode 0600
+       │     a PBKDF2 digest, never a password — the console hashes first
+  supabase-backup-reconfigure.path  (DirectoryNotEmpty)
+       ▼
+supabase-backup-reconfigure.service  (root, oneshot)
+  re-validates every field ─ the request came from a network-facing process
+  → rewrites only the keys it knows, keeping comments and every other line
+  → restarts supabase-backup-web
+  → puts the old file back if the console does not come up
+  → writes a result the console polls
+```
+
+What the panel changes:
+
+| Setting | Note |
+|---|---|
+| `WEB_USER` | changing it signs the browser out, like changing the password |
+| `WEB_PASSWORD_HASH` | typed as a password, stored as a PBKDF2 digest |
+| `WEB_BIND` | where it listens — see the rollback below |
+| `WEB_STALE_HOURS` | when a project's newest archive counts as stale |
+| `WEB_ALLOW_RUN` | offer "Run backup now" |
+| `WEB_ALLOW_DOWNLOAD` | allow whole archives over HTTP |
+| `WEB_ALLOW_REGISTER` | offer "Add a project" |
+| `WEB_ALLOW_SETTINGS` | offer this panel at all — turning it off is one-way from here |
+
+What it does not, and why:
+
+- `WEB_ALLOW_ANONYMOUS` — a switch that turns authentication off has no
+  business being reachable through the thing it authenticates.
+- `WEB_TRUSTED_PROXIES` — it decides whose word to take for who a client is.
+- `DATA_DIR`, `UNIT_PREFIX`, `WEB_RUN_COMMAND`, `WEB_SPOOL_DIR` — the shape of
+  the installation, not a preference. Those are edited on the host by someone
+  who is already root.
+
+### The password
+
+The console hashes it. The plaintext crosses the connection — as it already
+does on every Basic auth request — and stops there: what goes into the spool
+file is a `pbkdf2_sha256` digest at 600,000 iterations, so the password is
+never in a file under `/run`, never in root's argv, and never in the journal.
+The helper checks that what arrived really is a digest, because a plaintext
+password written into `WEB_PASSWORD_HASH` would leave a file that looks
+perfectly reasonable and rejects every login.
+
+Minimum twelve characters, and the panel asks for the **current** one before it
+will change anything. Basic auth alone does not prove anyone is there: a
+browser resends a saved password all day, so without that box an unattended tab
+would be a password change waiting to happen.
+
+Saving restarts the console, which is what makes the new credentials take
+effect — and immediately signs the browser out, since it is still holding the
+old ones. The page says so and offers a reload. Nothing about
+`server.py --hash` changes; it is still there, and still the way back in.
+
+### Not over plain HTTP either
+
+The same rule as [registering a project](#it-will-not-do-this-over-plain-http),
+for a plainer reason: a password changed over a connection that shows it to the
+network has not been changed. From a plain-HTTP connection the panel shows what
+the settings are and refuses to change them. Reach the console over the TLS
+proxy on this host or an SSH tunnel and it becomes a form.
+
+### If the console will not start with the new settings
+
+The helper restarts the console, then asks systemd three times over three
+seconds whether it is actually running — `systemctl restart` returns as soon as
+the process has been exec'd, and a console that rejects its own configuration
+dies a moment later. If it is not up, the previous `web.env` goes back and the
+console is restarted with it, and the panel says so.
+
+That is what makes changing the listen address survivable. What it cannot save
+you from is a *working* address you cannot reach: switch from `0.0.0.0` to
+`127.0.0.1` while browsing from the LAN and the console comes up perfectly,
+just not for you. The panel warns before saving that one; recovering it means
+an SSH tunnel, or `web.env` on the host.
+
+## Restoring an archive
+
+Off unless the host says otherwise: `WEB_ALLOW_RESTORE=0` by default, and the
+setup script asks before enabling `supabase-backup-restore.path`. Two switches
+because they answer different questions — whether the console *offers* it, and
+whether the host would *act* on a request at all.
+
+The console never restores. `restore` does, as root, triggered by the same
+spool pattern as everything else here: the identical script an operator runs by
+hand, taking the same steps in the same order.
+
+What made that script safe was a person answering its prompts. Those answers
+are not dropped here, they are moved: a request has to name the archive, spell
+out the target project ref by typing it, and carry a separate yes for each
+question the script would have stopped on — a non-empty target, catalog errors,
+a dry run or the real thing. Absent means no, so a request that simply omits a
+question cannot bulldoze through it.
+
+The root side re-checks every one, and re-derives the guard that matters most
+from `/etc/supabase-backup/*.conf` — files the console cannot read: **it will
+not write into a project this host backs up.** A restore that would overwrite a
+backup source is refused there, whatever the request said.
+
+A restore request carries the target's database password and service key, so
+like registration it is refused over plain HTTP from the network.
+
+## Encrypting the archives
+
+A project with an age recipients file gets its tarball encrypted to those
+public keys — `<name>.tar.gz.age`, with a small plaintext sidecar so the
+console can still say what is in an archive it cannot open.
+
+**The identity that opens these archives is deliberately not on this host.**
+Encrypting to a key the backup host also holds protects a stolen disk and
+nothing else. Keeping the private half elsewhere means a host that is fully
+compromised still yields no readable data — which is also why nothing here can
+decrypt what it just wrote, and why a lost identity is a lost archive. Keep it
+somewhere that outlives the host.
+
+Recipients live in `/etc/supabase-backup-keys/<project>.recipients`, not in the
+project's `.conf`: they are not secret, the two audiences differ, and the
+console has to be able to read them to show what a project is encrypted to. A
+non-empty file is the only switch — present means encrypt, absent means do not,
+with no second copy of the setting to drift.
+
+Setting them from the console goes the way everything else does: the console
+writes a request, `supabase-backup-keys.service` validates each recipient by
+making `age` itself accept it, and only then replaces the file. `age1…` public
+keys and `ssh-ed25519`/`ssh-rsa` public keys are both accepted. Nothing in the
+request is a secret, so unlike a registration it is not shredded.
+
+Requires the `age` binary on the host; the setup script installs it, and says
+so if it could not.
+
 ## What it deliberately does not do
 
-- **Restore.** `supabase-restore` is interactive, destructive, needs the target
-  project's credentials, and refuses to run against the project it backs up or
-  against a pair of credentials naming two different projects. Those guards
-  hold because a person is reading them while answering the prompts. A web
-  button would keep the code and lose the setting.
+- **Perform a restore itself.** It can ask for one, if the host was set up to
+  allow it — see [Restoring an archive](#restoring-an-archive). The work is
+  done by `restore` as root, and the guards are re-derived there from files
+  this process cannot read.
 - **Prune or delete.** `KEEP_DAYS` does that, on a schedule, with nobody
   clicking anything at 1 a.m.
-- **Edit configuration.** The `.conf` files are edited on the host.
+- **Edit a project's configuration.** The per-project `.conf` files are edited
+  on the host. This process cannot read one, never mind write one. Its own
+  `web.env` is a different matter — see
+  [Changing the console's own settings](#changing-the-consoles-own-settings).
 - **Read a project's credentials.** It runs as its own unprivileged user, its
   own config lives in `/etc/supabase-backup-web/`, and the unit adds
   `InaccessiblePaths=/etc/supabase-backup` on top of those files' 0600 modes.
@@ -119,6 +262,48 @@ What it cannot check is whether the archive matches the project. Only the run
 that wrote it could, and it does: `backup.sh` compares its storage walk against
 `storage.objects` and refuses to finalise an archive that disagrees.
 Verification here is about damage since then. It is also not a restore test.
+
+## When the disk fills
+
+The **Free space** card carries a forecast: how fast free space is going, and
+the date it runs out on that trend.
+
+**It is measured, not calculated.** A snapshot of the archive directory cannot
+answer this. The archives show what arrives; they cannot show what the
+retention prune took away, because what it took away is precisely what is no
+longer there to count. A host whose footprint has been flat for a year and a
+host filling steadily look identical in one `du`. So the console samples free
+space hourly into `/var/lib/supabase-backup-web/space.jsonl` and fits a line
+through what it actually saw.
+
+**The sawtooth is the trap.** Free space on a backup host does not fall
+smoothly — it drops a little every night and jumps back up whenever the prune
+runs. A straight line through less than two of those cycles fits the falling
+edge and confidently condemns a host that is perfectly stable. That is the one
+mistake this card must not make, so whole cycles are averaged to a single point
+each before anything is fitted. The cycle length is taken from the span the
+retained archives cover, which is `KEEP_DAYS` measured rather than configured —
+the console cannot read `KEEP_DAYS` itself, because it lives in a file holding
+the project's database password.
+
+What the card says, and what it is standing on:
+
+| Line | Basis | Means |
+|---|---|---|
+| `full in 4 months` | two or more whole prune cycles | the real trend, sawtooth removed |
+| `provisional · 12d short of 2 cycles` | a plain fit over the raw samples | may still be reading one falling edge as a trend |
+| `full in 41 days at worst` | the rate archives arrive | no samples yet — what would happen if nothing were ever pruned |
+| `not filling` | either fit, trend flat or rising | retention is holding, or nothing is growing |
+| `trend: not enough history yet` | nothing | a fresh install with no archives |
+
+The lead line turns amber under 60 days and red under 14. It is deliberately
+not folded into the header pill: that pill is about whether the backups are
+good, and a disk with three months left is not a backup that failed.
+
+So a freshly installed console starts at `at worst`, moves to `provisional`
+within three days, and gives a real answer after two retention periods — about
+60 days on the default 30-day retention. It says which of those it is doing
+rather than presenting all three as the same number.
 
 ## Exposure
 
@@ -155,8 +340,17 @@ exactly the kind of thing that quietly expires on a host nobody logs into.
 | `UNIT_PREFIX` | `supabase-backup` | Template unit name |
 | `WEB_RUN_COMMAND` | `systemctl start --no-block {unit}` | How a run is started |
 | `WEB_ALLOW_REGISTER` | `1` | Offer the "Add a project" form at all |
+| `WEB_ALLOW_SETTINGS` | `1` | Offer the "Console settings" panel at all |
+| `WEB_ALLOW_RESTORE` | `0` | Offer to ask the host for a restore |
+| `WEB_ALLOW_ENCRYPTION` | `1` | Offer to set a project's age recipients |
+| `KEYS_DIR` | `/etc/supabase-backup-keys` | Where the per-project recipients files live |
 | `WEB_TRUSTED_PROXIES` | — | Comma-separated proxy addresses trusted to assert `X-Forwarded-Proto` |
-| `WEB_SPOOL_DIR` | `/run/supabase-backup-web` | Spool shared with the registration helper |
+| `WEB_SPOOL_DIR` | `/run/supabase-backup-web` | Spool shared with the privileged helpers |
+| `WEB_STATE_DIR` | `/var/lib/supabase-backup-web` | Where the free-space history is kept |
+| `WEB_SAMPLE_SECONDS` | `3600` | How often free space is sampled |
+| `WEB_HISTORY_DAYS` | `90` | How much of that history is kept |
+| `WEB_FORECAST_DAYS` | `30` | Window for the provisional fit, before two cycles exist |
+| `WEB_FORECAST_MIN_DAYS` | `3` | History needed before any fit is attempted |
 
 It refuses to start with no password configured. That is not an oversight to
 work around: `WEB_ALLOW_ANONYMOUS=1` exists for a host where something else is
@@ -171,7 +365,9 @@ systemctl restart supabase-backup-web        # after editing web.env
 ```
 
 Editing anything under `/opt/supabase-backup/web/static/` takes effect on the
-next page load; only `server.py` and `web.env` need a restart.
+next page load; only `server.py` and `web.env` need a restart. The Settings
+panel does that restart for you — that is the whole reason a change made there
+takes a couple of seconds.
 
 ## When it misbehaves
 
@@ -223,6 +419,37 @@ active — and `journalctl -u supabase-backup-register -n 30` for what happened
 when it last fired. If the spool directory is missing, run
 `systemd-tmpfiles --create /etc/tmpfiles.d/supabase-backup-web.conf`.
 
+**The Settings panel shows a notice instead of a form.** One of three things,
+and the notice says which: you are connected over plain HTTP from the network;
+`WEB_ALLOW_SETTINGS=0`; or the helper is not installed, which means
+`/run/supabase-backup-web/settings` does not exist. For the last one, re-run
+`supabase-backup-web-setup.sh`, or:
+
+```sh
+systemd-tmpfiles --create /etc/tmpfiles.d/supabase-backup-web.conf
+systemctl enable --now supabase-backup-reconfigure.path
+```
+
+**A settings save says the console did not come back.** It restarts as part of
+saving, so a few seconds of silence is normal and the page waits it out. Past
+that, either it is listening somewhere else now — you changed `WEB_BIND` to an
+address that does not reach you — or it would not start, in which case the
+helper has already put the old `web.env` back:
+
+```sh
+journalctl -u supabase-backup-reconfigure -n 30    # what the helper did
+systemctl status supabase-backup-web
+```
+
+**Locked out: nobody knows the password.** The way in is the way it was set up
+in the first place, on the host:
+
+```sh
+/opt/supabase-backup/web/server.py --hash          # prints a WEB_PASSWORD_HASH line
+$EDITOR /etc/supabase-backup-web/web.env           # replace the line
+systemctl restart supabase-backup-web
+```
+
 **"Run backup now" fails with "Interactive authentication required".** The
 polkit rule is missing, not matching, or polkit was not restarted after it was
 written. It lives at `/etc/polkit-1/rules.d/50-supabase-backup-web.rules`.
@@ -249,5 +476,20 @@ systemctl restart systemd-journald
   prove it restores; only a rehearsal does that.
 - A project can be added but not edited or removed from the console. Changing
   credentials or retiring a project is still done on the host.
+- One account. The console has a single Basic auth user, and the Settings panel
+  changes that one's name and password. There is no second account and no
+  per-person audit trail beyond the journal — if several people use it, they
+  share the password.
+- The panel changes the console's own settings and nothing else. A project's
+  retention and credentials live in files this process is deliberately unable
+  to read, so `KEEP_DAYS` is still changed on the host.
 - The console knows nothing about offsite copies. A green header means the
   local archives are good, not that anything offsite is.
+- The free-space forecast is a straight line, and a straight line is wrong
+  about anything that accelerates — a project whose data is growing
+  exponentially will fill the disk sooner than the card says. It also measures
+  the whole filesystem, so something else on the host filling it up shows here
+  as a backup problem.
+- The history only exists where the console is running. A console that is
+  stopped for a month has a month-shaped hole, and one that has never run
+  cannot say anything beyond the ceiling.

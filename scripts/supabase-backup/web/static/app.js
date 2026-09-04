@@ -18,6 +18,12 @@ let capabilities = {};
 let anyRunning = false;
 let stickyMessage = null;           // {project, text} - an error stays put
 let projectListKey = "";            // rebuild panels only when the set changes
+let restorePoll = null;
+let restoreShown = null;            // id of the restore whose log is on screen
+let restoreBusy = false;            // one at a time, and the host agrees
+let restoreStalled = false;         // running, with nothing running it
+let restoreUnwatched = false;       // allowed here, not watched for on the host
+let signedOut = false;              // the password changed under this browser
 
 // ── Formatting ─────────────────────────────────────────────────────────────
 
@@ -50,6 +56,23 @@ function duration(seconds) {
   return `${m}m ${Math.round(seconds - m * 60)}s`;
 }
 
+// How long is left, in the unit that unit is still useful in. Intl's relative
+// format turns 41 days into "in 1 month", which is both vaguer and calmer than
+// the number it replaced - the wrong trade for the one card that has to alarm.
+function runway(days) {
+  if (days < 1) return "today";
+  if (days < 90) return `${Math.round(days)} days`;
+  if (days < 730) return `${Math.round(days / 30.44)} months`;
+  return `${(days / 365.25).toFixed(1)} years`;
+}
+
+// Month and year. The day is false precision on a forecast this soft, and the
+// card has room for about twenty characters.
+function shortDate(iso) {
+  if (!iso) return "—";
+  return new Date(iso).toLocaleDateString(undefined, { year: "numeric", month: "short" });
+}
+
 // Archives are named for the UTC instant a run started. Show it in the
 // reader's timezone, but keep the stamp visible - it is what you type into
 // `restore`.
@@ -73,7 +96,13 @@ async function api(path, options = {}) {
   const response = await fetch(path, { cache: "no-store", ...options });
   let payload = null;
   try { payload = await response.json(); } catch { /* non-JSON body */ }
-  if (!response.ok) throw new Error((payload && payload.error) || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error((payload && payload.error) || `HTTP ${response.status}`);
+    // 401 after a settings save is not a failure - it is the new password
+    // taking effect - and only the status can tell the two apart.
+    error.status = response.status;
+    throw error;
+  }
   return payload;
 }
 
@@ -110,9 +139,61 @@ function renderSummary(status) {
     ? card("Next run", relative(next), localTime(next))
     : card("Next run", "none scheduled", "no active timer", true));
 
-  cards.append(status.disk
+  const space = status.disk
     ? card("Free space", bytes(status.disk.free), `of ${bytes(status.disk.total)}`)
-    : card("Free space", "unknown", status.data_dir, true));
+    : card("Free space", "unknown", status.data_dir, true);
+  if (status.disk) space.append(...forecast(status.disk.trend));
+  cards.append(space);
+}
+
+// The forecast, in at most two lines: what happens, then what that rests on.
+// The date leads because it is the thing you act on; the rate is underneath so
+// you can judge whether to believe the date.
+function forecast(trend) {
+  if (!trend) return [];
+  const note = (text, tone) => el("div", `card-note${tone ? " " + tone : ""}`, text);
+  const perDay = `${bytes(Math.abs(trend.bytes_per_day || 0))}/day`;
+  const over = trend.span_days >= 1 ? `over ${Math.round(trend.span_days)}d` : "";
+
+  if (trend.history_error) {
+    // No history file means the forecast can never get past its ceiling, and
+    // that is something to fix on the host rather than something to hide.
+    return [note("forecast is not being kept", "warn"),
+            note(trend.history_error, "dim")];
+  }
+
+  if (trend.verdict === "filling") {
+    const days = trend.days_left;
+    const tone = days < 14 ? "crit" : days < 60 ? "warn" : null;
+    return [note(trend.basis === "ceiling"
+                   ? `full in ${runway(days)} at worst`
+                   : `full in ${runway(days)}`, tone),
+            note(basisLine(trend, perDay, over), "dim")];
+  }
+  // "not filling" is a real answer, and on a host whose retention is doing its
+  // job it is the usual one. Saying it plainly is the point.
+  if (trend.verdict === "freeing") {
+    return [note("not filling"), note(`freeing ${perDay}`, "dim")];
+  }
+  if (trend.verdict === "steady") {
+    return [note("not filling"), note(basisLine(trend, perDay, over), "dim")];
+  }
+  return [note("trend: not enough history yet", "dim")];
+}
+
+// What the number stands on, in about twenty characters. Only the two weaker
+// bases spend their line saying so - a fit over whole prune cycles is what the
+// card is meant to show, so it just shows the rate and the date.
+function basisLine(trend, perDay, over) {
+  if (trend.basis === "ceiling") {
+    return `${perDay} arriving · if never pruned`;
+  }
+  if (trend.basis === "provisional") {
+    const need = Math.ceil(trend.history_needed - trend.history_days);
+    return `provisional · ${need}d short of 2 cycles`;
+  }
+  return trend.full_at ? `${perDay} · ${shortDate(trend.full_at)}`
+                       : `${perDay} ${over}`.trim();
 }
 
 // ── Projects ───────────────────────────────────────────────────────────────
@@ -228,6 +309,11 @@ function buildProjectBody(body, project) {
   bar.append(message);
   body.append(bar);
 
+  const encryption = el("div", "encryption");
+  encryption.dataset.role = "encryption";
+  body.append(encryption);
+  renderEncryption(encryption, project);
+
   body.append(el("h3", null, "Archives"));
   const archives = el("div", "list");
   archives.dataset.role = "archives";
@@ -252,6 +338,8 @@ function refreshProjectBody(body, project) {
     button.disabled = running;
     button.textContent = running ? "Running…" : "Run backup now";
   }
+  const encryption = body.querySelector('[data-role="encryption"]');
+  if (encryption) renderEncryption(encryption, project);
   const message = body.querySelector('[data-role="msg"]');
   if (message && !(stickyMessage && stickyMessage.project === project.name)) {
     const partial = project.partials && project.partials[0];
@@ -299,6 +387,214 @@ async function startRun(name, body, button) {
   refresh();
 }
 
+// ── Encryption ─────────────────────────────────────────────────────────────
+
+let encryptionPoll = null;
+
+function encryptionSignature(project) {
+  const e = project.encryption || {};
+  return [e.enabled, (e.recipients || []).join(","), e.error,
+          e.archives_encrypted, e.archives_plain].join("|");
+}
+
+function renderEncryption(container, project) {
+  // Never redraw underneath someone who is typing into the form. A poll every
+  // ten seconds would otherwise wipe a half-pasted key.
+  if (container.dataset.editing === "1") return;
+  const signature = encryptionSignature(project);
+  if (container.dataset.sig === signature) return;
+  container.dataset.sig = signature;
+
+  const e = project.encryption || {};
+  container.replaceChildren();
+
+  const head = el("div", "enc-head");
+  head.append(el("h3", null, "Encryption"));
+  head.append(el("span", `pill pill-${e.error ? "unreadable" : (e.enabled ? "ok" : "never")}`,
+    e.error ? "unknown" : (e.enabled ? "on" : "off")));
+  container.append(head);
+
+  if (e.error) {
+    container.append(el("p", "hint", e.error));
+  } else if (e.enabled) {
+    const n = e.recipients.length;
+    container.append(el("p", "hint",
+      `New archives are encrypted to ${n} recipient${n === 1 ? "" : "s"}. `
+      + "This host holds no private key for them, so nothing here — including this "
+      + "console — can read what it writes. Restoring needs one of these identities."));
+    const chips = el("div", "chips");
+    for (const r of e.recipients) chips.append(el("span", "chip mono", r));
+    container.append(chips);
+  } else {
+    container.append(el("p", "hint",
+      "Archives are written in the clear. Anyone who can read this host, or a copy "
+      + "of it, can read every auth password hash and every storage object in them."));
+  }
+
+  // A project that was switched on partway through has both kinds on disk, and
+  // that is worth stating: the old ones did not become encrypted.
+  if (e.archives_encrypted > 0 && e.archives_plain > 0) {
+    container.append(el("p", "hint",
+      `On disk: ${e.archives_encrypted} encrypted, ${e.archives_plain} in the clear. `
+      + "Switching encryption on does not reach back — the older archives stay as they were."));
+  }
+
+  const bar = el("div", "bar");
+  if (capabilities.encryption) {
+    const edit = el("button", "btn-ghost", e.enabled ? "Change recipients" : "Turn on encryption");
+    edit.addEventListener("click", () => buildEncryptionForm(container, project));
+    bar.append(edit);
+    if (e.enabled) {
+      const off = el("button", "btn-ghost", "Turn off");
+      off.addEventListener("click", () => disableEncryption(container, project));
+      bar.append(off);
+    }
+  }
+  const message = el("span", "bar-msg");
+  message.dataset.role = "enc-msg";
+  bar.append(message);
+  container.append(bar);
+
+  if (!capabilities.encryption && capabilities.encryption_blocked_because) {
+    container.append(el("div", "notice", capabilities.encryption_blocked_because));
+  }
+  container.append(el("div", "enc-out"));
+}
+
+function buildEncryptionForm(container, project) {
+  container.dataset.editing = "1";
+  const e = project.encryption || {};
+  const form = el("div", "form enc-form");
+
+  const label = el("label", null, "Recipients, one per line");
+  const area = document.createElement("textarea");
+  area.rows = 4;
+  area.spellcheck = false;
+  area.autocomplete = "off";
+  area.value = (e.recipients || []).join("\n");
+  area.placeholder = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+  form.append(label, area);
+
+  form.append(el("div", "hint",
+    "An age recipient, or a whole line from an SSH .pub file. More than one means "
+    + "any of them can restore — which is how you avoid a single lost key costing "
+    + "you every backup."));
+  form.append(el("div", "hint",
+    "Make the key somewhere you keep secrets, not here: age-keygen -o backup.key "
+    + "prints a public key to paste in and a private key to store. This console will "
+    + "not generate one for you — a key that was ever on the backup host is a key "
+    + "that was, for a moment, exactly where it must never be."));
+
+  const bar = el("div", "bar");
+  const save = el("button", "btn", "Save recipients");
+  const cancel = el("button", "btn-ghost", "Cancel");
+  const message = el("span", "bar-msg");
+  bar.append(save, cancel, message);
+  form.append(bar);
+  const output = el("div");
+  form.append(output);
+
+  cancel.addEventListener("click", () => {
+    container.dataset.editing = "0";
+    container.dataset.sig = "";
+    renderEncryption(container, project);
+  });
+
+  save.addEventListener("click", () => {
+    const recipients = area.value.split("\n").map((r) => r.trim()).filter(Boolean);
+    if (!recipients.length) {
+      message.className = "bar-msg err";
+      message.textContent = "no recipients — use Turn off if that is what you meant";
+      return;
+    }
+    if (!confirm(
+      `Encrypt future archives of '${project.name}' to ${recipients.length} recipient(s)?\n\n`
+      + "Only those keys will open them. If you lose every one of them, the archives "
+      + "written from now on cannot be recovered by anyone, including you.")) return;
+    submitEncryption(project, recipients, container, save, message, output);
+  });
+
+  container.replaceChildren(form);
+  area.focus();
+}
+
+function disableEncryption(container, project) {
+  if (!confirm(
+    `Stop encrypting '${project.name}'?\n\n`
+    + "Every archive written from now on is readable by anyone who can read this "
+    + "host or a copy of it. The archives already written stay encrypted and still "
+    + "need their identity.")) return;
+  const message = container.querySelector('[data-role="enc-msg"]');
+  const output = container.querySelector(".enc-out") || el("div", "enc-out");
+  submitEncryption(project, [], container, null, message, output);
+}
+
+async function submitEncryption(project, recipients, container, button, message, output) {
+  if (button) button.disabled = true;
+  if (message) { message.className = "bar-msg"; message.textContent = "submitting…"; }
+  if (output) output.replaceChildren();
+  let id;
+  try {
+    ({ id } = await api(`/api/projects/${enc(project.name)}/encryption`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recipients }),
+    }));
+  } catch (error) {
+    if (message) { message.className = "bar-msg err"; message.textContent = error.message; }
+    if (button) button.disabled = false;
+    return;
+  }
+  if (message) message.textContent = "applying…";
+  pollEncryption(id, project, container, button, message, output);
+}
+
+function pollEncryption(id, project, container, button, message, output) {
+  clearTimeout(encryptionPoll);
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/encryption/${encodeURIComponent(id)}`);
+    } catch (error) {
+      if (message) { message.className = "bar-msg err"; message.textContent = error.message; }
+      if (button) button.disabled = false;
+      return;
+    }
+    if (result.state === "pending") {
+      encryptionPoll = setTimeout(tick, 1200);
+      return;
+    }
+    if (button) button.disabled = false;
+    if (message) message.textContent = "";
+
+    const ok = result.state === "ok";
+    const box = el("div", `result ${ok ? "ok" : "bad"}`);
+    box.append(el("div", null, ok
+      ? "Applied. It takes effect on the next run — archives already on disk are unchanged."
+      : `Not applied — ${result.error || "the host reported a failure"}`));
+    if (Array.isArray(result.steps) && result.steps.length) {
+      const ul = el("ul", "steps");
+      for (const step of result.steps) ul.append(el("li", null, step));
+      box.append(ul);
+    }
+    if (result.state === "unknown") {
+      box.replaceChildren(el("div", null,
+        "No result came back. The privileged helper may not be installed — check "
+        + "systemctl status supabase-backup-keys.path on the host."));
+    }
+
+    // Back to the read-only view, with the outcome kept under it. The next
+    // poll brings the new state from the host rather than this guessing at it.
+    container.dataset.editing = "0";
+    container.dataset.sig = "";
+    renderEncryption(container, project);
+    container.append(box);
+    clearTimeout(pollTimer);
+    refresh();
+  };
+  encryptionPoll = setTimeout(tick, 800);
+}
+
 // ── Archives ───────────────────────────────────────────────────────────────
 
 function renderArchives(project, container, listing) {
@@ -327,6 +623,9 @@ function archiveItem(project, archive) {
   const meta = el("div", "item-meta");
   meta.append(el("span", null, relative(archive.captured_at)));
   meta.append(el("span", "mono", bytes(archive.bytes)));
+  if (archive.encrypted) {
+    meta.append(el("span", archive.sidecar_error ? "tag tag-warn" : "tag", "encrypted"));
+  }
   head.append(meta);
 
   const body = el("div", "item-body");
@@ -377,6 +676,12 @@ async function fillArchive(body, project, archive) {
   } else if (manifest) {
     rows.push(["manifest", manifest.error]);
   }
+  if (archive.encrypted) {
+    const n = (archive.recipients || []).length;
+    rows.push(["encryption", n
+      ? `age — ${n} recipient${n === 1 ? "" : "s"}`
+      : "age — the sidecar does not say to whom"]);
+  }
   for (const [key, value] of rows) list.append(el("dt", null, key), el("dd", null, value));
   body.append(list);
 
@@ -402,8 +707,19 @@ async function fillArchive(body, project, archive) {
     }
   }
 
+  if (archive.encrypted && (archive.recipients || []).length) {
+    body.append(el("h3", null, "readable by"));
+    const chips = el("div", "chips");
+    for (const r of archive.recipients) chips.append(el("span", "chip mono", r));
+    body.append(chips);
+    body.append(el("p", "hint",
+      "The matching private key is not on this host, by design. Restoring this "
+      + "archive means bringing one of these identities to it."));
+  }
+
   const actions = el("div", "body-actions");
-  const verify = el("button", "btn-ghost", "Verify checksums");
+  const verify = el("button", "btn-ghost",
+    archive.encrypted ? "Check for damage" : "Verify checksums");
   const output = el("div");
   verify.addEventListener("click", async () => {
     verify.disabled = true;
@@ -416,7 +732,7 @@ async function fillArchive(body, project, archive) {
       output.replaceChildren(el("div", "result bad", error.message));
     } finally {
       verify.disabled = false;
-      verify.textContent = "Verify checksums";
+      verify.textContent = archive.encrypted ? "Check for damage" : "Verify checksums";
     }
   });
   actions.append(verify);
@@ -426,7 +742,56 @@ async function fillArchive(body, project, archive) {
     download.href = `/api/projects/${enc(project)}/archives/${enc(archive.name)}/download`;
     actions.append(download);
   }
-  body.append(actions, output);
+
+  // The form opens inside the archive it would restore, never beside it: which
+  // archive is being written into a live project is not a thing to select from
+  // a list a second time and get wrong.
+  const restoreHost = el("div");
+  if (capabilities.restore) {
+    const toggle = el("button", "btn-ghost", "Restore this archive…");
+    toggle.addEventListener("click", () => {
+      const open = !restoreHost.firstChild;
+      restoreHost.replaceChildren(...(open ? [buildRestoreForm(project, archive)] : []));
+      toggle.textContent = open ? "Cancel" : "Restore this archive…";
+    });
+    actions.append(toggle);
+  }
+  body.append(actions, output, restoreHost);
+}
+
+const shortHash = (h) => (h ? `${h.slice(0, 12)}…` : "—");
+
+function renderVerifyEncrypted(container, result) {
+  const box = el("div", `result ${result.ok ? "ok" : "bad"}`);
+  box.append(el("div", null, result.ok
+    ? `OK — ${bytes(result.bytes)} of ciphertext, byte for byte what the run wrote (${result.took_s}s)`
+    : "FAILED — these are not the bytes the run wrote. Use an older archive."));
+
+  const problems = [];
+  if (result.sha256_ok === false) {
+    problems.push(`sha256 is ${shortHash(result.actual_sha256)}, the run recorded ${shortHash(result.expected_sha256)}`);
+  }
+  if (result.size_ok === false) {
+    problems.push(`${result.bytes} bytes on disk, the run recorded ${result.expected_bytes}`);
+  }
+  if (result.header_ok === false) {
+    problems.push("this does not start like an age file — it may not be an encrypted archive at all");
+  }
+  if (problems.length) {
+    const ul = el("ul");
+    for (const problem of problems) ul.append(el("li", null, problem));
+    box.append(ul);
+  }
+
+  // Saying what a check covers matters more here than anywhere else on the
+  // page, because this one covers less than the name suggests.
+  box.append(el("div", "hint",
+    "This compares the file against the digest taken when it was written, so it "
+    + "catches a disk that rotted, a copy that truncated, a file that changed. It "
+    + "cannot look inside: that needs the identity, which this host does not have. "
+    + "The contents were checked against storage.objects by the run itself, before "
+    + "any of it was encrypted."));
+  container.replaceChildren(box);
 }
 
 function renderVerify(container, result) {
@@ -434,6 +799,7 @@ function renderVerify(container, result) {
     container.replaceChildren(el("div", "result bad", result.fatal));
     return;
   }
+  if (result.encrypted) return renderVerifyEncrypted(container, result);
   const box = el("div", `result ${result.ok ? "ok" : "bad"}`);
   box.append(el("div", null, result.ok
     ? `OK — ${result.checked} file(s) match their checksums, ${result.files_in_archive} storage object(s) present (${result.took_s}s)`
@@ -540,9 +906,9 @@ function renderRegister(status) {
   buildRegisterForm(host);
 }
 
-function field(label, name, hint, type = "text", placeholder = "") {
+function field(label, name, hint, type = "text", placeholder = "", prefix = "reg") {
   const wrap = el("div", "field");
-  const id = `reg-${name}`;
+  const id = `${prefix}-${name}`;
   const l = el("label", null, label);
   l.htmlFor = id;
   const input = document.createElement("input");
@@ -684,16 +1050,573 @@ function pollRegistration(id, form, submit, message, output) {
   registerPoll = setTimeout(tick, 1000);
 }
 
+// ── Console settings ───────────────────────────────────────────────────────
+
+// The console cannot write its own configuration, so saving here is the same
+// round trip as registering a project: leave a request, a root helper applies
+// it and restarts the service, poll for what it made of it. Which is why the
+// save is not instant, and why the page has to survive the console going away
+// for a second in the middle of it.
+
+let settingsPoll = null;
+
+async function loadSettings() {
+  const section = $("settings-section");
+  const host = $("settings");
+  if (!section || !host) return;
+  section.hidden = false;
+
+  let payload;
+  try {
+    payload = await api("/api/settings");
+  } catch (error) {
+    host.replaceChildren(el("div", "notice", error.message));
+    return;
+  }
+  const settings = payload.settings || {};
+  if (!payload.editable) {
+    // Still worth the panel: what the console is running with is exactly what
+    // you need to know before going to the host to change it.
+    host.replaceChildren(el("div", "notice", payload.blocked_because ||
+      "Settings cannot be changed from this connection."));
+    host.append(settingsSummary(settings));
+    return;
+  }
+  host.replaceChildren(buildSettingsForm(settings));
+}
+
+function settingsSummary(s) {
+  const wrap = el("div", "form");
+  const list = el("dl", "kv");
+  const rows = [
+    ["username", s.username],
+    ["password", s.password_set ? "set" : (s.anonymous ? "none — authentication is off" : "not set")],
+    ["listening on", s.bind],
+    ["stale after", `${s.stale_hours}h`],
+    ["run button", s.allow_run ? "on" : "off"],
+    ["downloads", s.allow_download ? "on" : "off"],
+    ["add a project", s.allow_register ? "on" : "off"],
+    ["settings here", s.allow_settings ? "on" : "off"],
+    ["config file", s.config_path],
+  ];
+  for (const [key, value] of rows) list.append(el("dt", null, key), el("dd", null, String(value)));
+  wrap.append(list);
+  return wrap;
+}
+
+// Named for the panel it belongs to: this file has more than one form now, and
+// a second plain `checkbox` further down would quietly win the name.
+function settingCheckbox(label, name, checked, hint) {
+  const wrap = el("div", "field");
+  const check = el("label", "check");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.id = `set-${name}`;
+  box.checked = !!checked;
+  check.append(box, document.createTextNode(label));
+  wrap.append(check);
+  if (hint) wrap.append(el("div", "hint", hint));
+  return wrap;
+}
+
+function buildSettingsForm(s) {
+  const form = el("div", "form");
+  const set = (label, name, hint, type, placeholder) =>
+    field(label, name, hint, type, placeholder, "set");
+
+  form.append(el("h3", null, "Sign in"));
+  form.append(set("Username", "username",
+    "Changing it signs this browser out — the credentials it has saved stop matching.",
+    "text"));
+  form.append(set("New password", "new_password",
+    `At least ${s.min_password} characters. Leave both boxes empty to keep the one you have.`,
+    "password"));
+  form.append(set("Repeat new password", "confirm_password", "", "password"));
+  form.append(set("Current password", "current_password",
+    s.password_set
+      ? "Asked for because a browser resends a saved password all day. Typing it here is what says someone is at the keyboard."
+      : "No password is set on this console yet, so leave this empty.",
+    "password"));
+
+  form.append(el("h3", null, "This console"));
+  const row = el("div", "row");
+  row.append(set("Listen address", "bind",
+    "127.0.0.1:8787 serves only an SSH tunnel or a proxy on this host. 0.0.0.0:8787 serves the network, with Basic auth in the clear on every request.",
+    "text"));
+  row.append(set("Stale after (hours)", "stale_hours",
+    "How old the newest archive may be before a project is called stale. The timer fires nightly, so past ~26h a night was missed.",
+    "text"));
+  form.append(row);
+
+  form.append(settingCheckbox('Offer "Run backup now"', "allow_run", s.allow_run,
+    "Needs the polkit rule the setup script installs."));
+  form.append(settingCheckbox("Allow downloading whole archives over HTTP", "allow_download", s.allow_download,
+    "An archive holds every auth password hash and every storage object. scp is the better route for a one-off."));
+  form.append(settingCheckbox('Offer "Add a project"', "allow_register", s.allow_register,
+    "Registering sends a service key, so it is refused over plain HTTP whatever this says."));
+  form.append(settingCheckbox("Allow changing settings from here", "allow_settings", s.allow_settings,
+    `Turning this off leaves ${s.config_path} on the host as the only way back.`));
+
+  const bar = el("div", "bar");
+  const submit = el("button", "btn", "Save settings");
+  const message = el("span", "bar-msg");
+  bar.append(submit, message);
+  form.append(el("div", "hint",
+    `Saving restarts ${s.unit}. Everything on the page goes quiet for a second; if the ` +
+    "username or password changed, the browser will ask for them again."));
+  form.append(bar);
+
+  const output = el("div");
+  form.append(output);
+
+  form.querySelector("#set-username").value = s.username || "";
+  form.querySelector("#set-bind").value = s.bind || "";
+  form.querySelector("#set-stale_hours").value = String(s.stale_hours ?? "");
+  if (!s.password_set) form.querySelector("#set-current_password").disabled = true;
+
+  submit.addEventListener("click", () => saveSettings(form, submit, message, output, s));
+  return form;
+}
+
+async function saveSettings(form, submit, message, output, s) {
+  // Not trimmed, unlike everything else here: a password is whatever was
+  // typed, spaces included.
+  const raw = (name) => form.querySelector(`#set-${name}`).value || "";
+  const value = (name) => raw(name).trim();
+  const checked = (name) => form.querySelector(`#set-${name}`).checked;
+
+  const password = raw("new_password");
+  if (password && password !== raw("confirm_password")) {
+    message.className = "bar-msg err";
+    message.textContent = "the two new passwords do not match";
+    return;
+  }
+  const body = {
+    current_password: raw("current_password"),
+    username: value("username"),
+    new_password: password,
+    confirm_password: raw("confirm_password"),
+    bind: value("bind"),
+    stale_hours: Number(value("stale_hours")),
+    allow_run: checked("allow_run"),
+    allow_download: checked("allow_download"),
+    allow_register: checked("allow_register"),
+    allow_settings: checked("allow_settings"),
+  };
+
+  const warnings = [];
+  if (password) warnings.push("The console password changes — this browser will have to sign in again.");
+  if (body.bind !== s.bind) warnings.push(`It will listen on ${body.bind} instead of ${s.bind}. If that address cannot reach you, this page stops here.`);
+  if (body.allow_download && !s.allow_download) warnings.push("Archives become downloadable over HTTP — auth password hashes included.");
+  if (!body.allow_settings) warnings.push(`This panel becomes read-only. Only ${s.config_path} on the host can undo that.`);
+  if (!confirm([`Save these settings and restart ${s.unit}?`, ...warnings].join("\n\n"))) return;
+
+  submit.disabled = true;
+  message.className = "bar-msg";
+  message.textContent = "saving…";
+  output.replaceChildren();
+
+  let id;
+  try {
+    ({ id } = await api("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }));
+  } catch (error) {
+    message.className = "bar-msg err";
+    message.textContent = error.message;
+    submit.disabled = false;
+    return;
+  }
+
+  // Whatever happens next, the passwords have left the browser.
+  for (const name of ["new_password", "confirm_password", "current_password"]) {
+    form.querySelector(`#set-${name}`).value = "";
+  }
+  message.textContent = "applying…";
+  pollSettings(id, submit, message, output, !!password);
+}
+
+function pollSettings(id, submit, message, output, passwordChanged) {
+  clearTimeout(settingsPoll);
+  // The console restarts in the middle of this, so a failed request is the
+  // expected case for a few seconds - not an error to report. After a minute
+  // and a half it is no longer a restart.
+  const deadline = Date.now() + 90_000;
+
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/settings/${enc(id)}`);
+    } catch (error) {
+      if (error.status === 401) return signedOutBox(output, message, submit);
+      if (Date.now() < deadline) {
+        message.textContent = "the console is restarting…";
+        settingsPoll = setTimeout(tick, 2000);
+        return;
+      }
+      message.className = "bar-msg err";
+      message.textContent = "the console has not come back on this address";
+      output.replaceChildren(el("div", "result bad",
+        "It may be listening somewhere else now, or it may not have started. On the host: " +
+        "systemctl status supabase-backup-web, and journalctl -u supabase-backup-reconfigure -n 30 " +
+        "for what the helper did — it puts the old settings back if the console will not start."));
+      submit.disabled = false;
+      return;
+    }
+
+    if (result.state === "pending" || result.state === "running") {
+      message.textContent = result.state === "running"
+        ? "applying…" : "waiting for the helper…";
+      settingsPoll = setTimeout(tick, 1500);
+      return;
+    }
+    // The helper takes the request, then works for a few seconds. An id with
+    // no result yet is that gap, not a missing helper - which is only what it
+    // means if it is still saying so when the time is up.
+    if (result.state === "unknown" && Date.now() < deadline) {
+      settingsPoll = setTimeout(tick, 1500);
+      return;
+    }
+    submit.disabled = false;
+    message.textContent = "";
+    const ok = result.state === "ok";
+    const box = el("div", `result ${ok ? "ok" : "bad"}`);
+    box.append(el("div", null, ok
+      ? "Saved."
+      : `Not saved — ${result.error || "the host reported a failure"}`));
+    if (Array.isArray(result.steps) && result.steps.length) {
+      const ul = el("ul", "steps");
+      for (const step of result.steps) ul.append(el("li", null, step));
+      box.append(ul);
+    }
+    if (result.state === "unknown") {
+      box.replaceChildren(el("div", null,
+        "No result came back. The settings helper may not be installed — check " +
+        "systemctl status supabase-backup-reconfigure.path on the host."));
+    }
+    output.replaceChildren(box);
+    // Deliberately not reloading the panel on success: it would replace the
+    // box that just said what changed, and the form already shows what took
+    // effect - it is what was typed into it.
+    if (ok && passwordChanged) signedOutBox(output, message, submit, true);
+  };
+  settingsPoll = setTimeout(tick, 1200);
+}
+
+function signedOutBox(output, message, submit, saved) {
+  submit.disabled = false;
+  message.className = "bar-msg";
+  message.textContent = "";
+  const box = el("div", "result ok");
+  box.append(el("div", null, saved
+    // Appended, not replacing: the box above it lists what actually changed,
+    // which is the part worth reading before signing back in.
+    ? "The password changed, so this browser is still signed in with the old one."
+    : "The password changed — this browser is signed in with the old one."));
+  const bar = el("div", "body-actions");
+  const reload = el("button", "btn-ghost", "Reload and sign in again");
+  reload.addEventListener("click", () => location.reload());
+  bar.append(reload);
+  box.append(bar);
+  output.append(box);
+}
+
+// ── Restoring an archive ───────────────────────────────────────────────────
+
+// The console cannot restore, so this asks for one: a form, a request, a poll.
+// What comes back is not a summary written for the browser - it is the lines
+// `restore` prints on the host, arriving as it prints them, which is the only
+// account of a destructive operation worth showing anyone.
+
+function refOf(url) {
+  const match = /^https:\/\/([a-z0-9-]+)\./.exec((url || "").trim());
+  return match ? match[1] : "";
+}
+
+function restoreCheckbox(id, text, checked) {
+  const label = el("label", "check");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.id = id;
+  input.checked = checked;
+  label.append(input, document.createTextNode(text));
+  return label;
+}
+
+function buildRestoreForm(project, archive) {
+  const form = el("div", "form");
+  // Unique per archive: two archives can have their forms open at once, and
+  // duplicate ids would quietly wire one form's label to the other's input.
+  const uid = `res-${project}-${archive.stamp}`;
+
+  form.append(el("div", "notice",
+    "Restoring writes this archive into another Supabase project: auth users first, " +
+    "then schema and data, then catalog objects, then every storage object. The host " +
+    "refuses any project it backs up. Supabase's control plane is not part of it — " +
+    "auth providers, email templates, the JWT secret and Vault values stay as they are " +
+    "in the target."));
+
+  form.append(field("Target session pooler URI", "database_url",
+    "The project being restored INTO. Its dashboard → Connect → Direct → Session pooler. " +
+    "Port 5432: transaction mode on 6543 drops the session between statements and stops a restore partway.",
+    "password", "postgresql://postgres.<ref>:<password>@…pooler.supabase.com:5432/postgres", uid));
+
+  form.append(field("Target project URL", "supabase_url",
+    "Must name the same project as the URI above — a mismatched pair writes one project's database while uploading another's files.",
+    "text", "https://<ref>.supabase.co", uid));
+
+  form.append(field("Target service key", "service_key",
+    "Uploads the storage objects. The request holding it is shredded as soon as the host has read it.",
+    "password", "", uid));
+
+  const confirmField = field("Type the target project ref", "confirm_ref",
+    "The last thing restore asks for at a terminal, and the one thing here that cannot be clicked.",
+    "text", "", uid);
+  form.append(confirmField);
+
+  // The ref is derivable from the URL above, so name it rather than leaving
+  // someone to guess what to type. Typing it is still the point.
+  const urlInput = form.querySelector(`#${uid}-supabase_url`);
+  const hint = confirmField.querySelector(".hint");
+  const hintText = hint.textContent;
+  urlInput.addEventListener("input", () => {
+    const ref = refOf(urlInput.value);
+    hint.textContent = ref
+      ? `Type ${ref} to say plainly that is the project being written into.`
+      : hintText;
+  });
+
+  const boxes = el("div", "field");
+  // Checked by default, and deliberately: the first click on a form like this
+  // should rehearse, not restore.
+  boxes.append(restoreCheckbox(`${uid}-dry_run`,
+    "Dry run — extract, check and connect, then stop before any writes", true));
+  // Each of the other two is a prompt restore would have stopped on. Unticked
+  // is the answer it gives when nobody says otherwise.
+  boxes.append(restoreCheckbox(`${uid}-allow_nonempty`,
+    "Go ahead even if the target already has tables in public", false));
+  boxes.append(restoreCheckbox(`${uid}-continue_on_catalog_errors`,
+    "Continue if catalog objects (triggers, buckets, jobs) fail to apply", false));
+  form.append(boxes);
+
+  const bar = el("div", "bar");
+  const submit = el("button", "btn", "Start restore");
+  const message = el("span", "bar-msg");
+  bar.append(submit, message);
+  form.append(bar);
+
+  submit.addEventListener("click", () =>
+    submitRestore(project, archive, form, uid, submit, message));
+  return form;
+}
+
+async function submitRestore(project, archive, form, uid, submit, message) {
+  const value = (name) => (form.querySelector(`#${uid}-${name}`).value || "").trim();
+  const ticked = (name) => form.querySelector(`#${uid}-${name}`).checked;
+  const body = {
+    database_url: value("database_url"),
+    supabase_url: value("supabase_url"),
+    service_key: value("service_key"),
+    confirm_ref: value("confirm_ref"),
+    dry_run: ticked("dry_run"),
+    allow_nonempty: ticked("allow_nonempty"),
+    continue_on_catalog_errors: ticked("continue_on_catalog_errors"),
+  };
+
+  if (restoreBusy) {
+    message.className = "bar-msg err";
+    message.textContent = "a restore is already running on this host";
+    return;
+  }
+
+  const ref = refOf(body.supabase_url) || body.confirm_ref || "that project";
+  const question = body.dry_run
+    ? `Rehearse restoring ${archive.name} into ${ref}?\n\nEverything except the writes: the archive is extracted and its checksums verified, the target is connected to, and it stops before the first write.`
+    : `Restore ${archive.name} into ${ref}?\n\nThis writes the archive's auth users, schema, data and storage objects into that project. It cannot be undone.`;
+  if (!confirm(question)) return;
+
+  submit.disabled = true;
+  message.className = "bar-msg";
+  message.textContent = "submitting…";
+  let id;
+  try {
+    ({ id } = await api(
+      `/api/projects/${enc(project)}/archives/${enc(archive.name)}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+  } catch (error) {
+    message.className = "bar-msg err";
+    message.textContent = error.message;
+    submit.disabled = false;
+    return;
+  }
+
+  // The credentials have left the browser; do not leave them in the DOM.
+  for (const name of ["database_url", "service_key"]) {
+    form.querySelector(`#${uid}-${name}`).value = "";
+  }
+  submit.disabled = false;
+  message.textContent = "handed to the host — it is running at the top of this page";
+  restoreBusy = true;
+  restoreShown = null;
+  pollRestore(id);
+}
+
+// Which restore is on screen is decided here; pollRestore owns what it says.
+function renderRestore(status) {
+  const section = $("restore-section");
+  if (!section) return;
+  const activity = status.restore;
+  restoreBusy = Boolean(activity && activity.running);
+  const latest = activity && activity.latest;
+  restoreStalled = Boolean(latest && latest.stalled);
+
+  // Allowed here but nothing watching the spool on the host: a request would
+  // sit there unread. Say so before someone fills in a form and waits.
+  restoreUnwatched = Boolean(activity && activity.helper_installed && !activity.helper_watching);
+  // ...and if one has already run, the log below says it far better than a
+  // warning about the future would, so this only takes over an empty panel.
+  if (restoreUnwatched && !latest) {
+    section.hidden = false;
+    $("restore").replaceChildren(el("div", "notice",
+      "Restores are enabled here, but the host is not watching for them: " +
+      "supabase-backup-restore.path is installed and not enabled. Until it is, a request " +
+      "would sit in the spool unread. Enable it with " +
+      "systemctl enable --now supabase-backup-restore.path, or re-run " +
+      "supabase-backup-web-setup.sh and answer yes to restores."));
+    return;
+  }
+  if (!activity || (!latest && !activity.running)) {
+    if (!restorePoll && !restoreShown) section.hidden = true;
+    return;
+  }
+  if (!latest) {
+    // Written, not yet picked up. Saying so beats an empty panel while the
+    // .path unit wakes the helper.
+    section.hidden = false;
+    $("restore").replaceChildren(el("div", "notice",
+      "A restore request is waiting for the host to pick it up."));
+    return;
+  }
+  if (latest.id !== restoreShown) pollRestore(latest.id);
+}
+
+async function pollRestore(id) {
+  clearTimeout(restorePoll);
+  restorePoll = null;
+  restoreShown = id;
+  $("restore-section").hidden = false;
+
+  let result;
+  try {
+    result = await api(`/api/restore/${enc(id)}`);
+  } catch (error) {
+    $("restore").replaceChildren(el("div", "result bad", error.message));
+    return;
+  }
+  renderRestoreResult($("restore"), result);
+  if (result.state === "running" || result.state === "pending") {
+    restorePoll = setTimeout(() => pollRestore(id), 2000);
+  }
+}
+
+const RESTORE_PILL = { ok: "ok", running: "running", pending: "running", failed: "failed" };
+
+function renderRestoreResult(host, result) {
+  const wrap = el("div");
+
+  const head = el("div", "restore-head");
+  const state = result.state || "unknown";
+  head.append(el("span", `pill pill-${RESTORE_PILL[state] || "unknown"}`,
+    state === "ok" ? (result.dry_run ? "rehearsed" : "restored") : state));
+  head.append(el("span", "restore-what", result.archive
+    ? `${result.archive} → ${result.target_ref || "?"}`
+    : "waiting to be picked up"));
+  if (result.dry_run) head.append(el("span", "chip", "dry run"));
+  if (result.started_at) head.append(el("span", "restore-when", localTime(result.started_at)));
+  wrap.append(head);
+
+  if (state === "pending" && restoreUnwatched) {
+    wrap.append(el("div", "notice",
+      "This request is waiting, and nothing on the host is watching for it: " +
+      "supabase-backup-restore.path is not enabled. Enable it with " +
+      "systemctl enable --now supabase-backup-restore.path and it will be picked up."));
+  }
+  if (state === "unknown") {
+    wrap.append(el("div", "notice",
+      "No result came back for that request. The privileged helper may not be installed — " +
+      "check systemctl status supabase-backup-restore.path on the host."));
+  }
+  if (state === "running" && restoreStalled) {
+    wrap.append(el("div", "result bad",
+      "This says it is running, but nothing is running it. The helper was killed or the " +
+      "host rebooted mid-restore — journalctl -u supabase-backup-restore for how far it got. " +
+      "The target is in whatever state the log below leaves it."));
+  }
+  if (result.error) wrap.append(el("div", "result bad", result.error));
+  if (state === "ok") {
+    wrap.append(el("div", "result ok", result.dry_run
+      ? "Dry run complete — the archive verifies and the target is reachable. Nothing was written."
+      : `Restored into ${result.target_ref}. Every row count and the storage object count match the archive.`));
+  }
+
+  const steps = Array.isArray(result.steps) ? result.steps : [];
+  if (steps.length) {
+    const log = el("div", "log");
+    for (const step of steps) {
+      log.append(el("div", `k-${(step && step.k) || "info"}`, (step && step.m) || ""));
+    }
+    wrap.append(log);
+    host.replaceChildren(wrap);
+    // Follow a running restore rather than making someone scroll after it.
+    if (state === "running" || state === "pending") log.scrollTop = log.scrollHeight;
+    return;
+  }
+  host.replaceChildren(wrap);
+}
+
+// The footer says what this console will and will not do about restoring, and
+// it changes with the answer - including the reason, when the answer is no.
+function renderFooter(status) {
+  const footer = $("footer");
+  if (!footer) return;
+  const caps = status.capabilities || {};
+  footer.replaceChildren();
+  if (caps.restore) {
+    footer.append(document.createTextNode("A restore asked for here is carried out on the host by "));
+    footer.append(el("code", null, "restore"));
+    footer.append(document.createTextNode(
+      ", as root: the same script, the same order, the same guards. It refuses any project " +
+      "this host backs up, and nothing is written until the target ref has been typed out in full."));
+  } else {
+    footer.append(document.createTextNode(caps.restore_blocked_because ||
+      "Restoring is not done from here."));
+    if (!caps.restore_blocked_because) {
+      footer.append(document.createTextNode(" Run "));
+      footer.append(el("code", null, "restore"));
+      footer.append(document.createTextNode(" on the host."));
+    }
+  }
+}
+
 // ── Polling ────────────────────────────────────────────────────────────────
 
 async function refresh() {
   try {
     const status = await api("/api/status");
     capabilities = status.capabilities;
-    anyRunning = status.projects.some((p) => p.health === "running");
+    // Before anyRunning is worked out: this is what sets restoreBusy, and a
+    // restore in flight is exactly when the page should not be polling lazily.
+    renderRestore(status);
+    anyRunning = status.projects.some((p) => p.health === "running") || restoreBusy;
     renderSummary(status);
     renderProjects(status);
     renderRegister(status);
+    renderFooter(status);
     // Only open panels cost requests; a host with many projects stays quiet
     // until someone actually looks at one.
     for (const project of status.projects) {
@@ -702,18 +1625,27 @@ async function refresh() {
       if (body) await loadProject(project.name, body, project);
     }
   } catch (error) {
-    $("health").textContent = "unreachable";
+    // A password change signs this browser out mid-poll. Saying "unreachable"
+    // and carrying on retrying would be wrong twice over: the console is fine,
+    // and no number of retries with the old password will get anywhere.
+    signedOut = error.status === 401;
+    $("health").textContent = signedOut ? "signed out" : "unreachable";
     $("health").className = "pill pill-unknown";
-    $("reason").textContent = error.message;
+    $("reason").textContent = signedOut
+      ? "The console no longer accepts the credentials this browser saved — its username or password changed. Reload the page to sign in again."
+      : error.message;
   } finally {
     clearTimeout(pollTimer);
-    pollTimer = setTimeout(refresh, anyRunning ? POLL_BUSY : POLL_IDLE);
+    if (!signedOut) pollTimer = setTimeout(refresh, anyRunning ? POLL_BUSY : POLL_IDLE);
   }
 }
 
 document.addEventListener("visibilitychange", () => {
   clearTimeout(pollTimer);
-  if (!document.hidden) refresh();
+  if (!document.hidden && !signedOut) refresh();
 });
 
 refresh();
+// Once: what may be changed here depends on the connection, and that does not
+// change while the page is open.
+loadSettings();

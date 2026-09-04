@@ -113,6 +113,23 @@ h2 {
 .card-sub { font-size: 0.73rem; color: var(--text2); margin-top: 0.2rem; font-family: var(--font-mono); }
 .card-value.muted { color: var(--text3); font-size: 1rem; font-weight: 600; }
 
+/* The free-space forecast. Two lines: the verdict, then what it rests on. */
+.card-note {
+  font-size: 0.75rem;
+  color: var(--text2);
+  margin-top: 0.4rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+}
+.card-note + .card-note {
+  margin-top: 0.15rem;
+  padding-top: 0;
+  border-top: none;
+}
+.card-note.dim { color: var(--text3); font-size: 0.7rem; font-family: var(--font-mono); }
+.card-note.warn { color: var(--amber); font-weight: 600; }
+.card-note.crit { color: var(--red);   font-weight: 600; }
+
 /* ── Buttons ── */
 .bar { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; }
 .bar-msg { font-size: 0.8rem; color: var(--text2); }
@@ -334,3 +351,77 @@ footer code { color: var(--text2); }
 }
 .notice code { color: var(--text); font-size: 0.74rem; }
 .steps { margin: 0.5rem 0 0 1rem; font-size: 0.76rem; line-height: 1.7; }
+
+/* ── Console settings ── */
+/* The settings panel is a form of forms: it needs headings inside one, which
+   nothing else here does. */
+.form h3 {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--text3);
+  margin: 1.2rem 0 0.6rem;
+}
+.form h3:first-child { margin-top: 0; }
+.form > .kv { margin-bottom: 0.2rem; }
+.form input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Restore ── */
+/* The panel is an .item like the others, but its contents are written into it
+   directly rather than through an .item-body, so the padding lives here. */
+#restore > div { padding: 0.9rem 0.95rem 1rem; }
+#restore .notice { margin: 0 0 0.8rem; }
+#restore .form { padding: 0; }
+.restore-head { display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+.restore-what { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text); word-break: break-all; }
+.restore-when { font-size: 0.72rem; color: var(--text3); margin-left: auto; }
+#restore .log { margin-top: 0.8rem; }
+/* The log is the host's own output: step, ok, warn and info, told apart the
+   way the terminal tells them apart rather than by re-wording any of them. */
+.log .k-step { color: var(--text); font-weight: 600; margin-top: 0.5rem; }
+.log .k-ok::before   { content: "✓ "; color: var(--green); }
+.log .k-warn { color: var(--amber); }
+.log .k-warn::before { content: "! "; }
+
+/* ── Encryption ─────────────────────────────────────────────────────────── */
+.encryption {
+  margin: 1rem 0 0.2rem;
+  padding: 0.75rem 0.85rem 0.6rem;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  background: var(--surface3);
+}
+.enc-head { display: flex; align-items: center; gap: 0.5rem; }
+.enc-head h3 { margin: 0; }
+.encryption .hint { font-size: 0.72rem; color: var(--text3); line-height: 1.55; margin: 0.45rem 0 0; }
+.encryption .chips { margin-top: 0.5rem; }
+.encryption .bar { margin-top: 0.65rem; }
+.encryption .notice { margin-top: 0.6rem; }
+.enc-form { padding: 0; }
+.enc-form textarea {
+  width: 100%;
+  min-height: 4.5rem;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.6;
+  resize: vertical;
+}
+.enc-form textarea:focus { outline: none; border-color: var(--accent); }
+
+/* A marker on an archive row, not a state of the whole project. */
+.tag {
+  font-size: 0.62rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  border: 1px solid var(--border2);
+  color: var(--text3);
+}
+.tag-warn { color: var(--amber); border-color: #6b5423; }

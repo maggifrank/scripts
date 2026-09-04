@@ -26,11 +26,21 @@ SupplementaryGroups=systemd-journal
 # someone loosening them by accident.
 InaccessiblePaths=-/etc/supabase-backup
 
-# The one writable path: the spool where a registration request is left for
-# the privileged helper to pick up. Everything else stays read-only.
-ReadWritePaths=/run/supabase-backup-web/register
+# The only writable paths: the spools where a request is left for a privileged
+# helper to pick up - a project to register, a change to this console's own
+# settings, who an archive is encrypted to, a restore. Everything else stays
+# read-only, /etc/supabase-backup-web included: the console cannot rewrite the
+# file that configures it.
+ReadWritePaths=/run/supabase-backup-web/register /run/supabase-backup-web/settings /run/supabase-backup-web/encryption /run/supabase-backup-web/restore
 
-# Nothing here writes to disk, so nothing needs to be writable.
+# The one thing the console keeps for itself, and the only thing it puts on a
+# real disk: an hourly free-space sample, so "when does this fill up" is
+# answered from what was observed rather than guessed from today's snapshot.
+# systemd creates the directory and hands it over already owned by this user.
+# It holds no secret - how much room was left, and when.
+StateDirectory=supabase-backup-web
+StateDirectoryMode=0750
+
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
