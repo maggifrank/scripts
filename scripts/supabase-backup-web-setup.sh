@@ -261,7 +261,7 @@ else
   sed -i "/^WEB_PASSWORD_HASH=/d" "${WEB_CONF_DIR}/web.env"
   printf '%s\n' "$HASH_LINE" >> "${WEB_CONF_DIR}/web.env"
   info "password set for ${WEB_USER}"
-  info "change it later from the console's Settings panel, or here in web.env"
+  info "change it later from the console's gear icon, or here in web.env"
 
   echo ""
   echo "  Where should the console listen?"

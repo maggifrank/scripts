@@ -16,6 +16,13 @@
   <div class="top-right">
     <span class="host" id="host"></span>
     <span class="pill pill-unknown" id="health">connecting</span>
+    <button class="gear" id="gear" type="button" title="Console settings" aria-label="Console settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1.08-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+    </button>
   </div>
 </header>
 
@@ -36,15 +43,20 @@
     <div id="register" class="item"></div>
   </section>
 
-  <section id="settings-section" hidden>
-    <h2>Console settings</h2>
-    <div id="settings" class="item"></div>
-  </section>
-
   <!-- Filled in by renderFooter: what this console will do about restoring
        depends on how it is configured and how you reached it. -->
   <footer id="footer"></footer>
 </main>
+
+<!-- Loaded when the gear is clicked, not on every page load: what may be
+     changed here depends on the connection, and most visits never ask. -->
+<dialog id="settings-dialog" class="modal" aria-labelledby="settings-title">
+  <div class="modal-head">
+    <h2 id="settings-title">Console settings</h2>
+    <button class="modal-close" id="settings-close" type="button" aria-label="Close">&times;</button>
+  </div>
+  <div class="modal-body" id="settings"></div>
+</dialog>
 
 <script type="module" src="/static/app.js"></script>
 </body>

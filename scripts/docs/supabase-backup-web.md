@@ -94,10 +94,10 @@ so it cannot be used to talk your way past the check.
 
 ## Changing the console's own settings
 
-The **Console settings** panel edits `web.env` — the password first of all —
-and the console can do neither half of that itself: it cannot write the file
-that configures it, and it cannot restart itself. So it asks, exactly the way
-it asks for a project to be registered.
+The **Console settings** dialog — the gear in the header — edits `web.env`, the
+password first of all, and the console can do neither half of that itself: it
+cannot write the file that configures it, and it cannot restart itself. So it
+asks, exactly the way it asks for a project to be registered.
 
 ```
 console (unprivileged, /etc/supabase-backup-web is read-only to it)
@@ -419,7 +419,7 @@ active — and `journalctl -u supabase-backup-register -n 30` for what happened
 when it last fired. If the spool directory is missing, run
 `systemd-tmpfiles --create /etc/tmpfiles.d/supabase-backup-web.conf`.
 
-**The Settings panel shows a notice instead of a form.** One of three things,
+**The settings dialog shows a notice instead of a form.** One of three things,
 and the notice says which: you are connected over plain HTTP from the network;
 `WEB_ALLOW_SETTINGS=0`; or the helper is not installed, which means
 `/run/supabase-backup-web/settings` does not exist. For the last one, re-run

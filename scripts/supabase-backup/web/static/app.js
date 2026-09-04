@@ -1059,12 +1059,26 @@ function pollRegistration(id, form, submit, message, output) {
 // for a second in the middle of it.
 
 let settingsPoll = null;
+let settingsBusy = false;           // a save is in flight; do not rebuild under it
+
+function openSettings() {
+  const dialog = $("settings-dialog");
+  if (!dialog) return;
+  dialog.showModal();
+  // Reloading under an in-flight save would throw away the box reporting it,
+  // and the poll writes into nodes this would have replaced.
+  if (!settingsBusy) loadSettings();
+}
+
+function closeSettings() {
+  const dialog = $("settings-dialog");
+  if (dialog && dialog.open) dialog.close();
+}
 
 async function loadSettings() {
-  const section = $("settings-section");
   const host = $("settings");
-  if (!section || !host) return;
-  section.hidden = false;
+  if (!host) return;
+  host.replaceChildren(el("p", "empty", "Loading…"));
 
   let payload;
   try {
@@ -1235,6 +1249,7 @@ async function saveSettings(form, submit, message, output, s) {
     form.querySelector(`#set-${name}`).value = "";
   }
   message.textContent = "applying…";
+  settingsBusy = true;
   pollSettings(id, submit, message, output, !!password);
 }
 
@@ -1256,6 +1271,7 @@ function pollSettings(id, submit, message, output, passwordChanged) {
         settingsPoll = setTimeout(tick, 2000);
         return;
       }
+      settingsBusy = false;
       message.className = "bar-msg err";
       message.textContent = "the console has not come back on this address";
       output.replaceChildren(el("div", "result bad",
@@ -1279,6 +1295,7 @@ function pollSettings(id, submit, message, output, passwordChanged) {
       settingsPoll = setTimeout(tick, 1500);
       return;
     }
+    settingsBusy = false;
     submit.disabled = false;
     message.textContent = "";
     const ok = result.state === "ok";
@@ -1306,6 +1323,7 @@ function pollSettings(id, submit, message, output, passwordChanged) {
 }
 
 function signedOutBox(output, message, submit, saved) {
+  settingsBusy = false;
   submit.disabled = false;
   message.className = "bar-msg";
   message.textContent = "";
@@ -1646,6 +1664,11 @@ document.addEventListener("visibilitychange", () => {
 });
 
 refresh();
-// Once: what may be changed here depends on the connection, and that does not
-// change while the page is open.
-loadSettings();
+
+$("gear").addEventListener("click", openSettings);
+$("settings-close").addEventListener("click", closeSettings);
+// A click that lands on the dialog element itself landed on the backdrop: the
+// box has no padding of its own, so everything inside it is a child.
+$("settings-dialog").addEventListener("click", (event) => {
+  if (event.target === $("settings-dialog")) closeSettings();
+});

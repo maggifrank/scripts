@@ -57,6 +57,21 @@ code, .mono { font-family: var(--font-mono); }
 .top-right { margin-left: auto; display: flex; align-items: center; gap: 0.7rem; }
 .host { color: var(--text3); font-size: 0.75rem; font-family: var(--font-mono); }
 
+.gear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.85rem;
+  height: 1.85rem;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--text3);
+}
+.gear:hover { color: var(--text); background: var(--surface2); border-color: var(--border2); }
+.gear svg { width: 17px; height: 17px; display: block; }
+
 .pill {
   font-size: 0.68rem;
   font-weight: 700;
@@ -425,3 +440,46 @@ footer code { color: var(--text2); }
   color: var(--text3);
 }
 .tag-warn { color: var(--amber); border-color: #6b5423; }
+
+/* ── The settings modal ── */
+/* display: only under [open]. A dialog is hidden by the UA until it is opened,
+   and giving .modal a display of its own would put the settings panel in the
+   middle of the page at every load. */
+.modal {
+  /* The reset at the top of this file sets margin: 0 on everything, which beats
+     the UA's `dialog:modal { margin: auto }` and pins the box to the top-left
+     corner. Centering has to be asked for again here. */
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--border2);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  width: min(560px, calc(100vw - 2rem));
+  max-height: min(85vh, 46rem);
+  overflow: hidden;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55);
+}
+.modal[open] { display: flex; flex-direction: column; }
+.modal::backdrop { background: rgba(4, 6, 12, 0.7); }
+.modal-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.85rem 0.95rem;
+  border-bottom: 1px solid var(--border);
+}
+.modal-head h2 { margin: 0; }
+.modal-close {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: var(--text3);
+  font-size: 1.15rem;
+  line-height: 1;
+  padding: 0.15rem 0.4rem;
+  border-radius: var(--radius-sm);
+}
+.modal-close:hover { color: var(--text); background: var(--surface2); }
+/* The form inside brings its own padding; this only has to scroll. */
+.modal-body { overflow-y: auto; }
