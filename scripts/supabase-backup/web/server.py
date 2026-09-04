@@ -784,8 +784,27 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
+    def client_label(self):
+        """Who to name in the log.
+
+        With a reverse proxy in front, every line otherwise reads as the proxy
+        and the actual client is invisible. X-Forwarded-For is only believed
+        from an address in WEB_TRUSTED_PROXIES - anyone else can put whatever
+        they like in that header - and the forwarded scheme is shown alongside,
+        which is what decides whether registration is offered.
+        """
+        client = self.client_address[0]
+        if client not in TRUSTED_PROXIES:
+            return client
+        proto = (self.headers.get("X-Forwarded-Proto") or "?").lower()
+        forwarded = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        # Keep it to something that cannot smuggle newlines into the journal.
+        if not re.fullmatch(r"[0-9a-fA-F.:]{1,45}", forwarded or ""):
+            forwarded = ""
+        return f"{forwarded or '?'} via {client}/{proto}"
+
     def log_message(self, fmt, *args):
-        sys.stdout.write("%s %s\n" % (self.address_string(), fmt % args))
+        sys.stdout.write("%s %s\n" % (self.client_label(), fmt % args))
         sys.stdout.flush()
 
     def send_bytes(self, code, body, content_type, extra=None):
