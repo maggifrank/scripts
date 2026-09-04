@@ -4,7 +4,9 @@
 # A read-mostly view of what supabase-backup has actually produced on this
 # host: every project's archives with their manifests, the run history, the
 # next scheduled run, and a verify that re-checks an archive against its own
-# checksums and its own inventory. It can start a run. It cannot restore.
+# checksums and its own inventory. It can start a run, change its own password
+# and settings, and - if you say so here - ask the host to restore an archive
+# into another project.
 #
 # Run it again after adding a project, so the new archive directory becomes
 # readable by the console.
@@ -49,9 +51,12 @@ echo "    · every project on this host, with its archives and manifests"
 echo "    · run history, read from the journal"
 echo "    · verify an archive against its own checksums and inventory"
 echo "    · start a run"
+echo "    · change its own password and settings, applied by a root helper"
+echo "    · set who each project's archives are encrypted to"
 echo ""
-echo "  It does not restore. That needs the target project's credentials and"
-echo "  carries guards that only hold when a person is answering the prompts."
+echo "  Restoring is asked about below. It is off unless you turn it on, and"
+echo "  even then the console only asks: restore does the work on this host, as"
+echo "  root, refusing any project this host backs up."
 echo ""
 [ -x "${LIB_DIR}/backup.sh" ] || error "supabase-backup is not installed - run supabase-backup-setup.sh first"
 read -rp "Proceed? [y/N]: " CONFIRM
@@ -72,6 +77,18 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   apt-get install -y -qq "${MISSING[@]}" || error "dependency install failed"
 fi
 info "python $(python3 -V 2>&1 | awk '{print $2}')"
+
+# age encrypts the archives, when a project has recipients. Not fatal if it is
+# not packaged here: a host that never sets a recipient never calls it, and the
+# console says so rather than pretending encryption is on.
+if ! command -v age >/dev/null; then
+  apt-get install -y -qq age >/dev/null 2>&1 || true
+fi
+if command -v age >/dev/null; then
+  info "age $(age --version 2>/dev/null | head -1)"
+else
+  warn "age is not installed - archive encryption will not be available"
+fi
 
 # ── Service user ──────────────────────────────────────────────────────────────
 step "Service user"
@@ -119,6 +136,86 @@ systemctl enable --now supabase-backup-register.path >/dev/null 2>&1 \
   || error "could not enable supabase-backup-register.path"
 info "registration helper installed and watching the spool"
 
+# ── The settings helper ───────────────────────────────────────────────────────
+# The console's Settings panel changes web.env - its password above all - and
+# the console can do neither: it cannot write the file that configures it and
+# cannot restart itself. Same shape as registration, one more spool.
+step "Settings helper"
+curl -fsSL --max-time 30 "${RAW_BASE}/reconfigure" -o "${LIB_DIR}/reconfigure" \
+  || error "could not download the settings helper"
+chmod 0755 "${LIB_DIR}/reconfigure"
+
+for f in supabase-backup-reconfigure.path supabase-backup-reconfigure.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+systemctl enable --now supabase-backup-reconfigure.path >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-reconfigure.path"
+info "settings helper installed and watching the spool"
+
+# ── The encryption helper ─────────────────────────────────────────────────────
+# Who an archive is encrypted to is a public key, so nothing here is secret -
+# but it decides who can read every archive written from then on, and it lives
+# in a root-owned directory. Same shape again: the console asks, root writes.
+step "Encryption helper"
+curl -fsSL --max-time 30 "${RAW_BASE}/keys" -o "${LIB_DIR}/keys" \
+  || error "could not download the encryption helper"
+chmod 0755 "${LIB_DIR}/keys"
+
+for f in supabase-backup-keys.path supabase-backup-keys.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+systemctl enable --now supabase-backup-keys.path >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-keys.path"
+info "encryption helper installed and watching the spool"
+
+# ── The restore helper ────────────────────────────────────────────────────────
+# The same restore an operator runs by hand, reading its answers from a request
+# instead of from a terminal. Two switches, and they are not the same question:
+# WEB_ALLOW_RESTORE decides whether the console offers it, and this .path unit
+# decides whether the host acts on one at all. Leaving the unit disabled means
+# a request could be written and would simply never be read.
+step "Restore helper"
+curl -fsSL --max-time 30 "${RAW_BASE}/restore" -o "${LIB_DIR}/restore" \
+  || error "could not download restore"
+chmod 0755 "${LIB_DIR}/restore"
+for f in supabase-backup-restore.path supabase-backup-restore.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+
+echo ""
+echo "  Allow restores to be started from the console?"
+echo ""
+echo "    A restore writes an archive into another Supabase project and cannot"
+echo "    be undone. The console never does it itself: it asks, and restore"
+echo "    carries it out here as root, with every guard it has at a terminal -"
+echo "    it refuses any project this host backs up, refuses credentials that"
+echo "    name two different projects, and will not write until whoever asked"
+echo "    has typed the target project's ref in full."
+echo ""
+echo "    Answering no installs the helper and leaves it disabled, so a request"
+echo "    would never be read. You can turn it on later."
+echo ""
+read -rp "  Allow restores? [y/N]: " ALLOW_RESTORE_ANSWER
+if [[ "$ALLOW_RESTORE_ANSWER" =~ ^[Yy]$ ]]; then
+  RESTORE_ENABLED=1
+  systemctl enable --now supabase-backup-restore.path >/dev/null 2>&1 \
+    || error "could not enable supabase-backup-restore.path"
+  info "restore helper installed and watching the spool"
+else
+  RESTORE_ENABLED=0
+  systemctl disable --now supabase-backup-restore.path >/dev/null 2>&1 || true
+  info "restore helper installed, not enabled"
+fi
+
 # ── Let it read the archives ──────────────────────────────────────────────────
 # The archive tree is 0700 root. The console needs to read it and nothing else,
 # so it gets group access - the per-project .conf files, which hold the service
@@ -164,6 +261,7 @@ else
   sed -i "/^WEB_PASSWORD_HASH=/d" "${WEB_CONF_DIR}/web.env"
   printf '%s\n' "$HASH_LINE" >> "${WEB_CONF_DIR}/web.env"
   info "password set for ${WEB_USER}"
+  info "change it later from the console's Settings panel, or here in web.env"
 
   echo ""
   echo "  Where should the console listen?"
@@ -177,6 +275,16 @@ else
     warn "service key. Use a TLS proxy on this host, or an SSH tunnel, for that."
   fi
 fi
+
+# Written whether the file is new or was kept: the question was just asked, so
+# the answer is what should be in there. An older web.env predating the switch
+# has no line to replace, and gets one.
+if grep -q '^WEB_ALLOW_RESTORE=' "${WEB_CONF_DIR}/web.env"; then
+  sed -i "s|^WEB_ALLOW_RESTORE=.*|WEB_ALLOW_RESTORE=${RESTORE_ENABLED}|" "${WEB_CONF_DIR}/web.env"
+else
+  printf 'WEB_ALLOW_RESTORE=%s\n' "$RESTORE_ENABLED" >> "${WEB_CONF_DIR}/web.env"
+fi
+info "restores from the console: $([ "$RESTORE_ENABLED" = 1 ] && echo enabled || echo disabled)"
 
 # ── polkit: let the console start a backup ────────────────────────────────────
 step "Run permission"
@@ -224,6 +332,9 @@ else
 fi
 echo "  Status            systemctl status supabase-backup-web"
 echo "  Registrations     journalctl -u supabase-backup-register -n 30"
+echo "  Settings changes  journalctl -u supabase-backup-reconfigure -n 30"
+echo "  Encryption keys   journalctl -u supabase-backup-keys -n 30"
+echo "  Restores          journalctl -u supabase-backup-restore -n 50"
 echo "  Logs              journalctl -u supabase-backup-web -n 30"
 echo "  Settings          ${WEB_CONF_DIR}/web.env"
 echo ""

@@ -24,6 +24,11 @@
 
   <section class="cards" id="cards" aria-label="Summary"></section>
 
+  <section id="restore-section" hidden>
+    <h2>Restore</h2>
+    <div id="restore" class="item"></div>
+  </section>
+
   <section id="projects" class="projects"><p class="empty">Loading…</p></section>
 
   <section id="register-section" hidden>
@@ -31,10 +36,14 @@
     <div id="register" class="item"></div>
   </section>
 
-  <footer>
-    Restoring is not done from here — it needs the target project's credentials
-    and refuses to touch the project it backs up. Run <code>restore</code> on the host.
-  </footer>
+  <section id="settings-section" hidden>
+    <h2>Console settings</h2>
+    <div id="settings" class="item"></div>
+  </section>
+
+  <!-- Filled in by renderFooter: what this console will do about restoring
+       depends on how it is configured and how you reached it. -->
+  <footer id="footer"></footer>
 </main>
 
 <script type="module" src="/static/app.js"></script>

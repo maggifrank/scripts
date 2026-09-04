@@ -1,0 +1,28 @@
+[Unit]
+Description=Apply console settings from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/reconfigure --drain
+
+# The privileged half of the settings page. It edits
+# /etc/supabase-backup-web/web.env and restarts the console - neither of which
+# the network-facing process can do - and puts the old file back if the console
+# does not come up with the new one.
+#
+# It never touches /etc/supabase-backup: a project's credentials are no part of
+# this, and saying so here means a bug cannot make it part of this. Every field
+# is re-validated, because the request was written by a process exposed to the
+# network.
+ReadWritePaths=/etc/supabase-backup-web /run/supabase-backup-web
+InaccessiblePaths=-/etc/supabase-backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

@@ -1,9 +1,21 @@
-# Spool between the console and the privileged registration helper.
+# Spool between the console and the privileged helpers that act for it.
 # Created here rather than with RuntimeDirectory= so it survives the console
 # restarting, and so the .path unit has something to watch at boot.
 d /run/supabase-backup-web          0750 supabase-backup-web supabase-backup-web -
 # Requests: written by the console, read and shredded by root. Only the console
 # can enter it, and each request file is 0600 - it holds a service key.
 d /run/supabase-backup-web/register 0700 supabase-backup-web supabase-backup-web -
+# Settings changes: written by the console, applied by root. 0600 like a
+# registration, though what is in one is a PBKDF2 digest and not a password -
+# the console hashes before it writes.
+d /run/supabase-backup-web/settings 0700 supabase-backup-web supabase-backup-web -
+# Encryption changes: written by the console, applied by root. Nothing in one
+# is secret - an age recipient is a public key - but it decides who can read
+# every archive written afterwards, so only the console may leave one here.
+d /run/supabase-backup-web/encryption 0700 supabase-backup-web supabase-backup-web -
+# Restore requests: written by the console, read and shredded by root. 0600 and
+# 0700, like a registration and for the same reason - one holds the target
+# project's database password and its service key.
+d /run/supabase-backup-web/restore 0700 supabase-backup-web supabase-backup-web -
 # Results: written by root, read by the console. No secrets.
 d /run/supabase-backup-web/results  0750 root                supabase-backup-web -

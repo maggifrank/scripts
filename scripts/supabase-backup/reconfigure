@@ -1,0 +1,201 @@
+#!/bin/bash
+# reconfigure — apply the console's own settings, left in its spool.
+#
+#   reconfigure --drain          apply every pending request (what the .path unit runs)
+#   reconfigure <request.json>   apply one
+#
+# Runs as root, triggered by supabase-backup-reconfigure.path when the console
+# drops a request. The console runs unprivileged: it cannot write the file that
+# configures it and cannot restart itself. This does both, and nothing else.
+#
+# The request was written by a process exposed to the network, so nothing in it
+# is trusted. Every field is validated again here; only a fixed list of keys is
+# ever written; and no path comes from the request - this edits the one file it
+# was built to edit. The password arrives already hashed, so the plaintext is
+# never in this script, its argv, or the journal.
+#
+# If the console does not come back up, the previous file is put back and the
+# console restarted with it. A settings page that can lock you out of the
+# settings page is not a settings page.
+set -euo pipefail
+
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+
+WEB_CONF_DIR="${WEB_CONF_DIR:-/etc/supabase-backup-web}"
+WEB_ENV="${WEB_CONF_DIR}/web.env"
+SPOOL_DIR="${SPOOL_DIR:-/run/supabase-backup-web}"
+SET_DIR="${SPOOL_DIR}/settings"
+RES_DIR="${SPOOL_DIR}/results"
+WEB_USER="${WEB_USER:-supabase-backup-web}"
+WEB_UNIT="${WEB_UNIT:-supabase-backup-web.service}"
+
+STEPS=()
+note() { STEPS+=("$1"); printf '  %s\n' "$1"; }
+
+emit() {  # emit <id> <state> <error>
+  local id="$1" state="$2" error="${3:-}"
+  mkdir -p "$RES_DIR"
+  jq -nc --arg id "$id" --arg state "$state" --arg error "$error" \
+     --arg kind settings --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     --argjson steps "$(printf '%s\n' "${STEPS[@]:-}" | jq -R -s 'split("\n") | map(select(length>0))')" \
+     '{id:$id, kind:$kind, state:$state, error:$error, steps:$steps, finished_at:$finished}' \
+     > "${RES_DIR}/${id}.json.tmp"
+  chmod 0640 "${RES_DIR}/${id}.json.tmp"
+  chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
+  mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
+}
+
+value_of() { sed -n "s|^${1}=||p" "$WEB_ENV" | tail -1; }   # what web.env says now
+
+onoff() { [ "$1" = "1" ] && echo on || echo off; }
+
+process() {
+  local file="$1"
+  STEPS=()
+
+  local id
+  id="$(basename "$file" .json)"
+  [[ "$id" =~ ^[0-9a-f]{32}$ ]] || { rm -f "$file"; return 0; }
+
+  local body
+  body="$(cat "$file")" || { emit "$id" failed "could not read the request"; rm -f "$file"; return 0; }
+  # No shred here, unlike a registration: this request holds a PBKDF2 digest,
+  # not a password. Removing it is what re-arms the .path unit.
+  rm -f "$file"
+
+  # From here on the request is gone but there is no result yet, and the
+  # console would call that "unknown" - a spinner turning into "no result came
+  # back" while this is still working. Claim the id first; the real result
+  # overwrites this one.
+  emit "$id" running ""
+
+  [ -f "$WEB_ENV" ] || { emit "$id" failed "${WEB_ENV} does not exist"; return 0; }
+
+  local username bind stale_hours password_hash
+  username="$(jq -r '.username // empty'      <<<"$body")"
+  bind="$(jq -r '.bind // empty'              <<<"$body")"
+  stale_hours="$(jq -r '.stale_hours // empty' <<<"$body")"
+  password_hash="$(jq -r '.password_hash // empty' <<<"$body")"
+
+  # A switch that is simply missing must not read as "turn it off", so an
+  # incomplete request is refused rather than interpreted.
+  local key allow_run allow_download allow_register allow_settings
+  for key in allow_run allow_download allow_register allow_settings; do
+    jq -e "has(\"${key}\")" >/dev/null <<<"$body" \
+      || { emit "$id" failed "the request does not say what ${key} should be"; return 0; }
+  done
+  allow_run="$(jq -r 'if .allow_run then 1 else 0 end'           <<<"$body")"
+  allow_download="$(jq -r 'if .allow_download then 1 else 0 end' <<<"$body")"
+  allow_register="$(jq -r 'if .allow_register then 1 else 0 end' <<<"$body")"
+  allow_settings="$(jq -r 'if .allow_settings then 1 else 0 end' <<<"$body")"
+
+  # ── Validate, trusting nothing the console sent ──
+  [[ "$username" =~ ^[A-Za-z0-9._@-]{1,64}$ ]] \
+    || { emit "$id" failed "invalid username"; return 0; }
+  local bind_host="${bind%:*}" bind_port="${bind##*:}"
+  [[ "$bind_port" =~ ^[0-9]{1,5}$ ]] && [ "$bind_port" -ge 1 ] && [ "$bind_port" -le 65535 ] \
+    || { emit "$id" failed "invalid listen port"; return 0; }
+  [[ "$bind_host" =~ ^(\[[0-9a-fA-F:]+\]|[0-9]{1,3}(\.[0-9]{1,3}){3}|localhost)$ ]] \
+    || { emit "$id" failed "invalid listen address"; return 0; }
+  [[ "$stale_hours" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+    || { emit "$id" failed "stale hours is not a number"; return 0; }
+  if [ -n "$password_hash" ]; then
+    # The console hashes; this makes sure that is what arrived. A password in
+    # this field would otherwise be written to web.env as if it were a digest,
+    # and every login would fail with the file looking perfectly reasonable.
+    [[ "$password_hash" =~ ^pbkdf2_sha256\$[0-9]+\$[0-9a-f]+\$[0-9a-f]+$ ]] \
+      || { emit "$id" failed "the password hash is not a pbkdf2_sha256 digest"; return 0; }
+  fi
+
+  # ── Say what is actually changing ──
+  local changed=0
+  changes() { changed=1; note "$1"; }
+  [ "$(value_of WEB_USER)" = "$username" ] || changes "username is now '${username}'"
+  [ "$(value_of WEB_BIND)" = "$bind" ] || changes "listening on ${bind} from now on"
+  [ "$(value_of WEB_STALE_HOURS)" = "$stale_hours" ] || changes "stale after ${stale_hours}h"
+  [ "$(value_of WEB_ALLOW_RUN)" = "$allow_run" ] || changes "run button $(onoff "$allow_run")"
+  [ "$(value_of WEB_ALLOW_DOWNLOAD)" = "$allow_download" ] || changes "archive downloads $(onoff "$allow_download")"
+  [ "$(value_of WEB_ALLOW_REGISTER)" = "$allow_register" ] || changes "adding a project $(onoff "$allow_register")"
+  [ "$(value_of WEB_ALLOW_SETTINGS)" = "$allow_settings" ] || changes "settings page $(onoff "$allow_settings")"
+  if [ -n "$password_hash" ] && [ "$(value_of WEB_PASSWORD_HASH)" != "$password_hash" ]; then
+    changes "console password changed"
+  fi
+  if [ "$changed" -eq 0 ]; then
+    note "nothing to do - web.env already says all of that"
+    emit "$id" ok ""
+    return 0
+  fi
+
+  # ── Write it, keeping every comment and every key not listed here ──
+  local wanted new backup
+  wanted="$(mktemp)"; new="$(mktemp)"; backup="$(mktemp)"
+  {
+    printf 'WEB_USER\t%s\n'           "$username"
+    printf 'WEB_BIND\t%s\n'           "$bind"
+    printf 'WEB_STALE_HOURS\t%s\n'    "$stale_hours"
+    printf 'WEB_ALLOW_RUN\t%s\n'      "$allow_run"
+    printf 'WEB_ALLOW_DOWNLOAD\t%s\n' "$allow_download"
+    printf 'WEB_ALLOW_REGISTER\t%s\n' "$allow_register"
+    printf 'WEB_ALLOW_SETTINGS\t%s\n' "$allow_settings"
+  } > "$wanted"
+  if [ -n "$password_hash" ]; then
+    printf 'WEB_PASSWORD_HASH\t%s\n' "$password_hash" >> "$wanted"
+  fi
+
+  # Replace each key in place, append the ones that were never there, and pass
+  # everything else through untouched - a commented default keeps its '#', so
+  # web.env still reads like the file the setup script wrote.
+  awk -F'\t' '
+    FNR==NR { want[$1]=$2; order[++n]=$1; next }
+    {
+      for (k in want) if (index($0, k "=") == 1) {
+        if (!seen[k]) { print k "=" want[k]; seen[k]=1 }
+        next
+      }
+      print
+    }
+    END { for (i = 1; i <= n; i++) if (!seen[order[i]]) print order[i] "=" want[order[i]] }
+  ' "$wanted" "$WEB_ENV" > "$new"
+  rm -f "$wanted"
+
+  cp -a "$WEB_ENV" "$backup"
+  install -o root -g "$WEB_USER" -m 0640 "$new" "$WEB_ENV"
+  rm -f "$new"
+  note "wrote ${WEB_ENV}, mode 0640 root:${WEB_USER}"
+
+  # ── Restart, and put the old file back if that did not work ──
+  local up=0 i
+  if systemctl restart "$WEB_UNIT" >/dev/null 2>&1; then
+    # Type=exec means restart returns as soon as the process is running, and a
+    # console that rejects its own config dies a moment later. Ask again.
+    for i in 1 2 3; do
+      sleep 1
+      systemctl is-active --quiet "$WEB_UNIT" && up=1 || { up=0; break; }
+    done
+  fi
+
+  if [ "$up" -eq 1 ]; then
+    rm -f "$backup"
+    note "${WEB_UNIT} restarted and running"
+    emit "$id" ok ""
+    return 0
+  fi
+
+  local why
+  # tail -c, not ${why}: bash gives back nothing at all for a negative
+  # offset longer than the string, which is exactly the short-message case.
+  why="$(journalctl -u "$WEB_UNIT" -n 8 --no-pager -o cat 2>/dev/null | tr '\n' ' ' | tail -c 300)"
+  install -o root -g "$WEB_USER" -m 0640 "$backup" "$WEB_ENV"
+  rm -f "$backup"
+  systemctl restart "$WEB_UNIT" >/dev/null 2>&1 || true
+  note "the console did not come back - the previous ${WEB_ENV} has been put back"
+  emit "$id" failed "the console would not start with those settings: ${why}"
+}
+
+case "${1:-}" in
+  --drain|"")
+    shopt -s nullglob
+    for f in "$SET_DIR"/*.json; do process "$f"; done
+    ;;
+  *) process "$1" ;;
+esac

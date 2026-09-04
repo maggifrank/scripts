@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for console settings changes from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Path]
+# The console drops a settings change here; this fires the root oneshot that
+# applies it to web.env and restarts the console. The console cannot write its
+# own configuration and cannot restart itself, which is the point.
+DirectoryNotEmpty=/run/supabase-backup-web/settings
+MakeDirectory=false
+
+[Install]
+WantedBy=paths.target
