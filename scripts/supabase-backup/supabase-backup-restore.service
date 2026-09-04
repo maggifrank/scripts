@@ -1,0 +1,35 @@
+[Unit]
+Description=Apply restore requests from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/restore --drain
+
+# The same restore an operator runs by hand, reading its answers from a request
+# instead of from a terminal. It needs root for one reason the console must
+# never have: /etc/supabase-backup, which is where "is this target a project we
+# back up?" is answered. That guard is worth nothing if the process asking can
+# be talked into skipping it, so it is checked here and only here.
+ReadWritePaths=/run/supabase-backup-web
+ReadOnlyPaths=/etc/supabase-backup /var/backups/supabase
+
+# A restore uploads every storage object one at a time. An hour is ordinary for
+# a large project, and a timeout that kills it halfway would leave a target in
+# the state this whole tool exists to avoid.
+TimeoutStartSec=infinity
+
+# PrivateTmp, and it matters here: the archive is extracted into /tmp and holds
+# every auth password hash in it. This way that copy is not on the real /tmp at
+# all, and it is gone when the unit stops even if the script is killed.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

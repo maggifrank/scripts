@@ -7,6 +7,21 @@
 #   supabase-restore --list     available archives
 #   supabase-restore --reset    DESTRUCTIVE: clear a target so a rehearsal can
 #                               be repeated. Refuses any configured source.
+#   supabase-restore --request FILE   apply one restore request from the console
+#   supabase-restore --drain    apply every request the console has left
+#
+# The last two are how the web console asks for a restore. It has no privilege
+# and holds no credentials, so it writes a request into a spool directory and
+# this runs as root from a .path unit. Nothing in that file is trusted: every
+# field is validated again here, the guards are re-derived from what only root
+# can read, and the file is shredded as soon as it has been read - it holds the
+# target's database password and service key until then.
+#
+# What the prompts below are for is not the typing, it is the deciding. So a
+# request has to have decided already: which archive, the target ref spelled
+# out, and a separate yes for each question this script would have stopped on.
+# One it did not answer stops the restore here, exactly as an empty answer at
+# the terminal would.
 #
 # Bash rather than POSIX sh, unlike backup.sh: this is interactive and runs
 # rarely, so readable prompts matter more than minimal dependencies.
@@ -15,7 +30,18 @@ set -euo pipefail
 LIB_DIR="${LIB_DIR:-/opt/supabase-backup}"
 CONF_DIR="${CONF_DIR:-/etc/supabase-backup}"
 DATA_DIR="${DATA_DIR:-/var/backups/supabase}"
+SPOOL_DIR="${SPOOL_DIR:-/run/supabase-backup-web}"
+REQ_DIR="${SPOOL_DIR}/restore"
+RES_DIR="${SPOOL_DIR}/results"
+WEB_USER="${WEB_USER:-supabase-backup-web}"
+RESTORE_UNIT="${RESTORE_UNIT:-supabase-backup-restore}"
 WORK=""
+
+# Set only under --request: a console is watching a result file, and every line
+# printed below is also a line it shows.
+REQ=0; ID=""; STEPS=(); STARTED=""; FINISHED=0
+PROJECT=""; ARCHIVE_NAME=""; DB_REF=""; CONFIRM_REF=""
+ALLOW_NONEMPTY=0; CATALOG_OK=0
 
 # Debian's psql is a Perl wrapper that emits a wall of locale warnings under an
 # ungenerated LANG, which some consoles hand us.
@@ -27,21 +53,88 @@ else
   B=""; R=""; G=""; Y=""; D=""; N=""
 fi
 
-die()  { printf '\n%sERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
-step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
-info() { printf '    %s\n' "$*"; }
-ok()   { printf '    %s✓%s %s\n' "$G" "$N" "$*"; }
-warn() { printf '    %s!%s %s\n' "$Y" "$N" "$*"; }
+# ── Reporting back to the console ──────────────────────────────────────────
+# Interactive runs never touch any of this: record() and emit() return at once
+# unless a request is being applied. What the console shows is therefore not a
+# second, summarised account of the restore - it is the same lines, in the same
+# order, with a marker saying which of step/ok/warn/info produced each.
 
-cleanup() { [[ -n "$WORK" && -d "$WORK" ]] && printf '\n%sExtracted archive left at %s%s\n' "$D" "$WORK" "$N"; }
+emit() {  # emit <state> [error]
+  (( REQ )) || return 0
+  local steps="[]"
+  (( ${#STEPS[@]} )) && steps="$(printf '%s\n' "${STEPS[@]}" | jq -cs '.')"
+  mkdir -p "$RES_DIR"
+  jq -nc --arg id "$ID" --arg state "$1" --arg error "${2:-}" \
+     --arg project "$PROJECT" --arg archive "$ARCHIVE_NAME" \
+     --arg target "$DB_REF" --arg started "$STARTED" \
+     --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     --argjson dry "$( (( DRY_RUN )) && echo true || echo false )" \
+     --argjson steps "$steps" \
+     '{kind:"restore", id:$id, state:$state, error:$error, project:$project,
+       archive:$archive, target_ref:$target, dry_run:$dry, started_at:$started,
+       finished_at:(if $state == "running" then null else $finished end),
+       steps:$steps}' \
+     > "${RES_DIR}/${ID}.json.tmp"
+  chmod 0640 "${RES_DIR}/${ID}.json.tmp"
+  chgrp "$WEB_USER" "${RES_DIR}/${ID}.json.tmp" 2>/dev/null || true
+  # Rewritten in full and moved into place after every line, so a reader never
+  # sees half a document and a long upload is watchable while it happens.
+  mv -f "${RES_DIR}/${ID}.json" "${RES_DIR}/${ID}.json.prev" 2>/dev/null || true
+  mv -f "${RES_DIR}/${ID}.json.tmp" "${RES_DIR}/${ID}.json"
+  rm -f "${RES_DIR}/${ID}.json.prev"
+}
+
+# A restore that fails object by object could otherwise grow the result file
+# without bound, re-serialising every line each time. The journal keeps all of
+# it; the console gets the first 400 lines and is told so.
+record() {  # record <kind> <message>
+  (( REQ )) || return 0
+  if (( ${#STEPS[@]} >= 400 )); then
+    (( ${#STEPS[@]} == 400 )) || return 0
+    STEPS+=("$(jq -nc --arg m "further output is in the journal only - journalctl -u ${RESTORE_UNIT}" '{k:"warn",m:$m}')")
+  else
+    STEPS+=("$(jq -nc --arg k "$1" --arg m "$2" '{k:$k,m:$m}')")
+  fi
+  # Never fatal. A result file that cannot be written is a console left in the
+  # dark, which is bad; a restore abandoned halfway because of it is worse.
+  emit running "" || true
+}
+
+die()  { emit failed "$*" || true; FINISHED=1; printf '\n%sERROR:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+step() { record step "$*"; printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
+info() { record info "$*"; printf '    %s\n' "$*"; }
+ok()   { record ok   "$*"; printf '    %s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { record warn "$*"; printf '    %s!%s %s\n' "$Y" "$N" "$*"; }
+
+cleanup() {
+  if (( REQ )); then
+    # Anything that got here without die() and without finishing - a killed
+    # helper, a psql that dropped the connection - would otherwise leave the
+    # console watching a restore that stopped talking.
+    (( FINISHED )) || emit failed "the restore stopped unexpectedly - journalctl -u ${RESTORE_UNIT}" || true
+    # The extracted copy holds every auth password hash in the archive. An
+    # interactive run keeps it on purpose, for the column-by-column fallback;
+    # nobody is standing at this one to use it.
+    [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"
+    return 0
+  fi
+  [[ -n "$WORK" && -d "$WORK" ]] && printf '\n%sExtracted archive left at %s%s\n' "$D" "$WORK" "$N"
+  return 0
+}
 trap cleanup EXIT
 
-DRY_RUN=0; RESET=0
+DRY_RUN=0; RESET=0; REQUEST=""
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
   --reset)   RESET=1 ;;
   --list)    find "$DATA_DIR" -name '*.tar.gz' -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | sort -r || echo "no archives under $DATA_DIR"; exit 0 ;;
-  --help|-h) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  --help|-h) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  --request) REQUEST="${2:-}"; [[ -n "$REQUEST" ]] || die "--request needs a file" ;;
+  # One process per request: this script is a straight line that ends in an
+  # exit, so a loop inside it could not run a second one after the first died.
+  --drain)   shopt -s nullglob
+             for f in "$REQ_DIR"/*.json; do "$0" --request "$f" || true; done
+             exit 0 ;;
   "")        ;;
   *)         die "unknown option: $1 (try --help)" ;;
 esac
@@ -65,28 +158,76 @@ ask_secret() {
 confirm() { local r; read -rp "    $1 [y/N]: " r; [[ "$r" == y || "$r" == Y ]]; }
 ref_of()  { sed -E 's|.*://(postgres\.)?([a-z0-9]+)[.:/].*|\2|; s|/+$||' <<<"$1"; }
 
+# ── Load a console request, if this is one ─────────────────────────────────
+if [[ -n "$REQUEST" ]]; then
+  command -v jq >/dev/null || { printf 'jq not found\n' >&2; exit 1; }
+  ID="$(basename "$REQUEST" .json)"
+  # Anything else in the spool was not put there by the console. Leave it.
+  [[ "$ID" =~ ^[0-9a-f]{32}$ ]] || { printf 'ignoring %s\n' "$REQUEST" >&2; exit 0; }
+  REQ=1
+  STARTED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # Read it once, then destroy it. It holds the target's database password and
+  # its service key, so nothing after this line can leave them in /run.
+  BODY="$(cat "$REQUEST")" || die "could not read the request"
+  shred -u "$REQUEST" 2>/dev/null || rm -f "$REQUEST"
+
+  PROJECT="$(jq -r '.project // empty'            <<<"$BODY")"
+  ARCHIVE_NAME="$(jq -r '.archive // empty'       <<<"$BODY")"
+  TARGET_DB_URL="$(jq -r '.database_url // empty' <<<"$BODY")"
+  TARGET_SUPABASE_URL="$(jq -r '.supabase_url // empty' <<<"$BODY")"
+  TARGET_SERVICE_KEY="$(jq -r '.service_key // empty'   <<<"$BODY")"
+  CONFIRM_REF="$(jq -r '.confirm_ref // empty'    <<<"$BODY")"
+  # Absent means no, for all three. A request cannot get past a question by
+  # not mentioning it.
+  if [[ "$(jq -r '.dry_run // false' <<<"$BODY")" == "true" ]]; then DRY_RUN=1; fi
+  if [[ "$(jq -r '.allow_nonempty // false' <<<"$BODY")" == "true" ]]; then ALLOW_NONEMPTY=1; fi
+  if [[ "$(jq -r '.continue_on_catalog_errors // false' <<<"$BODY")" == "true" ]]; then CATALOG_OK=1; fi
+  BODY=""
+  emit running ""
+
+  # The archive is named, never chosen. Both halves of the path are matched
+  # against a fixed shape and the result has to be a file that already exists
+  # under DATA_DIR, so no part of a request reaches the filesystem unchecked.
+  [[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid project name"
+  [[ "$ARCHIVE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*-[0-9]{8}T[0-9]{6}Z\.tar\.gz$ ]] \
+    || die "not an archive name: ${ARCHIVE_NAME}"
+  [[ "$ARCHIVE_NAME" == "${PROJECT}-"* ]] \
+    || die "archive '${ARCHIVE_NAME}' does not belong to project '${PROJECT}'"
+  ARCHIVE="${DATA_DIR}/${PROJECT}/${ARCHIVE_NAME}"
+  [[ -f "$ARCHIVE" ]] || die "no such archive: ${ARCHIVE}"
+  [[ -n "$TARGET_DB_URL" && -n "$TARGET_SUPABASE_URL" && -n "$TARGET_SERVICE_KEY" ]] \
+    || die "the request does not carry the target's credentials"
+fi
+
 # ── 0. Preflight ───────────────────────────────────────────────────────────
 step "Preflight"
 for c in psql curl jq tar sha256sum; do command -v "$c" >/dev/null || die "$c not found"; done
 ok "tools present"
+(( REQ )) && info "applying console request ${ID}"
 (( DRY_RUN )) && warn "DRY RUN — nothing will be written to the target"
 
 # ── 1. Archive ─────────────────────────────────────────────────────────────
 if (( RESET )); then
   warn "RESET mode — this destroys data in a target, it restores none"
 else
-  step "Choose an archive"
-  mapfile -t ARCHIVES < <(find "$DATA_DIR" -name '*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
-  (( ${#ARCHIVES[@]} )) || die "no archives found under $DATA_DIR"
-  for i in "${!ARCHIVES[@]}"; do
-    printf '    %2d) %-46s %s%s%s\n' "$((i+1))" "$(basename "${ARCHIVES[$i]}")" \
-      "$D" "$(du -h "${ARCHIVES[$i]}" | cut -f1)" "$N"
-    (( i >= 14 )) && break
-  done
-  read -rp "    Number [1 = newest]: " CHOICE
-  ARCHIVE="${ARCHIVES[$(( ${CHOICE:-1} - 1 ))]:-}"
-  [[ -n "$ARCHIVE" ]] || die "no such archive"
-  ok "using $(basename "$ARCHIVE")"
+  if (( REQ )); then
+    step "Archive"
+    ok "using ${ARCHIVE_NAME}, named in the request"
+  else
+    step "Choose an archive"
+    mapfile -t ARCHIVES < <(find "$DATA_DIR" -name '*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    (( ${#ARCHIVES[@]} )) || die "no archives found under $DATA_DIR"
+    for i in "${!ARCHIVES[@]}"; do
+      printf '    %2d) %-46s %s%s%s\n' "$((i+1))" "$(basename "${ARCHIVES[$i]}")" \
+        "$D" "$(du -h "${ARCHIVES[$i]}" | cut -f1)" "$N"
+      (( i >= 14 )) && break
+    done
+    read -rp "    Number [1 = newest]: " CHOICE
+    ARCHIVE="${ARCHIVES[$(( ${CHOICE:-1} - 1 ))]:-}"
+    [[ -n "$ARCHIVE" ]] || die "no such archive"
+    ok "using $(basename "$ARCHIVE")"
+  fi
 
   step "Extract and verify"
   WORK="$(mktemp -d /tmp/supabase-restore-XXXXXX)"
@@ -98,26 +239,33 @@ else
     [[ -f "$WORK/$f" ]] || die "archive is missing $f — is this a supabase-backup archive?"
   done
   info ""
+  # Read into the current shell rather than piped, so that record() - which
+  # appends to an array - is not running in a subshell whose array dies with it.
   # String concatenation rather than \(...) interpolation: nested quotes inside
   # an interpolation are not valid jq, and are painful to escape through bash.
-  jq -r '
+  while IFS= read -r l; do record info "$l"; printf '%s\n' "$l"; done < <(jq -r '
     "    project:  " + .project,
     "    captured: " + .created_utc,
     "    schemas:  " + (.schemas | join(", ")),
     "    buckets:  " + (.buckets | join(", ")),
     "    objects:  " + (.storage_objects | tostring)
-  ' "$WORK/manifest.json"
+  ' "$WORK/manifest.json")
   info ""
-  jq -r '.rows | to_entries[] | "    \(.key)\t\(.value) rows"' "$WORK/manifest.json" | expand -t 34
+  while IFS= read -r l; do record info "$l"; printf '%s\n' "$l"; done \
+    < <(jq -r '.rows | to_entries[] | "    \(.key)\t\(.value) rows"' "$WORK/manifest.json" | expand -t 34)
 fi
 
 # ── 2. Target ──────────────────────────────────────────────────────────────
 step "Target project (the one being restored INTO)"
-info "From that project's dashboard: Connect → Direct tab → Session pooler (5432)"
-info ""
-ask        "Session pooler URI (with password)" TARGET_DB_URL
-ask        "Project URL (https://<ref>.supabase.co)" TARGET_SUPABASE_URL
-ask_secret "Service key" TARGET_SERVICE_KEY
+if (( REQ )); then
+  info "credentials came with the request"
+else
+  info "From that project's dashboard: Connect → Direct tab → Session pooler (5432)"
+  info ""
+  ask        "Session pooler URI (with password)" TARGET_DB_URL
+  ask        "Project URL (https://<ref>.supabase.co)" TARGET_SUPABASE_URL
+  ask_secret "Service key" TARGET_SERVICE_KEY
+fi
 
 DB_REF="$(ref_of "$TARGET_DB_URL")"
 URL_REF="$(ref_of "$TARGET_SUPABASE_URL")"
@@ -131,6 +279,15 @@ step "Safety checks"
   || die "credentials disagree: the URI names '$DB_REF' but the project URL names '$URL_REF'"
 ok "both credentials name project '$DB_REF'"
 
+# The ref the requester typed out, against the ref their credentials resolve
+# to. At a terminal this is the last prompt, immediately before the writes;
+# in a request it has to be settled here, because there is nobody to ask.
+if (( REQ )); then
+  [[ "$CONFIRM_REF" == "$DB_REF" ]] \
+    || die "the request confirmed '${CONFIRM_REF}' but its credentials name '${DB_REF}'"
+  ok "the request spells out '${DB_REF}' as the target"
+fi
+
 # Never write to a project this host backs up. Checked against every configured
 # project, not just the one this archive came from.
 shopt -s nullglob
@@ -143,13 +300,20 @@ done
 shopt -u nullglob
 ok "target is not a configured backup source"
 
-[[ "$TARGET_DB_URL" == *":5432/"* ]] || warn "URI is not on port 5432 — transaction mode fails partway"
+if [[ "$TARGET_DB_URL" != *":5432/"* ]]; then
+  # A warning is enough for someone who can watch it happen and stop. A request
+  # is unattended, and what this failure looks like is a target left half
+  # written, so it is refused outright.
+  (( REQ )) && die "the target URI is not on port 5432 — transaction mode does not hold a session across statements, and a restore through it stops partway"
+  warn "URI is not on port 5432 — transaction mode fails partway"
+fi
 
 step "Target reachability"
 ERRF="$(mktemp)"
 if ! EXISTING="$(psql "$TARGET_DB_URL" -Atc "select count(*) from pg_tables where schemaname='public'" 2>"$ERRF")"; then
-  sed 's/^/    /' "$ERRF"; rm -f "$ERRF"
-  die "cannot connect to the target (see above)"
+  sed 's/^/    /' "$ERRF"
+  DETAIL="$(head -3 "$ERRF" | tr '\n' ' ')"; rm -f "$ERRF"
+  die "cannot connect to the target: ${DETAIL}"
 fi
 rm -f "$ERRF"
 ok "connected"
@@ -232,7 +396,12 @@ fi
 if [[ "$EXISTING" != "0" ]]; then
   warn "target already has $EXISTING table(s) in public — this is not an empty project"
   warn "loading schema.sql over them will fail on objects that already exist"
-  confirm "Continue anyway?" || die "aborted"
+  if (( REQ )); then
+    (( ALLOW_NONEMPTY )) || die "the target is not empty and the request did not say to go ahead anyway. Tick that box, or restore into an empty project."
+    warn "the request says to go ahead anyway"
+  else
+    confirm "Continue anyway?" || die "aborted"
+  fi
 else
   ok "target public schema is empty"
 fi
@@ -242,10 +411,18 @@ info "archive: $(basename "$ARCHIVE")"
 info "target:  $DB_REF"
 info "order:   auth → schema and data → catalog objects → $(find "$WORK/files" -type f 2>/dev/null | wc -l | tr -d ' ') storage object(s)"
 info ""
-if (( DRY_RUN )); then ok "dry run — stopping before any writes"; exit 0; fi
+if (( DRY_RUN )); then
+  ok "dry run — stopping before any writes"
+  FINISHED=1; emit ok ""
+  exit 0
+fi
 warn "This writes the archive's data into project '$DB_REF'."
-read -rp "    Type the project ref to proceed: " TYPED
-[[ "$TYPED" == "$DB_REF" ]] || die "did not match — aborted"
+if (( REQ )); then
+  ok "already confirmed in the request"
+else
+  read -rp "    Type the project ref to proceed: " TYPED
+  [[ "$TYPED" == "$DB_REF" ]] || die "did not match — aborted"
+fi
 
 # ── 6. Restore ─────────────────────────────────────────────────────────────
 # Auth first. Application tables carry foreign keys to auth.users(id), so
@@ -256,7 +433,7 @@ step "Loading auth users and identities"
 if psql "$TARGET_DB_URL" -q -v ON_ERROR_STOP=1 -f "$WORK/auth.sql" > "$WORK/auth.log" 2>&1; then
   ok "loaded ($(psql "$TARGET_DB_URL" -Atc "select count(*) from auth.users") users)"
 else
-  tail -5 "$WORK/auth.log" | sed 's/^/    /'
+  while IFS= read -r l; do record warn "$l"; printf '    %s\n' "$l"; done < <(tail -5 "$WORK/auth.log")
   die "auth load failed. Every application table references auth.users, so the
     rest cannot succeed without it. Usually a GoTrue column-shape difference
     between the source and target projects — see the docs for the
@@ -271,7 +448,7 @@ step "Loading schema and data"
 psql "$TARGET_DB_URL" -q -f "$WORK/schema.sql" > "$WORK/schema.log" 2>&1 || true
 OTHER="$(grep -i '^psql:.*ERROR' "$WORK/schema.log" | grep -viE 'schema "[a-z_]+" already exists' || true)"
 if [[ -n "$OTHER" ]]; then
-  printf '%s\n' "$OTHER" | head -10 | sed 's/^/    /'
+  while IFS= read -r l; do record warn "$l"; printf '    %s\n' "$l"; done < <(printf '%s\n' "$OTHER" | head -10)
   die "unexpected errors loading schema.sql (full log: $WORK/schema.log)"
 fi
 ok "loaded (expected 'schema already exists' ignored)"
@@ -289,9 +466,17 @@ step "Applying catalog objects"
 psql "$TARGET_DB_URL" -q -f "$WORK/non-public.sql" > "$WORK/nonpublic.log" 2>&1 || true
 NPERR="$(grep -i '^psql:.*ERROR' "$WORK/nonpublic.log" | grep -vi 'already exists' || true)"
 if [[ -n "$NPERR" ]]; then
-  printf '%s\n' "$NPERR" | head -10 | sed 's/^/    /'
+  while IFS= read -r l; do record warn "$l"; printf '    %s\n' "$l"; done < <(printf '%s\n' "$NPERR" | head -10)
   warn "some catalog objects failed — review $WORK/nonpublic.log"
-  confirm "Continue?" || die "aborted"
+  if (( REQ )); then
+    # The database is already written by this point. Stopping here leaves a
+    # target that is loaded but missing triggers or buckets, which is why the
+    # request has to have said in advance which of those it would rather have.
+    (( CATALOG_OK )) || die "catalog objects failed and the request did not say to continue past that. The tables and rows are loaded; the triggers, buckets or jobs above are not."
+    warn "the request says to continue past that"
+  else
+    confirm "Continue?" || die "aborted"
+  fi
 else
   ok "extensions, triggers, policies, buckets and jobs applied"
 fi
@@ -319,24 +504,30 @@ ok "uploaded $UP object(s)"
 
 # ── 7. Verify against the archive's own manifest ───────────────────────────
 step "Verifying against the manifest"
-printf '    %-30s %9s %9s\n' "table" "archive" "restored"
+# The table is built as text first and coloured on the way out, so the console
+# gets the same rows the terminal does instead of a summary of them.
+HEAD_ROW="$(printf '%-30s %9s %9s' "table" "archive" "restored")"
+record info "$HEAD_ROW"; printf '    %s\n' "$HEAD_ROW"
 BAD=0
 while IFS=$'\t' read -r tbl want; do
   [[ "$tbl" =~ ^[a-z_]+\.[a-z_]+$ ]] || { warn "skipping odd table name: $tbl"; continue; }
   got="$(psql "$TARGET_DB_URL" -Atc "select count(*) from ${tbl}" 2>/dev/null || echo "ERR")"
+  row="$(printf '%-30s %9s %9s' "$tbl" "$want" "$got")"
   if [[ "$got" == "$want" ]]; then
-    printf '    %-30s %9s %9s  %s✓%s\n' "$tbl" "$want" "$got" "$G" "$N"
+    record ok "$row";   printf '    %s  %s✓%s\n' "$row" "$G" "$N"
   else
-    printf '    %-30s %9s %9s  %s✗%s\n' "$tbl" "$want" "$got" "$R" "$N"; BAD=1
+    record warn "$row"; printf '    %s  %s✗%s\n' "$row" "$R" "$N"; BAD=1
   fi
 done < <(jq -r '.rows | to_entries[] | "\(.key)\t\(.value)"' "$WORK/manifest.json")
 (( BAD == 0 )) || die "row counts do not match the archive"
 
 WANT_OBJ="$(jq -r '.storage_objects' "$WORK/manifest.json")"
 GOT_OBJ="$(psql "$TARGET_DB_URL" -Atc "select count(*) from storage.objects")"
-printf '    %-30s %9s %9s' "storage objects" "$WANT_OBJ" "$GOT_OBJ"
-if [[ "$WANT_OBJ" == "$GOT_OBJ" ]]; then printf '  %s✓%s\n' "$G" "$N"
-else printf '  %s✗%s\n' "$R" "$N"; die "storage object count does not match the archive"; fi
+row="$(printf '%-30s %9s %9s' "storage objects" "$WANT_OBJ" "$GOT_OBJ")"
+printf '    %s' "$row"
+if [[ "$WANT_OBJ" == "$GOT_OBJ" ]]; then record ok "$row"; printf '  %s✓%s\n' "$G" "$N"
+else printf '  %s✗%s\n' "$R" "$N"; record warn "$row"
+     die "storage object count does not match the archive"; fi
 
 step "Restore complete"
 ok "project '$DB_REF' now holds the contents of $(basename "$ARCHIVE")"
@@ -350,3 +541,6 @@ info "  · whatever points your application at this project"
 info ""
 info "Then sign in through the application and open something that reads a"
 info "storage object. Reads through a service key prove nothing about RLS."
+
+FINISHED=1
+emit ok ""
