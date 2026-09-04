@@ -68,7 +68,7 @@
   {
     "name": "Supabase Backup Console",
     "file": "supabase-backup-web-setup.sh",
-    "description": "Web console for a supabase-backup host \u2014 archives, manifests, run history, and verify an archive against its own checksums.",
+    "description": "Web console for a supabase-backup host \u2014 archives, run history, verify, free-space forecast, encryption recipients, its own settings, and optionally restores.",
     "requires_root": true
   }
 ]
