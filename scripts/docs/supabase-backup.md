@@ -36,6 +36,10 @@ itself, and the tool asks it rather than trusting a file written months ago.
 | `SHA256SUMS` | Checksums for everything above |
 | `filelist.txt` | Every storage object path captured |
 
+Encrypted, the whole tarball becomes `<project>-<stamp>.tar.gz.age` and gains a
+plaintext sidecar, `<project>-<stamp>.meta.json`, holding the ciphertext's
+digest and the manifest — see [Encryption](#encryption).
+
 ### What `pg_dump` cannot see
 
 `pg_dump --schema=public` is blind to anything outside the schemas you name,
@@ -92,14 +96,115 @@ Archives are written under a temporary name and renamed into place. Rename is
 atomic within a filesystem, so a snapshot taken mid-run captures a whole
 archive or none of it, never a truncated one that still looks valid.
 
+## Encryption
+
+Archives can be encrypted with [age](https://age-encryption.org), to a public
+key whose private half never comes near this host.
+
+Give a project one or more recipients and every archive from then on is written
+as `<project>-<stamp>.tar.gz.age`:
+
+```
+/etc/supabase-backup-keys/<project>.recipients
+```
+
+One recipient per line — an `age1…` public key, or a line from an SSH `.pub`
+file. Blank lines and `#` comments are ignored. That file existing and being
+non-empty is the **only** switch. There is no second copy of the setting to
+drift away from what the nightly run will actually do, and no state to
+reconcile. Removing the file turns encryption off — though not silently, if the
+project already has encrypted archives; see
+[It will not quietly stop encrypting](#it-will-not-quietly-stop-encrypting).
+
+Set it up with `supabase-backup-setup.sh` when adding a project, from the web
+console, or by writing the file yourself.
+
+### The host gets the key that locks, not the one that opens
+
+`age` is asked to encrypt **to a recipient**, not with a passphrase. The
+distinction is the whole point. A passphrase would have to live on this host to
+run unattended, which would put the key next to the ciphertext and buy nothing.
+A recipient is a public key: it encrypts, and it cannot decrypt.
+
+So nothing here can read back what it just wrote, including this tool, the web
+console, and anyone who takes the disk. Generate the key where you keep
+secrets — not here:
+
+```bash
+age-keygen -o backup.key      # public key to paste in, private key to keep
+```
+
+**A lost key is a lost archive.** There is no recovery path and none can be
+added afterwards. Give a project two or three recipients so a single lost key
+is survivable.
+
+### What this protects, and what it does not
+
+It protects every archive that leaves this host or outlives it: a copy taken
+offsite, a stolen or discarded disk, years of retained archives that stay
+unreadable even to someone who compromises the host later.
+
+It does **not** protect the project. To take a backup at all, this host must
+hold a database password and a service key that bypasses RLS, in
+`/etc/supabase-backup/<project>.conf`. Anyone who reaches those can read the
+live project without touching an archive. Encryption at rest cannot fix that,
+and no scheme that runs unattended can.
+
+Two smaller exposures, stated plainly:
+
+- **During a run** the backup exists in the clear, in
+  `/var/backups/supabase/<project>/.work-<stamp>`, until it is tarred and
+  encrypted. That directory is created `0700`, so nothing but root can enter
+  it, and it is removed when the run ends.
+- **The sidecar is plaintext.** `<project>-<stamp>.meta.json` carries the
+  ciphertext's SHA-256 and the manifest — schema names, bucket names, per-table
+  row counts. That is what lets the console inventory an archive and check it
+  for damage without a key. Set `SIDECAR_MANIFEST=0` to withhold the manifest;
+  the digest stays, because without it nothing can tell a damaged archive from
+  a good one.
+
+### It will not quietly stop encrypting
+
+A recipients file that goes missing looks exactly like one that was never
+there. So if a project has encrypted archives on disk and no recipients
+configured, the run **fails** rather than writing a plaintext archive beside
+them. Set `ALLOW_PLAINTEXT=1` in the project's `.conf` to say the downgrade is
+deliberate — which is what turning encryption off from the console does for
+you.
+
+### Restoring one
+
+`supabase-restore` lists encrypted archives with `needs a key` and asks for the
+identity: a path to an identity file, or a pasted `AGE-SECRET-KEY-…`, which is
+handed to `age` through a process substitution and never written to disk.
+Before decrypting, the ciphertext is checked against the digest its own run
+recorded — otherwise a damaged archive arrives as "could not decrypt", which
+reads like the wrong key and sends you looking for a better one that does not
+exist.
+
+A restore asked for from the web console is refused for an encrypted archive.
+The console holds no identity, by design, so there is nowhere it could have got
+one; run `supabase-restore` at the terminal instead.
+
+```bash
+age -d -i backup.key <archive>.tar.gz.age | tar xz -C /tmp/restore   # by hand
+```
+
 ## Layout
 
 ```
 /opt/supabase-backup/           backup.sh, catalog.sql
 /etc/supabase-backup/<p>.conf   credentials, 0600, one per project
+/etc/supabase-backup-keys/      age recipients, 0644, public keys only
+  <p>.recipients
 /var/backups/supabase/<p>/      archives, 0700
 /etc/systemd/system/supabase-backup@.{service,timer}
 ```
+
+The two `/etc` directories are separate because their audiences are. One holds
+a service key and is readable by root alone; the other holds public keys, which
+are not secret and which the web console has to read to show what a project
+encrypts to.
 
 ## Operating
 
@@ -134,6 +239,8 @@ with whatever punctuation ends up in a database password.
 | `BACKUP_DIR` | `/var/backups/supabase/<project>` | Where archives go |
 | `KEEP_DAYS` | `30` | Prune older archives; `0` disables |
 | `PLATFORM_SCHEMAS` | Supabase's own | Schemas treated as platform-owned |
+| `ALLOW_PLAINTEXT` | unset | Permit a plaintext archive beside encrypted ones |
+| `SIDECAR_MANIFEST` | `1` | Publish the manifest beside an encrypted archive |
 
 Use the **session** pooler (5432). Transaction mode (6543) does not hold a
 session across statements and `pg_dump` fails partway. Percent-encode a

@@ -243,6 +243,16 @@ making `age` itself accept it, and only then replaces the file. `age1…` public
 keys and `ssh-ed25519`/`ssh-rsa` public keys are both accepted. Nothing in the
 request is a secret, so unlike a registration it is not shredded.
 
+**The console will not generate a key for you**, and this is not an omission.
+A key generated here would have existed, for a moment, on the backup host — in
+a spool file, in a result the console polls, possibly in the journal — which is
+precisely where the design says it must never be. It takes public keys and
+nothing else. Make the key where you keep secrets:
+
+```bash
+age-keygen -o backup.key    # public key to paste in, private key to keep
+```
+
 Requires the `age` binary on the host; the setup script installs it, and says
 so if it could not.
 
@@ -277,6 +287,26 @@ What it cannot check is whether the archive matches the project. Only the run
 that wrote it could, and it does: `backup.sh` compares its storage walk against
 `storage.objects` and refuses to finalise an archive that disagrees.
 Verification here is about damage since then. It is also not a restore test.
+
+### On an encrypted archive it checks something narrower
+
+Every one of those four checks reads files inside the tarball, and on a
+`.tar.gz.age` the tarball is ciphertext. So the button says **Check for
+damage**, and what it compares is the file against the SHA-256 the run recorded
+of exactly these bytes, in the sidecar. It also checks the file still begins
+like an age file, which is what a truncated copy or a mislabelled plaintext
+archive looks like.
+
+That is narrower than the plaintext check and is worth being exact about: it
+proves the archive on disk is bit-for-bit what was written, which is what
+catches a disk that rotted, a copy that truncated, a file that changed. It
+proves nothing about the contents. Nothing here can open them.
+
+The contents were not left unchecked, though — they were checked by the run
+that wrote them, against `storage.objects`, before any of it was encrypted.
+
+If the sidecar is missing, the console says so rather than passing: without it
+there is nothing to compare against, and the archive may be perfectly good.
 
 ## When the disk fills
 
