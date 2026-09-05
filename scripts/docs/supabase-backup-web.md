@@ -88,6 +88,14 @@ Loopback covers both supported paths — a TLS proxy on this host forwarding to
 ssh -N -L 8787:127.0.0.1:8787 root@<host>   # then http://localhost:8787
 ```
 
+**The tunnel needs `AllowTcpForwarding yes` on the host's sshd, which hardened
+hosts often turn off** — `lxc-hardening.sh` and `ubuntu-server-hardening.sh`
+both do. Check with `sshd -T | grep allowtcpforwarding`. When it is `no` the
+tunnel fails silently: `ssh -L` still opens the local port, connections through
+it are simply closed, and the console logs nothing at all because no request
+ever arrives. On such a host use a TLS proxy and `WEB_TRUSTED_PROXIES` instead;
+that is the supported route, not a workaround.
+
 A proxy on a *different* host must be named in `WEB_TRUSTED_PROXIES` and must
 send `X-Forwarded-Proto: https`. That header is ignored from any other client,
 so it cannot be used to talk your way past the check.
@@ -314,11 +322,35 @@ the network, and you reach it over a tunnel:
 ssh -N -L 8787:127.0.0.1:8787 root@<host>     # then http://localhost:8787
 ```
 
+That assumes the host permits TCP forwarding; see the warning under
+[Registering a project](#it-will-not-do-this-over-plain-http) if it does not.
+
 The alternative is `0.0.0.0:8787`, browsable directly at `http://<host>:8787`.
 Basic auth over plain HTTP means the password crosses the network in the clear
 on every request. On a trusted LAN that may be a fair trade; make it knowingly,
 and put a TLS-terminating reverse proxy in front if anything less trusted
 shares the network. Switching later is one line in `web.env` and a restart.
+
+### Closing the plain-HTTP port
+
+With a proxy in front, the console's own port is still open to the whole
+network, and reaching it directly bypasses the TLS you just put there. Limit it
+to the proxy and to loopback:
+
+```sh
+nft add rule inet filter input tcp dport 8787 iif lo accept
+nft add rule inet filter input tcp dport 8787 ip saddr <proxy-address> accept
+nft add rule inet filter input tcp dport 8787 reject with tcp reset
+```
+
+Use the address the proxy *connects from*, which is not necessarily the one it
+listens on — a multi-homed proxy differs in both, and the wrong one fails
+closed with no clue why. The console's own log tells you: a proxied request
+appears as `<client> via <proxy>/<scheme>`.
+
+Nothing else is filtered; every chain keeps its accept policy, so this is a lock
+on one port rather than a firewall. Put the same three rules in
+`/etc/nftables.conf` to survive a reboot, and check with `nft -c -f` first.
 
 There is no TLS in the server itself, on purpose — a certificate to renew is
 exactly the kind of thing that quietly expires on a host nobody logs into.
@@ -411,7 +443,9 @@ tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value supabase-backup-web)/en
 
 **The "Add a project" form is replaced by a notice.** You are connected over
 plain HTTP from the network, and registering sends a service key. Reach the
-console through the TLS proxy on this host or over an SSH tunnel.
+console through the TLS proxy on this host or over an SSH tunnel. If the tunnel
+opens but nothing reaches the console, check `sshd -T | grep allowtcpforwarding`
+on the host — hardened hosts disable it.
 
 **A registration stays "applying…" forever.** The helper is not running. Check
 `systemctl status supabase-backup-register.path` — it must be enabled and
