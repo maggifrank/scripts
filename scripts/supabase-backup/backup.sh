@@ -87,7 +87,17 @@ trap cleanup EXIT INT TERM
 
 psql_q() { psql "$DATABASE_URL" -Atq -v ON_ERROR_STOP=1 -c "$1"; }
 
-mkdir -p "$WORK/files"
+# The working copy is the backup with nothing done to it yet: schema.sql holds
+# every row, auth.sql every password hash, files/ every stored object. It lives
+# for the length of the run inside a directory the console's user can list, and
+# root's usual umask would make it 0755 - so an encrypted archive would be
+# written by a process that had just left the whole of it readable next door.
+#
+# A umask in a subshell rather than a chmod after the fact: chmod leaves the
+# directory traversable for the instant between the two calls, and a umask here
+# would otherwise follow the script down to the archive itself, which has to
+# stay group-readable for the console to verify it.
+(umask 077; mkdir -p "$WORK/files")
 log "backup ${NAME} starting"
 
 # ── 0. Encryption preflight ────────────────────────────────────────────────
