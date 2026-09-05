@@ -76,5 +76,16 @@ from storage.buckets order by id;
 \echo '-- ── Scheduled jobs (pg_cron) ──'
 -- Captured as they actually are, which is not necessarily as any migration
 -- file claims. Reconciling the two is the operator''s job, not the backup''s.
+--
+-- pg_cron is an extension a project may never have enabled, and an absent
+-- cron.job is an ordinary fact about the source database, not a broken backup.
+-- The catalog has to be asked before the table is named: a plain
+-- `from cron.job` fails while the statement is being parsed, which is before
+-- any WHERE clause it could carry gets a chance to run.
+select (pg_catalog.to_regclass('cron.job') is not null)::text as has_cron \gset
+\if :has_cron
 select format('select cron.schedule(%L, %L, %L);', jobname, schedule, command)
 from cron.job order by jobname;
+\else
+\echo '-- pg_cron is not installed here; this database has no scheduled jobs.'
+\endif

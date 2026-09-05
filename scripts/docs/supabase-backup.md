@@ -50,7 +50,9 @@ is generated from the catalog on every run:
 - **Policies on `auth` and `storage` tables** — reconstructed from `pg_policy`
 - **Bucket definitions** — from `storage.buckets`
 - **Scheduled jobs** — from `cron.job`, exactly as they are, which is not
-  necessarily as any migration file claims
+  necessarily as any migration file claims. Projects that never enabled
+  `pg_cron` have no `cron.job` at all; the section then says so and the run
+  carries on, since a missing optional extension is not a failed backup.
 
 Supabase's own objects are excluded, since they exist in every project already.
 The rule for triggers is *"app-owned means the function lives in a user
