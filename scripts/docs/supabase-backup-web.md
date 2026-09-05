@@ -211,6 +211,13 @@ backup source is refused there, whatever the request said.
 A restore request carries the target's database password and service key, so
 like registration it is refused over plain HTTP from the network.
 
+**An encrypted archive cannot be restored from here at all.** Opening one needs
+the age identity, and that is kept off this host on purpose — there is nothing
+the console could ask for that would make it possible. So the button is not
+offered on a `.tar.gz.age`, the reason is shown in its place, and a request
+naming one is refused on both sides rather than failing halfway through.
+`supabase-restore` at the terminal will ask for the key and restore it.
+
 ## Encrypting the archives
 
 A project with an age recipients file gets its tarball encrypted to those

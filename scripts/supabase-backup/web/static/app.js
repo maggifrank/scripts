@@ -747,7 +747,14 @@ async function fillArchive(body, project, archive) {
   // archive is being written into a live project is not a thing to select from
   // a list a second time and get wrong.
   const restoreHost = el("div");
-  if (capabilities.restore) {
+  if (capabilities.restore && archive.encrypted) {
+    // Not a button that fails: the identity that opens this is deliberately
+    // not on the host, so there is nothing the console could ask for that
+    // would make the restore possible from here.
+    actions.append(el("span", "bar-msg",
+      "Encrypted — restoring it needs the age identity, which is kept off this host. " +
+      "Run supabase-restore at the terminal and supply the key there."));
+  } else if (capabilities.restore) {
     const toggle = el("button", "btn-ghost", "Restore this archive…");
     toggle.addEventListener("click", () => {
       const open = !restoreHost.firstChild;

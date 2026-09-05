@@ -1348,6 +1348,14 @@ def validate_restore(project, archive, body):
     if not isinstance(body, dict):
         return None, "expected a JSON object"
 
+    # The helper refuses this too, and has to - it is the side that cannot be
+    # talked out of anything. Saying it here as well saves a round trip that
+    # could only ever end one way, and says it while the form is still open.
+    if archive.endswith(".age"):
+        return None, (f"{archive} is encrypted. Opening it needs the age identity, which is "
+                      "kept off this host on purpose and so cannot travel in a request. Run "
+                      "supabase-restore at the terminal and supply the key there.")
+
     database_url = (body.get("database_url") or "").strip()
     if not database_url.startswith(("postgresql://", "postgres://")):
         return None, "the target's session pooler URI must be a postgresql:// URI"
