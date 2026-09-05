@@ -10,6 +10,12 @@
 #   supabase-restore --request FILE   apply one restore request from the console
 #   supabase-restore --drain    apply every request the console has left
 #
+# An archive ending .age is encrypted to an age recipient. The identity that
+# opens it is deliberately not kept on this host, so restoring one asks for the
+# key and only a person at the terminal can answer - a console request naming
+# an encrypted archive is refused, because there is nowhere it could have got
+# the key from.
+#
 # The last two are how the web console asks for a restore. It has no privilege
 # and holds no credentials, so it writes a request into a spool directory and
 # this runs as root from a .path unit. Nothing in that file is trusted: every
@@ -36,6 +42,11 @@ RES_DIR="${SPOOL_DIR}/results"
 WEB_USER="${WEB_USER:-supabase-backup-web}"
 RESTORE_UNIT="${RESTORE_UNIT:-supabase-backup-restore}"
 WORK=""
+# Set once the archive is known. cleanup() reads both, and cleanup can run
+# before anything has been chosen - or after a decryption that failed, which is
+# why what was decrypted is tracked separately from what was encrypted.
+ENCRYPTED=0
+DECRYPTED=0
 
 # Set only under --request: a console is watching a result file, and every line
 # printed below is also a line it shows.
@@ -118,7 +129,13 @@ cleanup() {
     [[ -n "$WORK" && -d "$WORK" ]] && rm -rf "$WORK"
     return 0
   fi
-  [[ -n "$WORK" && -d "$WORK" ]] && printf '\n%sExtracted archive left at %s%s\n' "$D" "$WORK" "$N"
+  if [[ -n "$WORK" && -d "$WORK" ]]; then
+    printf '\n%sExtracted archive left at %s%s\n' "$D" "$WORK" "$N"
+    # Leaving it is still right - the column-by-column fallback needs it - but
+    # not quietly. This is the decrypted contents of an encrypted archive, in
+    # /tmp, on the host the encryption exists to keep it off.
+    (( DECRYPTED )) && printf '%s!%s That is the decrypted contents of an encrypted archive. Remove it when you are done:\n      rm -rf %s\n' "$Y" "$N" "$WORK"
+  fi
   return 0
 }
 trap cleanup EXIT
@@ -127,8 +144,8 @@ DRY_RUN=0; RESET=0; REQUEST=""
 case "${1:-}" in
   --dry-run) DRY_RUN=1 ;;
   --reset)   RESET=1 ;;
-  --list)    find "$DATA_DIR" -name '*.tar.gz' -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | sort -r || echo "no archives under $DATA_DIR"; exit 0 ;;
-  --help|-h) sed -n '2,27p' "$0" | sed 's/^# \?//'; exit 0 ;;
+  --list)    find "$DATA_DIR" \( -name '*.tar.gz' -o -name '*.tar.gz.age' \) -printf '%TY-%Tm-%Td %TH:%TM  %10s  %p\n' 2>/dev/null | sort -r || echo "no archives under $DATA_DIR"; exit 0 ;;
+  --help|-h) sed -n '2,33p' "$0" | sed 's/^# \?//'; exit 0 ;;
   --request) REQUEST="${2:-}"; [[ -n "$REQUEST" ]] || die "--request needs a file" ;;
   # One process per request: this script is a straight line that ends in an
   # exit, so a loop inside it could not run a second one after the first died.
@@ -157,6 +174,64 @@ ask_secret() {
 }
 confirm() { local r; read -rp "    $1 [y/N]: " r; [[ "$r" == y || "$r" == Y ]]; }
 ref_of()  { sed -E 's|.*://(postgres\.)?([a-z0-9]+)[.:/].*|\2|; s|/+$||' <<<"$1"; }
+
+# ── Opening an encrypted archive ───────────────────────────────────────────
+# There is no key here to find. backup.sh encrypts to a recipient rather than a
+# passphrase precisely so that a host holding every archive holds nothing that
+# opens one, which means the identity has to arrive from wherever it was kept.
+#
+# The ciphertext is checked against the digest its own run recorded before age
+# is asked to read it. A damaged archive would otherwise surface as "could not
+# decrypt", which reads like the wrong key and sends someone hunting for a
+# better one that does not exist.
+decrypt_into() {
+  local dest="$1" meta want sum choice idfile key r
+  local -a recipients=()
+
+  command -v age >/dev/null \
+    || die "this archive is encrypted and age is not installed. apt-get install age"
+
+  meta="${ARCHIVE%.tar.gz.age}.meta.json"
+  if [[ -f "$meta" ]]; then
+    want="$(jq -r '.sha256 // empty' "$meta")"
+    if [[ -n "$want" ]]; then
+      sum="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+      [[ "$sum" == "$want" ]] || die "this archive is not the bytes that were written: sha256 is ${sum:0:12}…, the run recorded ${want:0:12}…. It is damaged - use an older one."
+      ok "ciphertext matches the digest its run recorded"
+    fi
+    mapfile -t recipients < <(jq -r '.encryption.recipients // [] | .[]' "$meta")
+  else
+    warn "no sidecar beside this archive, so its bytes cannot be checked before decrypting"
+  fi
+
+  if (( ${#recipients[@]} )); then
+    info ""
+    info "Encrypted to:"
+    for r in "${recipients[@]}"; do info "  $r"; done
+  fi
+  info ""
+  info "The matching private key is not on this host, by design. Supply one:"
+  info "  1) a path to an identity file — an age key, or an SSH private key"
+  info "  2) paste an age identity (AGE-SECRET-KEY-…)"
+  read -rp "    Choice [1]: " choice
+
+  if [[ "${choice:-1}" == "2" ]]; then
+    ask_secret "Identity" key
+    # A process substitution, not a temp file: the key exists as a pipe for the
+    # length of one command and is never written to the disk being restored
+    # from - which, on this host, is the disk the archive is on.
+    age -d -i <(printf '%s\n' "$key") "$ARCHIVE" | tar xz -C "$dest" \
+      || die "could not decrypt. Either that is not one of the identities above, or the archive is damaged."
+    key=""
+  else
+    ask "Path to the identity file" idfile
+    [[ -f "$idfile" ]] || die "no such file: ${idfile}"
+    age -d -i "$idfile" "$ARCHIVE" | tar xz -C "$dest" \
+      || die "could not decrypt with ${idfile}. Either it is not one of the identities above, or the archive is damaged."
+  fi
+  DECRYPTED=1
+  ok "decrypted"
+}
 
 # ── Load a console request, if this is one ─────────────────────────────────
 if [[ -n "$REQUEST" ]]; then
@@ -190,8 +265,15 @@ if [[ -n "$REQUEST" ]]; then
   # against a fixed shape and the result has to be a file that already exists
   # under DATA_DIR, so no part of a request reaches the filesystem unchecked.
   [[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid project name"
-  [[ "$ARCHIVE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*-[0-9]{8}T[0-9]{6}Z\.tar\.gz$ ]] \
+  [[ "$ARCHIVE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*-[0-9]{8}T[0-9]{6}Z\.tar\.gz(\.age)?$ ]] \
     || die "not an archive name: ${ARCHIVE_NAME}"
+  # Matched, then refused - deliberately in that order. Falling out of the shape
+  # check would tell the console the name is malformed, which is not true and
+  # sends whoever asked looking for a typo. The name is fine; the thing it names
+  # cannot be opened from here, and that is worth saying in those words.
+  if [[ "$ARCHIVE_NAME" == *.age ]]; then
+    die "${ARCHIVE_NAME} is encrypted. Opening it needs the age identity, which is kept off this host on purpose and so cannot travel in a request. Run supabase-restore at the terminal and supply the key there."
+  fi
   [[ "$ARCHIVE_NAME" == "${PROJECT}-"* ]] \
     || die "archive '${ARCHIVE_NAME}' does not belong to project '${PROJECT}'"
   ARCHIVE="${DATA_DIR}/${PROJECT}/${ARCHIVE_NAME}"
@@ -216,11 +298,14 @@ else
     ok "using ${ARCHIVE_NAME}, named in the request"
   else
     step "Choose an archive"
-    mapfile -t ARCHIVES < <(find "$DATA_DIR" -name '*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+    mapfile -t ARCHIVES < <(find "$DATA_DIR" \( -name '*.tar.gz' -o -name '*.tar.gz.age' \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
     (( ${#ARCHIVES[@]} )) || die "no archives found under $DATA_DIR"
     for i in "${!ARCHIVES[@]}"; do
-      printf '    %2d) %-46s %s%s%s\n' "$((i+1))" "$(basename "${ARCHIVES[$i]}")" \
-        "$D" "$(du -h "${ARCHIVES[$i]}" | cut -f1)" "$N"
+      # Marked in the list, not discovered after choosing: needing a key you do
+      # not have to hand is worth knowing before you pick the archive.
+      lock=""; [[ "${ARCHIVES[$i]}" == *.age ]] && lock="  ${Y}needs a key${N}"
+      printf '    %2d) %-46s %s%s%s%s\n' "$((i+1))" "$(basename "${ARCHIVES[$i]}")" \
+        "$D" "$(du -h "${ARCHIVES[$i]}" | cut -f1)" "$N" "$lock"
       (( i >= 14 )) && break
     done
     read -rp "    Number [1 = newest]: " CHOICE
@@ -229,9 +314,15 @@ else
     ok "using $(basename "$ARCHIVE")"
   fi
 
+  [[ "$ARCHIVE" == *.age ]] && ENCRYPTED=1
+
   step "Extract and verify"
   WORK="$(mktemp -d /tmp/supabase-restore-XXXXXX)"
-  tar xzf "$ARCHIVE" -C "$WORK"
+  if (( ENCRYPTED )); then
+    decrypt_into "$WORK"
+  else
+    tar xzf "$ARCHIVE" -C "$WORK"
+  fi
   ( cd "$WORK" && sha256sum -c SHA256SUMS --quiet ) \
     || die "checksum mismatch — this archive is damaged, use an older one"
   ok "checksums verify"
