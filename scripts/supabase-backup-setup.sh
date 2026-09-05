@@ -18,6 +18,11 @@ RAW_BASE="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRAN
 
 LIB_DIR="/opt/supabase-backup"
 CONF_DIR="/etc/supabase-backup"
+# Public keys only, and separate from CONF_DIR on purpose: that one holds a
+# service key and is readable by root alone, while these are age recipients -
+# not secret, and the web console has to read them to show what a project
+# encrypts to.
+KEYS_DIR="/etc/supabase-backup-keys"
 DATA_DIR="/var/backups/supabase"
 UNIT_DIR="/etc/systemd/system"
 
@@ -69,7 +74,19 @@ if [ ${#MISSING[@]} -gt 0 ]; then
   apt-get update -qq
   apt-get install -y -qq "${MISSING[@]}" || error "dependency install failed"
 fi
+
+# Not in MISSING: a host that never sets a recipient never calls age, so an
+# unpackaged one is not a failed install - it only means the offer below is not
+# made. Debian 12 and Ubuntu 22.04 both carry it.
+if ! command -v age >/dev/null; then
+  apt-get install -y -qq age >/dev/null 2>&1 || true
+fi
 info "pg_dump $(pg_dump --version | awk '{print $3}')"
+if command -v age >/dev/null; then
+  info "age $(age --version 2>/dev/null | head -1)"
+else
+  warn "age is not available here - archives can only be written in the clear"
+fi
 
 # ── Install the tool ──────────────────────────────────────────────────────────
 step "Installing to ${LIB_DIR}"
@@ -170,6 +187,88 @@ if [ "$CLIENT_MAJOR" -lt "$SERVER_MAJOR" ]; then
   warn "Install a matching client from the PGDG repository:"
   warn "  https://www.postgresql.org/download/linux/debian/"
   error "refusing to schedule a backup that cannot run"
+fi
+
+# ── Encryption ────────────────────────────────────────────────────────────────
+# Asked after the connection check, so nobody is invited to think about keys for
+# a project that turns out to be unreachable. Asked before the first run, so
+# that if the answer is yes there is never an unencrypted archive on disk for
+# this project at all.
+step "Encryption"
+
+if ! command -v age >/dev/null; then
+  warn "age is not installed, so archives will be written in the clear."
+  warn "Install it and re-run this script to turn encryption on later."
+else
+cat <<'EOF'
+
+  Archives can be encrypted to an age public key. The private half never comes
+  here: this host gets the key that locks, not the one that opens. A stolen
+  disk, a copy taken offsite, or this machine itself in the wrong hands then
+  yields nothing readable.
+
+  The other side of that is real. A lost key is a lost archive - there is no
+  recovery path, and nobody can add one afterwards.
+
+  It does not protect the project itself. This host has to hold a database
+  password and a service key to take a backup at all, and anyone who reaches
+  those can read the live project without touching an archive. What encryption
+  protects is every archive that outlives this host or leaves it.
+
+  Make the key where you keep secrets - your laptop, a password manager - not
+  here:
+
+      age-keygen -o backup.key
+
+  That prints a public key (age1...) to paste in below, and a private key to
+  put somewhere you will still have it in two years. A line from an SSH .pub
+  file works too, if you already keep one safely.
+
+EOF
+  read -rp "Encrypt archives for '${PROJECT}'? [y/N]: " ENC_ANSWER
+  if [[ "$ENC_ANSWER" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "  Paste one recipient per line. More than one means any of them can"
+    echo "  restore, which is how a single lost key stops being fatal."
+    echo "  Empty line when done."
+    echo ""
+    RECIPIENTS=()
+    while :; do
+      read -rp "  recipient: " LINE
+      [ -z "$LINE" ] && break
+      RECIPIENTS+=("$LINE")
+    done
+
+    if [ ${#RECIPIENTS[@]} -eq 0 ]; then
+      warn "no recipients given - archives will be written in the clear"
+    else
+      install -d -m 0755 "$KEYS_DIR"
+      TMP_REC="$(mktemp "${KEYS_DIR}/.${PROJECT}.XXXXXX")"
+      {
+        printf '# age recipients for supabase-backup project %s\n' "$PROJECT"
+        printf '# Written by supabase-backup-setup.sh on %s. Public keys only:\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf '# the identity that opens these archives is deliberately not on this host.\n'
+        printf '%s\n' "${RECIPIENTS[@]}"
+      } > "$TMP_REC"
+
+      # age is the authority on what age accepts. A list this script liked and
+      # age does not would be discovered at 03:20, by a backup that does not
+      # happen - so it is made to accept them here, while someone is watching.
+      if printf '' | age -R "$TMP_REC" >/dev/null 2>&1; then
+        chmod 0644 "$TMP_REC"
+        mv -f "$TMP_REC" "${KEYS_DIR}/${PROJECT}.recipients"
+        info "${#RECIPIENTS[@]} recipient(s) written to ${KEYS_DIR}/${PROJECT}.recipients"
+        info "archives for '${PROJECT}' will be written as .tar.gz.age from now on"
+        warn "this host cannot read them back - keep the private key safe"
+      else
+        printf '' | age -R "$TMP_REC" 2>&1 | sed 's/^/  /' || true
+        rm -f "$TMP_REC"
+        error "age rejected those recipients (see above) - nothing was written"
+      fi
+    fi
+  else
+    info "archives will be written in the clear"
+  fi
 fi
 
 # ── First run ─────────────────────────────────────────────────────────────────
