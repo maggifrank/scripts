@@ -212,7 +212,17 @@ for b in $BUCKETS; do
   # The database is the authoritative inventory. Comparing the walk against
   # storage.objects is what catches a walk that skipped a subtree - the walk's
   # own output cannot reveal what it never looked at.
-  psql_q "select name from storage.objects where bucket_id = '${b}' order by name" \
+  #
+  # Both sides have to leave out the same things. The dashboard represents an
+  # empty folder by storing a literal .emptyFolderPlaceholder object, which the
+  # walk drops above because nobody uploaded it. It is still a row here, so
+  # counting it on this side alone makes every empty folder look like an object
+  # the walk lost, and fails a backup that is in fact whole.
+  psql_q "select name from storage.objects
+          where bucket_id = '${b}'
+            and name <> '.emptyFolderPlaceholder'
+            and name not like '%/.emptyFolderPlaceholder'
+          order by name" \
     > "$WORK/expected" || fail "could not read storage.objects for '${b}'"
   sort -o "$WORK/found" "$WORK/found"
   sort -o "$WORK/expected" "$WORK/expected"
