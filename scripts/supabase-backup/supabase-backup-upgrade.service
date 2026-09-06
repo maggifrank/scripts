@@ -1,0 +1,39 @@
+[Unit]
+Description=Upgrade supabase-backup from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/upgrade --drain
+
+# The privileged half of the Upgrade button. It replaces code and nothing else:
+# /opt/supabase-backup, the systemd units, and the tmpfiles snippet that makes
+# the spools. It keeps what it replaced under /var/lib/supabase-backup/rollback
+# and puts it all back if the console will not start on the new code.
+#
+# It never touches /etc/supabase-backup or /etc/supabase-backup-web, and saying
+# so here means a bug cannot make it touch them: an upgrade that could rewrite
+# a config could undo a decision someone made deliberately - which password,
+# which address, whether this host acts on a restore request at all.
+#
+# The request it reads names no version and no URL. Everything it fetches is
+# fixed in the script, so a request that was tampered with on the way asks for
+# exactly what an untampered one asks for.
+# /var/lib/supabase-backup is not listed: StateDirectory= below makes it, and
+# makes it writable, before this sandbox is set up.
+ReadWritePaths=/opt/supabase-backup /etc/systemd/system /etc/tmpfiles.d -/usr/local/bin /run/supabase-backup-web
+InaccessiblePaths=-/etc/supabase-backup -/etc/supabase-backup-web
+StateDirectory=supabase-backup
+StateDirectoryMode=0700
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

@@ -1072,9 +1072,9 @@ function openSettings() {
   const dialog = $("settings-dialog");
   if (!dialog) return;
   dialog.showModal();
-  // Reloading under an in-flight save would throw away the box reporting it,
-  // and the poll writes into nodes this would have replaced.
-  if (!settingsBusy) loadSettings();
+  // Reloading under an in-flight save or upgrade would throw away the box
+  // reporting it, and the poll writes into nodes this would have replaced.
+  if (!settingsBusy && !upgradeBusy) loadSettings();
 }
 
 function closeSettings() {
@@ -1094,16 +1094,19 @@ async function loadSettings() {
     host.replaceChildren(el("div", "notice", error.message));
     return;
   }
+  // Above the form either way, and it loads on its own: what version this host
+  // runs is the first thing you look for here, and asking GitHub about it must
+  // not hold up a panel you opened to change a password.
   const settings = payload.settings || {};
   if (!payload.editable) {
     // Still worth the panel: what the console is running with is exactly what
     // you need to know before going to the host to change it.
-    host.replaceChildren(el("div", "notice", payload.blocked_because ||
+    host.replaceChildren(versionBlock(), el("div", "notice", payload.blocked_because ||
       "Settings cannot be changed from this connection."));
     host.append(settingsSummary(settings));
     return;
   }
-  host.replaceChildren(buildSettingsForm(settings));
+  host.replaceChildren(versionBlock(), buildSettingsForm(settings));
 }
 
 function settingsSummary(s) {
@@ -1118,6 +1121,7 @@ function settingsSummary(s) {
     ["downloads", s.allow_download ? "on" : "off"],
     ["add a project", s.allow_register ? "on" : "off"],
     ["settings here", s.allow_settings ? "on" : "off"],
+    ["upgrade here", s.allow_upgrade ? "on" : "off"],
     ["config file", s.config_path],
   ];
   for (const [key, value] of rows) list.append(el("dt", null, key), el("dd", null, String(value)));
@@ -1177,6 +1181,10 @@ function buildSettingsForm(s) {
     "Registering sends a service key, so it is refused over plain HTTP whatever this says."));
   form.append(settingCheckbox("Allow changing settings from here", "allow_settings", s.allow_settings,
     `Turning this off leaves ${s.config_path} on the host as the only way back.`));
+  form.append(settingCheckbox('Offer "Upgrade"', "allow_upgrade", s.allow_upgrade,
+    "The version panel above keeps saying what is running either way. With this off it " +
+    "stops offering to do anything about it, and supabase-backup-upgrade on the host is " +
+    "the way."));
 
   const bar = el("div", "bar");
   const submit = el("button", "btn", "Save settings");
@@ -1223,6 +1231,7 @@ async function saveSettings(form, submit, message, output, s) {
     allow_download: checked("allow_download"),
     allow_register: checked("allow_register"),
     allow_settings: checked("allow_settings"),
+    allow_upgrade: checked("allow_upgrade"),
   };
 
   const warnings = [];
@@ -1347,6 +1356,264 @@ function signedOutBox(output, message, submit, saved) {
   box.append(bar);
   output.append(box);
 }
+
+// ── Version, and upgrading ─────────────────────────────────────────────────
+
+// What is running here, what GitHub publishes, and a button between the two.
+// The console installs nothing: it leaves a request, a root helper downloads
+// and installs, and this polls for what it made of it - the same round trip as
+// saving settings, and it ends the same way, with the console restarting
+// underneath the page that asked.
+
+let upgradePoll = null;
+let upgradeBusy = false;            // an upgrade is in flight; do not rebuild
+
+function versionBlock() {
+  const wrap = el("div", "form version");
+  wrap.append(el("h3", null, "Version"), el("p", "empty", "Checking…"));
+  loadVersion(wrap);
+  return wrap;
+}
+
+async function loadVersion(wrap, refresh) {
+  if (refresh) {
+    wrap.replaceChildren(el("h3", null, "Version"),
+                         el("p", "empty", "Asking GitHub…"));
+  }
+  let payload;
+  try {
+    payload = await api(`/api/upgrade${refresh ? "?refresh=1" : ""}`);
+  } catch (error) {
+    wrap.replaceChildren(el("h3", null, "Version"), el("div", "notice", error.message));
+    return;
+  }
+  paintVersion(wrap, payload);
+  // An upgrade already running - started here before a reload, or from
+  // another browser. Reattach to it rather than offering to start a second.
+  const pending = (payload.activity && payload.activity.pending) || [];
+  if (pending.length && !upgradeBusy) {
+    const bar = wrap.querySelector(".bar");
+    const message = wrap.querySelector(".bar-msg");
+    const output = wrap.querySelector(".upgrade-output");
+    if (bar && message && output) {
+      for (const button of bar.querySelectorAll("button")) button.disabled = true;
+      upgradeBusy = true;
+      message.textContent = "an upgrade is already running…";
+      pollUpgrade(pending[0], wrap, message, output);
+    }
+  }
+}
+
+// One line each, in the order the question is asked: what is here, what is
+// there. The commit is shown next to the version because the version is a
+// label someone typed and the commit is not.
+function versionLine(version, commit, when, whenLabel) {
+  const parts = [version || "unknown"];
+  if (commit) parts.push(commit.slice(0, 7));
+  if (when) parts.push(`${whenLabel} ${localTime(when)}`);
+  return parts.join(" · ");
+}
+
+function paintVersion(wrap, payload) {
+  const check = payload.check || {};
+  const nodes = [el("h3", null, "Version")];
+
+  if (check.error) {
+    nodes.push(el("div", "notice", check.error));
+    wrap.replaceChildren(...nodes);
+    return;
+  }
+
+  const installed = check.installed || {};
+  const available = check.available || {};
+  const list = el("dl", "kv");
+  list.append(el("dt", null, "running"),
+              el("dd", null, versionLine(installed.version, installed.commit,
+                                         installed.installed_at, "installed")));
+  list.append(el("dt", null, "available"),
+              el("dd", null, versionLine(available.version, available.commit,
+                                         available.committed_at, "committed")));
+  if (Array.isArray(installed.components)) {
+    list.append(el("dt", null, "installed"), el("dd", null, installed.components.join(", ")));
+  }
+  if (check.repo) {
+    list.append(el("dt", null, "source"), el("dd", null, `${check.repo} · ${check.branch}`));
+  }
+  nodes.push(list);
+
+  if (check.reason) nodes.push(el("div", "hint", check.reason));
+
+  const bar = el("div", "bar");
+  const message = el("span", "bar-msg");
+  const output = el("div", "upgrade-output");
+
+  const upgrade = el("button", check.upgrade_available ? "btn" : "btn-ghost",
+                     check.upgrade_available ? "Upgrade" : "Reinstall");
+  const recheck = el("button", "btn-ghost", "Check again");
+  bar.append(upgrade, recheck, message);
+
+  if (!payload.allowed) {
+    upgrade.disabled = true;
+    nodes.push(bar, el("div", "notice", payload.blocked_because ||
+      "Upgrading is not possible from this connection."), output);
+    recheck.addEventListener("click", () => loadVersion(wrap, true));
+    wrap.replaceChildren(...nodes);
+    return;
+  }
+
+  // Installed but not watching: the helper would never see the request. It
+  // looks exactly like an upgrade that is taking a while, so say which it is
+  // before the button is pressed rather than after.
+  const activity = payload.activity || {};
+  if (activity.helper_installed && !activity.helper_watching) {
+    nodes.push(el("div", "notice",
+      `${activity.unit} is installed but supabase-backup-upgrade.path is not watching the ` +
+      "spool, so a request would sit there unread. On the host: systemctl enable --now " +
+      "supabase-backup-upgrade.path"));
+  }
+
+  upgrade.addEventListener("click",
+    () => startUpgrade(check, wrap, upgrade, recheck, message, output));
+  recheck.addEventListener("click", () => loadVersion(wrap, true));
+  nodes.push(bar, output);
+
+  const last = activity.latest;
+  if (last && last.state && last.state !== "running" && !upgradeBusy) {
+    output.append(upgradeResult(last));
+  }
+  wrap.replaceChildren(...nodes);
+}
+
+function upgradeResult(result) {
+  const ok = result.state === "ok";
+  const box = el("div", `result ${ok ? "ok" : "bad"}`);
+  box.append(el("div", null, ok
+    ? "Upgraded."
+    : `Not upgraded — ${result.error || "the host reported a failure"}`));
+  if (Array.isArray(result.steps) && result.steps.length) {
+    const ul = el("ul", "steps");
+    for (const step of result.steps) ul.append(el("li", null, step));
+    box.append(ul);
+  }
+  return box;
+}
+
+async function startUpgrade(check, wrap, upgrade, recheck, message, output) {
+  const lines = [
+    check.upgrade_available
+      ? `Upgrade supabase-backup on this host? ${check.reason}`
+      : "Reinstall the version this host is already running?",
+    "The host downloads the code from GitHub as root and installs it. Configs, " +
+    "credentials and archives are not touched, and neither is whether this host acts " +
+    "on a restore request.",
+    "The console restarts at the end, so this page goes quiet for a moment. If the new " +
+    "console will not start, everything is put back as it was.",
+  ];
+  if (!confirm(lines.join("\n\n"))) return;
+
+  upgrade.disabled = true;
+  recheck.disabled = true;
+  message.className = "bar-msg";
+  message.textContent = "asking…";
+  output.replaceChildren();
+
+  let id;
+  try {
+    ({ id } = await api("/api/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "apply" }),
+    }));
+  } catch (error) {
+    message.className = "bar-msg err";
+    message.textContent = error.message;
+    upgrade.disabled = false;
+    recheck.disabled = false;
+    return;
+  }
+  upgradeBusy = true;
+  message.textContent = "downloading and installing…";
+  pollUpgrade(id, wrap, message, output);
+}
+
+function pollUpgrade(id, wrap, message, output) {
+  clearTimeout(upgradePoll);
+  // Longer than the settings poll: this downloads a couple of dozen files
+  // before it restarts anything, and a slow host on a slow link is not a
+  // failure. The console going away in the middle is the expected case.
+  const deadline = Date.now() + 300_000;
+  const enable = () => {
+    upgradeBusy = false;
+    const bar = wrap.querySelector(".bar");
+    if (bar) for (const button of bar.querySelectorAll("button")) button.disabled = false;
+  };
+
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/upgrade/${enc(id)}`);
+    } catch (error) {
+      if (Date.now() < deadline) {
+        message.textContent = "the console is restarting…";
+        upgradePoll = setTimeout(tick, 2500);
+        return;
+      }
+      enable();
+      message.className = "bar-msg err";
+      message.textContent = "the console has not come back on this address";
+      output.replaceChildren(el("div", "result bad",
+        "On the host: systemctl status supabase-backup-web, and " +
+        "journalctl -u supabase-backup-upgrade -n 50 for what the helper did — it puts " +
+        "the previous files back if the console will not start on the new ones."));
+      return;
+    }
+
+    if (result.state === "pending" || result.state === "running") {
+      message.textContent = result.state === "running"
+        ? "downloading and installing…" : "waiting for the helper…";
+      upgradePoll = setTimeout(tick, 2000);
+      return;
+    }
+    // The gap between the helper taking the request and writing a result. Only
+    // a missing helper if it is still saying this when the time is up.
+    if (result.state === "unknown" && Date.now() < deadline) {
+      upgradePoll = setTimeout(tick, 2000);
+      return;
+    }
+    enable();
+    message.textContent = "";
+    if (result.state === "unknown") {
+      output.replaceChildren(el("div", "result bad",
+        "No result came back. The upgrade helper may not be installed — check " +
+        "systemctl status supabase-backup-upgrade.path on the host."));
+      return;
+    }
+    const box = upgradeResult(result);
+    // Repaint from the result the helper handed back rather than asking again:
+    // it checked after installing, and the console it is describing is the one
+    // that just came back up.
+    if (result.check) {
+      paintVersion(wrap, { check: result.check, activity: {}, allowed: true });
+      const fresh = wrap.querySelector(".upgrade-output");
+      if (fresh) fresh.replaceChildren(box);
+    } else {
+      output.replaceChildren(box);
+    }
+    if (result.state === "ok") {
+      const reload = el("button", "btn-ghost", "Reload the console");
+      reload.addEventListener("click", () => location.reload());
+      const actions = el("div", "body-actions");
+      actions.append(reload);
+      (wrap.querySelector(".upgrade-output") || output).append(
+        el("div", "hint",
+           "This page is still the old console's HTML and JavaScript. Reload to run what " +
+           "was just installed."),
+        actions);
+    }
+  };
+  upgradePoll = setTimeout(tick, 1500);
+}
+
 
 // ── Restoring an archive ───────────────────────────────────────────────────
 

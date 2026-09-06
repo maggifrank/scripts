@@ -4,8 +4,9 @@ A browser view of what [supabase-backup](supabase-backup.md) has actually
 produced on a host: every project, its archives and their manifests, the run
 history, the next scheduled run, and a verify that re-checks an archive against
 its own checksums and its own inventory. It can start a run, change its own
-password and settings, set who a project's archives are encrypted to, and — if
-the host was set up for it — ask for a restore.
+password and settings, set who a project's archives are encrypted to, say what
+version the host is running and upgrade it, and — if the host was set up for
+it — ask for a restore.
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
@@ -133,6 +134,7 @@ What the panel changes:
 | `WEB_ALLOW_DOWNLOAD` | allow whole archives over HTTP |
 | `WEB_ALLOW_REGISTER` | offer "Add a project" |
 | `WEB_ALLOW_SETTINGS` | offer this panel at all — turning it off is one-way from here |
+| `WEB_ALLOW_UPGRADE` | offer the Upgrade button — see [Upgrading](#upgrading) |
 
 What it does not, and why:
 
@@ -184,6 +186,155 @@ you from is a *working* address you cannot reach: switch from `0.0.0.0` to
 `127.0.0.1` while browsing from the LAN and the console comes up perfectly,
 just not for you. The panel warns before saving that one; recovering it means
 an SSH tunnel, or `web.env` on the host.
+
+## Upgrading
+
+The gear opens on a **Version** block before it opens on anything else:
+
+```
+running     1.2.0 · 7b2e004 · installed 2 Sep 2026, 03:11
+available   1.3.0 · a06014b · committed 5 Sep 2026, 10:01
+installed   core, web
+source      maggifrank/scripts · main
+```
+
+`VERSION` is a string someone typed into the repository. The commit is what
+actually decides, because a version string is only as honest as whoever
+remembered to bump it: the check asks GitHub for the last commit that touched
+`scripts/supabase-backup` and compares it with the one recorded here at install
+time. If the API cannot be reached it falls back to comparing the two `VERSION`
+strings and says that is what it did — a smaller question, answered out loud
+rather than quietly.
+
+The record is written only by something that installed the whole of what it
+describes: `upgrade` itself, and `supabase-backup-web-setup.sh`, which for this
+reason now also refreshes `backup.sh` and the template units it used to leave
+alone. `supabase-backup-setup.sh` on a host that also runs the console
+deliberately does *not* write one — it refreshes the backup tool and leaves
+`server.py` alone, so a record naming one commit would be claiming something
+about files it never touched. A record a commit behind is harmless: it says an
+upgrade is available, which is true. One ahead of the files says the opposite
+of what is true.
+
+The check needs no privilege at all — a file under `/opt` and one HTTPS
+request — so the console does it itself, by running the same `upgrade --check`
+a person runs at the terminal. One script answers "what version is this", which
+is the point: two implementations would disagree eventually, on the day it
+mattered.
+
+Installing is a different thing entirely, and goes the way everything
+privileged here goes.
+
+```
+console (unprivileged, /opt/supabase-backup is read-only to it)
+  └─ writes /run/supabase-backup-web/upgrade/<id>.json, mode 0600
+       │     one id, one verb. No version, no URL, no file list.
+  supabase-backup-upgrade.path  (DirectoryNotEmpty)
+       ▼
+supabase-backup-upgrade.service  (root, oneshot)
+  → downloads the whole payload to a staging directory first
+  → refuses to install anything that is not what it claims to be
+  → copies what is installed now to /var/lib/supabase-backup/rollback/<stamp>
+  → replaces each file with install(1), reloads systemd, restarts the console
+  → puts every file back if the console does not come up on the new code
+  → writes a result the console polls
+```
+
+A request names a verb and nothing else. There is no version to choose and no
+URL to supply — every one of those is fixed in `upgrade` itself — so a request
+that was rewritten on the way asks for exactly what an untampered one asks for.
+
+### What an upgrade replaces, and what it will not touch
+
+Code, and only code: `/opt/supabase-backup` (including the console's static
+files), the systemd units, and `/etc/tmpfiles.d/supabase-backup-web.conf`.
+
+`supabase-backup-upgrade.service` puts `/etc/supabase-backup` and
+`/etc/supabase-backup-web` behind `InaccessiblePaths=`, so it is not a promise
+about the script's behaviour — the helper cannot reach a config file even if
+some future version of it tried. An upgrade that could rewrite a config could
+undo a decision someone made deliberately: which password, which address,
+whether this host acts on a restore request at all.
+
+Two things follow from that, and both are on purpose:
+
+- **`supabase-backup-restore.path` is left exactly as it was.** Whether this
+  host acts on a restore request was answered at the setup script, and an
+  upgrade is not the place to revisit it. The other `.path` units are enabled,
+  because a release can add a spool and a `.path` unit with nothing to watch
+  never fires.
+- **`web.env` never gains or loses a key.** A release that adds a switch adds
+  it with its default; `supabase-backup-web-setup.sh` is what writes the line.
+
+### It refuses while a backup or a restore is running
+
+`systemctl list-units` is asked directly, not the console's view of it, which
+may be a page minutes old. Replacing `backup.sh` underneath a run that is
+writing a tarball is not something to do because a button was convenient.
+`supabase-backup-upgrade --force` overrides it at the terminal.
+
+Files are replaced with `install(1)` rather than `cp`, which swaps the
+directory entry for a new inode — so a `backup.sh` that *is* running keeps
+reading the file it started from, and so does `upgrade` itself, which is in its
+own payload.
+
+### If the new console will not start
+
+The same shape as the settings rollback, and it has more to put back. Before
+anything is written, every file about to be replaced is copied to
+`/var/lib/supabase-backup/rollback/<stamp>/`, and a file the release is about
+to create for the first time is recorded as absent so rolling back removes it
+rather than leaving a stray unit behind. If the copy cannot be taken, the
+upgrade stops there: installing without a way back is the one state this is all
+built to avoid.
+
+After the install the helper restarts the console and asks systemd three times
+over three seconds whether it is really running. If it is not, every file goes
+back, the console is restarted on the old code, and the panel says so. The last
+five rollbacks are kept.
+
+Two things are checked before a single file is touched, both against the
+staging copy: every shell script must start with `#!` and pass `bash -n`, and
+`server.py` must compile. A truncated download or a half-published release is
+caught there, with nothing changed.
+
+### Not over plain HTTP either
+
+The same rule as the settings panel, though nothing secret travels in an
+upgrade request. It is about what the request *causes*: root downloads and
+installs. "Someone on the network can make that happen whenever they like" is
+not a smaller problem because the request itself was boring. From a plain-HTTP
+connection the version block still says what is running — that is exactly what
+you want to know before going to the host — and the button is disabled.
+
+### The first time
+
+None of this exists on a host installed before it did: no `upgrade` script, no
+spool, no `.path` unit. Run the setup script once more the way you always
+have — it installs all of it, and it is the last time you will need to.
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/scripts/supabase-backup-web-setup.sh)"
+```
+
+From then on the gear and `supabase-backup-upgrade` do it. Until then the
+version panel says the helper is not installed rather than offering a button
+that would leave a request nothing ever reads.
+
+### At the terminal
+
+```sh
+supabase-backup-upgrade                 # say what is available, then ask
+supabase-backup-upgrade --check         # say what is available and stop
+supabase-backup-upgrade --apply         # no questions
+supabase-backup-upgrade --refresh       # ignore the six-hour cached check
+supabase-backup-upgrade --force         # even while a backup is running
+```
+
+Re-running `supabase-backup-web-setup.sh` still works and still updates the
+code. The difference is that it is an installer: it asks the questions an
+installer asks, and answering one of them differently by accident changes the
+host.
 
 ## Restoring an archive
 
@@ -271,6 +422,9 @@ so if it could not.
 - **Read a project's credentials.** It runs as its own unprivileged user, its
   own config lives in `/etc/supabase-backup-web/`, and the unit adds
   `InaccessiblePaths=/etc/supabase-backup` on top of those files' 0600 modes.
+- **Install anything.** It can say what version this host runs and ask for a
+  newer one — see [Upgrading](#upgrading). `/opt/supabase-backup` is read-only
+  to it, so the asking is all it could do even if the code tried to do more.
 
 ## What "verify" actually checks
 
@@ -410,6 +564,9 @@ exactly the kind of thing that quietly expires on a host nobody logs into.
 | `WEB_RUN_COMMAND` | `systemctl start --no-block {unit}` | How a run is started |
 | `WEB_ALLOW_REGISTER` | `1` | Offer the "Add a project" form at all |
 | `WEB_ALLOW_SETTINGS` | `1` | Offer the "Console settings" panel at all |
+| `WEB_ALLOW_UPGRADE` | `1` | Offer the Upgrade button in the version panel |
+| `WEB_UPGRADE_SCRIPT` | `/opt/supabase-backup/upgrade` | What the console runs to ask what version this is |
+| `WEB_UPGRADE_CACHE` | `<WEB_STATE_DIR>/upgrade-check.json` | Where that answer is cached, for six hours |
 | `WEB_ALLOW_RESTORE` | `0` | Offer to ask the host for a restore |
 | `WEB_ALLOW_ENCRYPTION` | `1` | Offer to set a project's age recipients |
 | `KEYS_DIR` | `/etc/supabase-backup-keys` | Where the per-project recipients files live |
@@ -431,6 +588,10 @@ already doing the authenticating, and it makes you say so.
 systemctl status supabase-backup-web
 journalctl -u supabase-backup-web -n 30
 systemctl restart supabase-backup-web        # after editing web.env
+
+supabase-backup-upgrade --check              # what is running, what is published
+supabase-backup-upgrade                      # ask, then install
+journalctl -u supabase-backup-upgrade -n 50  # what an upgrade from the console did
 ```
 
 Editing anything under `/opt/supabase-backup/web/static/` takes effect on the

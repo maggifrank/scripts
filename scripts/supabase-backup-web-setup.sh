@@ -53,6 +53,7 @@ echo "    · verify an archive against its own checksums and inventory"
 echo "    · start a run"
 echo "    · change its own password and settings, applied by a root helper"
 echo "    · set who each project's archives are encrypted to"
+echo "    · say what version this host runs, and upgrade it"
 echo ""
 echo "  Restoring is asked about below. It is off unless you turn it on, and"
 echo "  even then the console only asks: restore does the work on this host, as"
@@ -174,6 +175,44 @@ systemctl enable --now supabase-backup-keys.path >/dev/null 2>&1 \
   || error "could not enable supabase-backup-keys.path"
 info "encryption helper installed and watching the spool"
 
+# ── The upgrade helper ────────────────────────────────────────────────────────
+# The console's version panel says what this host is running and what GitHub
+# publishes. Acting on the difference means writing /opt/supabase-backup and
+# /etc/systemd/system, which the console cannot do and should not be able to.
+# Same shape as the others: it asks, root installs - and root takes nothing
+# from the request but a verb, because every URL is fixed in the script.
+step "Upgrade helper"
+# backup.sh, catalog.sql and the two template units belong to the other setup
+# script, and this one has never refreshed them - so a host kept current by
+# re-running *this* script has been carrying an old backup.sh all along. They
+# are here now, because the version recorded at the end of this script names a
+# commit, and that has to be true of the whole installation rather than of the
+# half this script used to touch.
+for f in backup.sh catalog.sql upgrade VERSION; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${LIB_DIR}/${f}" \
+    || error "could not download ${f}"
+done
+chmod 0755 "${LIB_DIR}/backup.sh" "${LIB_DIR}/upgrade"
+chmod 0644 "${LIB_DIR}/catalog.sql" "${LIB_DIR}/VERSION"
+for f in "supabase-backup@.service" "supabase-backup@.timer"; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+# An installation from before supabase-backup-setup.sh knew about any of this
+# has no upgrade command on PATH. It does now.
+ln -sf "${LIB_DIR}/upgrade" /usr/local/bin/supabase-backup-upgrade
+
+for f in supabase-backup-upgrade.path supabase-backup-upgrade.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+systemctl enable --now supabase-backup-upgrade.path >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-upgrade.path"
+info "upgrade helper installed and watching the spool"
+
 # ── The restore helper ────────────────────────────────────────────────────────
 # The same restore an operator runs by hand, reading its answers from a request
 # instead of from a terminal. Two switches, and they are not the same question:
@@ -276,6 +315,14 @@ else
   fi
 fi
 
+# A web.env written before this switch existed has no line for it, and the
+# console defaults it on - so the file and the behaviour would disagree, and
+# the Settings panel would show a box whose state is not in the file it edits.
+if ! grep -q '^WEB_ALLOW_UPGRADE=' "${WEB_CONF_DIR}/web.env"; then
+  printf '\n# Allow upgrading supabase-backup from the console.\nWEB_ALLOW_UPGRADE=1\n' \
+    >> "${WEB_CONF_DIR}/web.env"
+fi
+
 # Written whether the file is new or was kept: the question was just asked, so
 # the answer is what should be in there. An older web.env predating the switch
 # has no line to replace, and gets one.
@@ -317,6 +364,12 @@ sleep 1
 systemctl is-active --quiet supabase-backup-web.service \
   || error "the console is not running - journalctl -u supabase-backup-web -n 30"
 
+# Which commit all of this is, so the console's version panel has something to
+# compare against. Not fatal if GitHub's API cannot be reached: the record just
+# has no commit in it, and the check falls back to comparing VERSION strings.
+INSTALLED="$("${LIB_DIR}/upgrade" --record 2>/dev/null || true)"
+info "running ${INSTALLED:-an unrecorded version}"
+
 BIND="$(grep '^WEB_BIND=' "${WEB_CONF_DIR}/web.env" | cut -d= -f2-)"
 PORT="${BIND##*:}"
 HOSTIP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -334,10 +387,15 @@ echo "  Status            systemctl status supabase-backup-web"
 echo "  Registrations     journalctl -u supabase-backup-register -n 30"
 echo "  Settings changes  journalctl -u supabase-backup-reconfigure -n 30"
 echo "  Encryption keys   journalctl -u supabase-backup-keys -n 30"
+echo "  Upgrades          journalctl -u supabase-backup-upgrade -n 50"
 echo "  Restores          journalctl -u supabase-backup-restore -n 50"
 echo "  Logs              journalctl -u supabase-backup-web -n 30"
 echo "  Settings          ${WEB_CONF_DIR}/web.env"
 echo ""
 echo "  After adding a project, re-run this script so its archive directory"
 echo "  becomes readable by the console."
+echo ""
+echo "  To update the code from now on, use the console's gear icon or run"
+echo "  supabase-backup-upgrade here - it replaces code only, and asks none of"
+echo "  the questions this script just asked."
 echo ""

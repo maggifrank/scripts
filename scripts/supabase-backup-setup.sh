@@ -95,17 +95,18 @@ install -d -m 0755 "$LIB_DIR"
 install -d -m 0700 "$CONF_DIR"
 install -d -m 0700 "$DATA_DIR"
 
-for f in backup.sh catalog.sql restore; do
+for f in backup.sh catalog.sql restore upgrade VERSION; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${LIB_DIR}/${f}" \
     || error "could not download ${f} from ${RAW_BASE}"
 done
-chmod 0755 "${LIB_DIR}/backup.sh" "${LIB_DIR}/restore"
-chmod 0644 "${LIB_DIR}/catalog.sql"
+chmod 0755 "${LIB_DIR}/backup.sh" "${LIB_DIR}/restore" "${LIB_DIR}/upgrade"
+chmod 0644 "${LIB_DIR}/catalog.sql" "${LIB_DIR}/VERSION"
 
-# On PATH as supabase-restore. Note that the Proxmox LXC console starts bash
-# without /etc/profile, so /usr/local/bin can be missing from PATH there even
-# though an SSH login has it.
+# On PATH as supabase-restore and supabase-backup-upgrade. Note that the
+# Proxmox LXC console starts bash without /etc/profile, so /usr/local/bin can
+# be missing from PATH there even though an SSH login has it.
 ln -sf "${LIB_DIR}/restore" /usr/local/bin/supabase-restore
+ln -sf "${LIB_DIR}/upgrade" /usr/local/bin/supabase-backup-upgrade
 
 for f in "supabase-backup@.service" "supabase-backup@.timer"; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
@@ -113,7 +114,25 @@ for f in "supabase-backup@.service" "supabase-backup@.timer"; do
   chmod 0644 "${UNIT_DIR}/${f}"
 done
 systemctl daemon-reload
-info "tool and systemd templates installed"
+
+# Which commit this is, so `supabase-backup-upgrade` can later say whether there
+# is a newer one. Written by the one script that knows what a version is here;
+# not fatal if GitHub's API cannot be reached, the record simply has no commit
+# in it and the check falls back to comparing VERSION strings.
+#
+# Only when this script installed the whole of what the record would describe.
+# On a host that also runs the console, this script refreshes the backup tool
+# and leaves server.py and its helpers alone - so recording "this host is at
+# commit X" would claim something about files it never touched. A record that
+# is one commit behind is harmless: it says an upgrade is available, which is
+# true. One that is ahead of the files says the opposite of what is true.
+if [ -f "${LIB_DIR}/web/server.py" ]; then
+  info "tool and systemd templates installed"
+  info "the console is installed here too - run supabase-backup-upgrade to bring all of it current"
+else
+  INSTALLED="$("${LIB_DIR}/upgrade" --record 2>/dev/null || true)"
+  info "tool and systemd templates installed${INSTALLED:+ — ${INSTALLED}}"
+fi
 
 # ── Project details ───────────────────────────────────────────────────────────
 step "Add a project"
@@ -303,6 +322,7 @@ cat <<EOF
   Next run          systemctl list-timers supabase-backup@${PROJECT}.timer
   Add another       re-run this script
   Restore           supabase-restore
+  Update            supabase-backup-upgrade
 
   supabase-restore refuses to write to any project configured here, so it
   cannot overwrite the thing it backs up. Rehearse it against a throwaway

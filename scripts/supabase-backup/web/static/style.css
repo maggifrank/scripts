@@ -382,6 +382,16 @@ footer code { color: var(--text2); }
 .form > .kv { margin-bottom: 0.2rem; }
 .form input:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* The version panel shares the modal body with the settings form, and is not
+   part of it: its buttons change the host, the form's button changes a file.
+   A rule between them, and its own bar well away from Save. */
+.form.version { padding-bottom: 0.9rem; border-bottom: 1px solid var(--border); }
+.form.version .kv { margin-bottom: 0.55rem; }
+.form.version .hint { margin: 0 0 0.2rem; }
+.form.version .bar { margin-top: 0.75rem; }
+.form.version .notice { margin-top: 0.7rem; }
+.upgrade-output:empty { display: none; }
+
 /* ── Restore ── */
 /* The panel is an .item like the others, but its contents are written into it
    directly rather than through an .item-body, so the padding lives here. */

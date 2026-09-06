@@ -27,6 +27,9 @@ database password or a service key, so it must not be able to read one.
 
 It cannot write that file either. The settings page changes it the same way
 registering a project writes a config: by leaving a request for a root helper.
+Upgrading goes the same way and for a stronger reason - /opt is read-only to
+this process, so it can say what version is running and ask for a newer one,
+and root does the installing.
 
 The one thing it keeps for itself is an hourly free-space sample, under
 /var/lib/supabase-backup-web. Nothing else here needs history - health is read
@@ -132,6 +135,23 @@ FORECAST_MIN_DAYS = float(env("WEB_FORECAST_MIN_DAYS", "3"))
 KEYS_DIR         = Path(env("KEYS_DIR", "/etc/supabase-backup-keys"))
 ENCRYPTION_DIR   = SPOOL_DIR / "encryption"
 ALLOW_ENCRYPTION = env_bool("WEB_ALLOW_ENCRYPTION", True)
+
+# Upgrading. The console cannot replace the code it is running - /opt is
+# read-only to it - so this goes through the spool like everything else
+# privileged here: it asks, and supabase-backup-upgrade.service downloads and
+# installs as root. The one thing the console does for itself is the check,
+# which needs no privilege at all: `upgrade --check` reads a file under /opt
+# and asks GitHub what it publishes. Running the same script the helper runs
+# means there is one answer to "what version is this", not two.
+UPGRADE_DIR     = SPOOL_DIR / "upgrade"
+ALLOW_UPGRADE   = env_bool("WEB_ALLOW_UPGRADE", True)
+UPGRADE_SCRIPT  = Path(env("WEB_UPGRADE_SCRIPT", "/opt/supabase-backup/upgrade"))
+UPGRADE_UNIT    = env("WEB_UPGRADE_UNIT", f"{UNIT_PREFIX}-upgrade.service")
+# The check goes to the network, and the settings panel asks on every open, so
+# `upgrade` caches its answer. Its own default lives under
+# /var/lib/supabase-backup, which is root's; this process has exactly one
+# writable directory on a real disk, and this is it.
+UPGRADE_CACHE   = Path(env("WEB_UPGRADE_CACHE", str(STATE_DIR / "upgrade-check.json")))
 
 # A proxy terminating TLS on another host, trusted to speak for the client.
 TRUSTED_PROXIES = {h.strip() for h in env("WEB_TRUSTED_PROXIES", "").split(",") if h.strip()}
@@ -1512,6 +1532,7 @@ def current_settings():
         "allow_download": ALLOW_DOWNLOAD,
         "allow_register": ALLOW_REGISTER,
         "allow_settings": ALLOW_SETTINGS,
+        "allow_upgrade": ALLOW_UPGRADE,
         "anonymous": ALLOW_ANON,
         "password_set": bool(PASSWORD_HASH),
         "min_password": MIN_PASSWORD,
@@ -1604,6 +1625,7 @@ def validate_settings(body):
         "allow_download": bool(body.get("allow_download", ALLOW_DOWNLOAD)),
         "allow_register": bool(body.get("allow_register", ALLOW_REGISTER)),
         "allow_settings": bool(body.get("allow_settings", ALLOW_SETTINGS)),
+        "allow_upgrade": bool(body.get("allow_upgrade", ALLOW_UPGRADE)),
     }
     if password:
         request["password_hash"] = hash_password(password)
@@ -1628,6 +1650,130 @@ def submit_settings(request):
                               "present? Re-run supabase-backup-web-setup.sh."}
     return 202, {"id": request_id, "state": "pending",
                  "password_changed": "password_hash" in request}
+
+
+# ── Version, and upgrading ─────────────────────────────────────────────────
+
+# Two halves, and they are not the same kind of thing. Asking what version is
+# running and what version is published needs no privilege: it reads a file
+# under /opt and makes an HTTPS request. Installing it does, and goes through
+# the spool - the console never writes to /opt, and could not if it tried.
+#
+# Both halves are `upgrade`. Reimplementing the comparison here would give the
+# host two answers to "is this up to date", and the day they disagreed would be
+# the day someone needed the right one.
+
+UPGRADE_CHECK_TIMEOUT = float(env("WEB_UPGRADE_CHECK_TIMEOUT", "45"))
+
+
+def upgrade_check(refresh=False):
+    """`upgrade --check --json`, or why it could not be run.
+
+    Its own cache is what keeps this from hitting GitHub on every visit to the
+    settings panel; refresh=True is a person asking again on purpose.
+    """
+    if not UPGRADE_SCRIPT.exists():
+        return {"error": f"{UPGRADE_SCRIPT} is not installed, so this console cannot tell "
+                         "what version it is running. Re-run supabase-backup-web-setup.sh "
+                         "on the host."}
+    args = [str(UPGRADE_SCRIPT), "--check", "--json"]
+    if refresh:
+        args.append("--refresh")
+    # A named environment rather than this process's own. web.env is loaded
+    # into it - the password digest included - and there is no reason for any
+    # of that to be in the environment of something that opens a socket to
+    # GitHub. It needs a PATH and somewhere it may write its cache.
+    env_vars = {
+        "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "UPGRADE_CACHE": str(UPGRADE_CACHE),
+    }
+    try:
+        out = subprocess.run(args, capture_output=True, text=True,
+                             timeout=UPGRADE_CHECK_TIMEOUT, env=env_vars)
+    except subprocess.TimeoutExpired:
+        return {"error": "the version check timed out. Can this host reach GitHub?"}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": f"could not run {UPGRADE_SCRIPT}: {exc}"}
+    if out.returncode != 0:
+        detail = (out.stderr or out.stdout).strip() or f"exit {out.returncode}"
+        return {"error": f"the version check failed: {detail}"}
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return {"error": "the version check did not return JSON"}
+
+
+def upgrade_activity():
+    """Whether an upgrade is in flight, and what came of the last one.
+
+    The same shape as restore_activity, and for the same reason: the console
+    keeps nothing between requests, so a reloaded page can only reattach to
+    what is in the spool.
+    """
+    pending = []
+    try:
+        pending = sorted(p.stem for p in UPGRADE_DIR.iterdir()
+                         if REQUEST_ID_RE.match(p.stem))
+    except OSError:
+        pass
+
+    latest = None
+    try:
+        results = sorted(RESULT_DIR.glob("*.json"),
+                         key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    except OSError:
+        results = []
+    for path in results:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if data.get("kind") == "upgrade":
+            latest = {key: data.get(key) for key in
+                      ("id", "state", "error", "steps", "finished_at")}
+            break
+
+    props = systemctl_show(UPGRADE_UNIT, ["LoadState", "ActiveState"])
+    unit_active = bool(props) and props.get("ActiveState") in ("activating", "active")
+    watch = systemctl_show(f"{UNIT_PREFIX}-upgrade.path", ["LoadState", "ActiveState"])
+    return {
+        "running": bool(pending) or unit_active,
+        "pending": pending,
+        "latest": latest,
+        # Installed but not watching is a real state and looks exactly like a
+        # request taking a long time to start, unless the console says which.
+        "helper_installed": bool(props) and props.get("LoadState") == "loaded",
+        "helper_watching": bool(watch) and watch.get("ActiveState") == "active",
+        "unit": UPGRADE_UNIT,
+    }
+
+
+def submit_upgrade(action):
+    """Leave an upgrade request. It names one verb and nothing else.
+
+    No version, no URL, no file list: every one of those is fixed in the helper
+    script, so the worst a rewritten request can ask for is the upgrade someone
+    was already asking for. Checking is not in here either - it needs no
+    privilege, so this process does that itself and the spool means one thing.
+    """
+    if action != "apply":
+        return 400, {"error": "unknown action"}
+    if upgrade_activity()["running"]:
+        return 409, {"error": "an upgrade is already running on this host"}
+
+    request_id = secrets.token_hex(16)
+    request = {"kind": "upgrade", "action": action, "id": request_id,
+               "requested_at": iso(time.time())}
+    path = UPGRADE_DIR / f"{request_id}.json"
+    try:
+        UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(request, fh)
+    except OSError as exc:
+        return 500, {"error": f"could not write the request: {exc}. Is the spool directory "
+                              "present? Re-run supabase-backup-web-setup.sh."}
+    return 202, {"id": request_id, "action": action, "state": "pending"}
 
 
 # ── HTTP ───────────────────────────────────────────────────────────────────
@@ -1783,6 +1929,27 @@ class Handler(BaseHTTPRequestHandler):
         return self.credential_channel(
             "Changing the console password puts it on the wire, so it")
 
+    def may_upgrade(self):
+        """Whether THIS connection may ask the host to install new code.
+
+        No secret travels in an upgrade request - it names a verb and nothing
+        else, and the helper takes its URLs from its own source. The channel
+        rule is here for what the request causes rather than what it carries:
+        root downloads and installs, and "someone on the network can make that
+        happen whenever they like" is not a smaller thing than a password
+        because the request itself was boring.
+        """
+        if not ALLOW_UPGRADE:
+            return False, ("upgrading from the console is disabled (WEB_ALLOW_UPGRADE=0). "
+                           "Run supabase-backup-upgrade on the host.")
+        if not UPGRADE_DIR.is_dir():
+            return False, (f"the upgrade helper is not installed: {UPGRADE_DIR} does not "
+                           "exist, so nothing would act on the request. Re-run "
+                           "supabase-backup-web-setup.sh on the host.")
+        return self.credential_channel(
+            "Asking the host to download and install new code over a connection anyone "
+            "can rewrite is not asking, so it")
+
     def authorised(self):
         if ALLOW_ANON:
             return True
@@ -1872,6 +2039,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"settings": current_settings(),
                                             "editable": allowed,
                                             "blocked_because": why})
+            if path == "/api/upgrade":
+                # Readable on any connection, like /api/settings: what version
+                # this host runs is exactly what you need before going to it.
+                allowed, why = self.may_upgrade()
+                refresh = query.get("refresh", ["0"])[0] in ("1", "true", "yes")
+                return self.send_json(200, {"check": upgrade_check(refresh),
+                                            "activity": upgrade_activity(),
+                                            "allowed": allowed,
+                                            "blocked_because": why})
+            match = re.fullmatch(r"/api/upgrade/([^/]+)", path)
+            if match:
+                code, payload = spool_result(match.group(1), UPGRADE_DIR)
+                return self.send_json(code, payload)
             match = re.fullmatch(r"/api/settings/([^/]+)", path)
             if match:
                 code, payload = spool_result(match.group(1), SETTINGS_DIR)
@@ -1929,6 +2109,16 @@ class Handler(BaseHTTPRequestHandler):
                 if error:
                     return self.send_json(400, {"error": error})
                 code, payload = submit_settings(request)
+                return self.send_json(code, payload)
+            if path == "/api/upgrade":
+                allowed, why = self.may_upgrade()
+                if not allowed:
+                    return self.send_json(403, {"error": why})
+                body, error = self.read_json_body()
+                if error:
+                    return self.send_json(400, {"error": error})
+                action = (body or {}).get("action", "apply")
+                code, payload = submit_upgrade(action)
                 return self.send_json(code, payload)
             if path == "/api/register":
                 allowed, why = self.may_register()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for upgrade requests from the backup console
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Path]
+# The console drops an upgrade request here; this fires the root oneshot that
+# downloads the new code and installs it. The console cannot write to
+# /opt/supabase-backup or /etc/systemd/system, and cannot restart itself -
+# which is the point, and the reason this is one more spool rather than one
+# more thing the console may do.
+DirectoryNotEmpty=/run/supabase-backup-web/upgrade
+MakeDirectory=false
+
+[Install]
+WantedBy=paths.target

@@ -17,5 +17,9 @@ d /run/supabase-backup-web/encryption 0700 supabase-backup-web supabase-backup-w
 # 0700, like a registration and for the same reason - one holds the target
 # project's database password and its service key.
 d /run/supabase-backup-web/restore 0700 supabase-backup-web supabase-backup-web -
+# Upgrade requests: written by the console, applied by root. One holds an id
+# and a verb and nothing else - what gets installed is fixed in the upgrade
+# script - but only the console may leave one here.
+d /run/supabase-backup-web/upgrade 0700 supabase-backup-web supabase-backup-web -
 # Results: written by root, read by the console. No secrets.
 d /run/supabase-backup-web/results  0750 root                supabase-backup-web -

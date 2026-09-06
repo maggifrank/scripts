@@ -193,11 +193,13 @@ age -d -i backup.key <archive>.tar.gz.age | tar xz -C /tmp/restore   # by hand
 ## Layout
 
 ```
-/opt/supabase-backup/           backup.sh, catalog.sql
+/opt/supabase-backup/           backup.sh, catalog.sql, restore, upgrade
+  VERSION, installed.json       what this is, and the commit it came from
 /etc/supabase-backup/<p>.conf   credentials, 0600, one per project
 /etc/supabase-backup-keys/      age recipients, 0644, public keys only
   <p>.recipients
 /var/backups/supabase/<p>/      archives, 0700
+/var/lib/supabase-backup/       rollback/, what the last few upgrades replaced
 /etc/systemd/system/supabase-backup@.{service,timer}
 ```
 
@@ -224,6 +226,31 @@ sha256sum -c SHA256SUMS && jq . manifest.json
 
 Quote the path — with several archives present an unquoted glob makes `tar`
 treat the second match as a member name and fail confusingly.
+
+### Keeping it up to date
+
+```bash
+supabase-backup-upgrade --check     # what is running, what is published
+supabase-backup-upgrade             # say what is available, then ask
+```
+
+It replaces code and nothing else: `/opt/supabase-backup`, the systemd units,
+and the console's static files if the console is installed. No config, no
+credential, no archive, and nothing about whether this host acts on a restore
+request. What it replaces is copied to `/var/lib/supabase-backup/rollback/`
+first, and put back if the console does not come up on the new code.
+
+"Up to date" means the commit that last touched `scripts/supabase-backup` on
+`main`, recorded here at install time and compared against what GitHub reports
+now — `VERSION` is the name a human reads, the commit is what decides. It
+refuses while a backup or a restore is running; `--force` overrides that.
+
+Re-running `supabase-backup-setup.sh` also updates the code, and still works.
+The difference is that it is an installer: it asks the questions an installer
+asks, including which project to add.
+
+The console has the same thing behind its gear icon — see
+[the console's Upgrading section](supabase-backup-web.md#upgrading).
 
 ## Configuration
 
