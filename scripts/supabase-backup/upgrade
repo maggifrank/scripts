@@ -36,6 +36,26 @@ REPO_PATH="scripts/supabase-backup"
 RAW_BASE="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${BRANCH}/${REPO_PATH}"
 API_BASE="https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}"
 
+# Where a download actually comes from. A branch URL is served from a cache
+# that lags the API by minutes, and the two disagreeing is not hypothetical:
+# the API reported a commit while the branch URL was still serving the previous
+# release's VERSION and the previous release's code. Two ways that hurts, and
+# both are silent - a file list fetched half from one commit and half from the
+# next, each file passing its own checks; and "same version, new commit", which
+# is the definition of a patch, so an automatic host would install a release
+# that had deliberately bumped its version to avoid exactly that.
+#
+# A commit URL is immutable, so pinning removes both. The branch URL is only
+# the fallback for when the API could not say what the commit is.
+raw_base_at() {  # raw_base_at [sha]
+  if [ -n "${1:-}" ]; then
+    printf 'https://raw.githubusercontent.com/%s/%s/%s/%s' \
+      "$GITHUB_USER" "$GITHUB_REPO" "$1" "$REPO_PATH"
+  else
+    printf '%s' "$RAW_BASE"
+  fi
+}
+
 LIB_DIR="${LIB_DIR:-/opt/supabase-backup}"
 WEB_DIR="${LIB_DIR}/web"
 UNIT_DIR="${UNIT_DIR:-/etc/systemd/system}"
@@ -211,8 +231,9 @@ write_installed() {  # write_installed <version> <commit>
 
 # ── What is available ────────────────────────────────────────────────────────
 
-remote_version() {
-  curl -fsSL --max-time 20 "${RAW_BASE}/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]'
+remote_version() {  # remote_version [sha] - pinned when we know one
+  curl -fsSL --max-time 20 "$(raw_base_at "${1:-}")/VERSION" 2>/dev/null \
+    | head -1 | tr -d '[:space:]'
 }
 
 # Commits that touched the directory this host installs from, newest first.
@@ -288,7 +309,9 @@ check() {  # check [--refresh] -> one JSON object on stdout
 
   local inst avail_version commit_line avail_commit avail_date error=""
   inst="$(installed_json)"
-  avail_version="$(remote_version)" || true
+  # The commit first: the version is then read from that commit rather than
+  # from whatever the branch URL happens to be serving, so the two always
+  # describe the same thing.
   commit_line="$(remote_commit)" || true
   avail_commit="${commit_line%% *}"
   if [ -n "$commit_line" ] && [ "$avail_commit" != "$commit_line" ]; then
@@ -296,6 +319,7 @@ check() {  # check [--refresh] -> one JSON object on stdout
   else
     avail_date=""
   fi
+  avail_version="$(remote_version "$avail_commit")" || true
 
   local have_commit have_version
   have_commit="$(jq -r '.commit  // ""' <<<"$inst")"
@@ -420,8 +444,8 @@ busy_units() {
     | awk '{print $1}'
 }
 
-stage() {  # stage <dir> — the whole payload, or a failure having changed nothing
-  local dir="$1" entry src dest mode target err
+stage() {  # stage <dir> <base url> — the whole payload, or nothing changed
+  local dir="$1" base="$2" entry src dest mode target err
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     src="${entry%%|*}"; entry="${entry#*|}"
@@ -430,7 +454,7 @@ stage() {  # stage <dir> — the whole payload, or a failure having changed noth
     # curl's own message says which half of "could not download" it was - no
     # route, no such file, TLS - and that is the whole difference between
     # "GitHub is down" and "this release is not published yet".
-    err="$(curl -fsSL --max-time 60 "${RAW_BASE}/${src}" -o "$target" 2>&1)" \
+    err="$(curl -fsSL --max-time 60 "${base}/${src}" -o "$target" 2>&1)" \
       || { echo "could not download ${src}${err:+: ${err}}" >&2; return 1; }
     [ -s "$target" ] || { echo "${src} came back empty" >&2; return 1; }
     chmod "$mode" "$target"
@@ -519,15 +543,24 @@ apply_body() {  # apply_body <staging> <force>
     return 1
   fi
 
+  # Every file from one commit, not from a branch URL whose cache may be
+  # partway between two. Where the API could not say what the commit is there
+  # is nothing to pin to, and the note says which of the two happened.
+  local base
+  base="$(raw_base_at "${AVAILABLE_COMMIT:-}")"
+  if [ -z "${AVAILABLE_COMMIT:-}" ]; then
+    note "could not resolve a commit to pin to - downloading from ${BRANCH}, which may be served from a cache that lags"
+  fi
+
   # stdout is the plan, stderr is why it stopped. Flattened, because it ends up
   # in one line of a result box in the browser.
-  if ! problem="$(stage "$staging" 2>&1 > "$plan")"; then
+  if ! problem="$(stage "$staging" "$base" 2>&1 > "$plan")"; then
     problem="$(printf '%s' "$problem" | tr '\n' ' ')"
     APPLY_ERROR="${problem:-the download failed}. Nothing has been changed."
     note "download failed — nothing changed"
     return 1
   fi
-  note "downloaded $(wc -l < "$plan" | tr -d ' ') files from ${RAW_BASE}"
+  note "downloaded $(wc -l < "$plan" | tr -d ' ') files from ${base}"
 
   if ! problem="$(sanity "$plan")"; then
     APPLY_ERROR="${problem}. Nothing has been changed."
