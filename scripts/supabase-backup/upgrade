@@ -562,11 +562,15 @@ apply_body() {  # apply_body <staging> <force>
   # `if`, which this is, so nothing else here would notice a half-written
   # /opt — and a half-written /opt is the one state this whole design exists
   # to avoid being left in.
-  local target dest mode changed=0 broke=""
+  local target dest mode changed=0 broke="" self_replaced=0
   while IFS=$'\t' read -r target dest mode; do
     if ! install -d -m 0755 "$(dirname "$dest")"; then broke="$dest"; break; fi
     if [ -f "$dest" ] && cmp -s "$target" "$dest"; then continue; fi
     if ! install -m "$mode" "$target" "$dest"; then broke="$dest"; break; fi
+    # This script is in its own payload, and the copy running right now is the
+    # one that was here before - so the file list it is working from is the old
+    # one. Worth knowing about: see the second pass at the end.
+    [ "$dest" = "${LIB_DIR}/upgrade" ] && self_replaced=1
     changed=$((changed + 1))
   done < "$plan"
   if [ -n "$broke" ]; then
@@ -581,13 +585,15 @@ apply_body() {  # apply_body <staging> <force>
     note "${changed} file(s) replaced"
   fi
 
-  # The console's Automatic switch writes into this directory, and its helper is
-  # sandboxed out of the rest of /etc - so it cannot create it, only write into
-  # it once it exists. The setup scripts make it; an upgrade run from a terminal
-  # is the other way a host can come to have all of this, and without this line
-  # that host gets a switch that can only ever answer "could not write".
-  install -d -m 0755 "$AUTO_CONF_DIR" 2>/dev/null \
-    || note "could not create ${AUTO_CONF_DIR} - the console's Automatic switch will not be able to write"
+  # The console's Automatic switch writes into this directory. From a terminal
+  # this creates it; from the console's helper it cannot - that unit is
+  # sandboxed out of /etc and may only write into paths that already exist,
+  # which is why the unit now has an ExecStartPre= that makes it with full
+  # privileges before the sandbox is applied. On a host whose unit predates
+  # that, this line is the one that fails, so it says what to do about it.
+  if [ ! -d "$AUTO_CONF_DIR" ] && ! install -d -m 0755 "$AUTO_CONF_DIR" 2>/dev/null; then
+    note "could not create ${AUTO_CONF_DIR} - run 'supabase-backup-upgrade --auto off' once on the host, or upgrade again now that the unit can make it"
+  fi
 
   ln -sf "${LIB_DIR}/restore" /usr/local/bin/supabase-restore \
     || note "could not link /usr/local/bin/supabase-restore"
@@ -615,6 +621,13 @@ apply_body() {  # apply_body <staging> <force>
     note "helpers reloaded and watching their spools"
   fi
 
+  # Nothing was replaced, so the running console is already the installed code
+  # and restarting it would be a second of downtime bought with nothing.
+  if [ "$was_active" -eq 1 ] && [ "$changed" -eq 0 ]; then
+    note "${WEB_UNIT} left alone - nothing it runs changed"
+    was_active=0
+  fi
+
   if [ "$was_active" -eq 1 ]; then
     local up=0 i
     if systemctl restart "$WEB_UNIT" >/dev/null 2>&1; then
@@ -636,6 +649,36 @@ apply_body() {  # apply_body <staging> <force>
       return 1
     fi
     note "${WEB_UNIT} restarted and running"
+  fi
+
+  # ── The second pass ──
+  # An upgrade runs the script that was already here, so it installs the file
+  # list *that* script knew about. A release that adds a file therefore lands
+  # incomplete, and the version it then records over-claims: it names a commit
+  # whose files are not all here. The host looks up to date and is not.
+  #
+  # So when this script has just replaced itself, hand over to the copy it
+  # installed and let it finish the job with its own list. Once only - the
+  # guard is what stops two releases in a row turning into a loop - and as a
+  # child rather than an exec, because the caller still has a result to write.
+  if [ "$self_replaced" -eq 1 ] && [ -z "${UPGRADE_REEXEC:-}" ]; then
+    note "the upgrade script replaced itself - running the new one so its own file list takes effect"
+    local out line rc=0
+    out="$(UPGRADE_REEXEC=1 "${LIB_DIR}/upgrade" --apply 2>&1)" || rc=$?
+    while IFS= read -r line; do
+      case "$line" in
+        "  "*) note "· ${line#  }" ;;
+      esac
+    done <<<"$out"
+    if [ "$rc" -eq 0 ]; then
+      # It recorded the version itself, against the list it actually installed,
+      # which is the honest one. Nothing left for this pass to claim.
+      prune_rollbacks
+      return 0
+    fi
+    note "the second pass failed - what this pass installed is in place, but the newer file list is not"
+    APPLY_ERROR="the upgrade installed, then its own newer version could not finish the job: $(printf '%s' "$out" | tr '\n' ' ' | tail -c 300)"
+    return 1
   fi
 
   local new_version new_commit

@@ -6,6 +6,13 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# The console's Automatic switch writes AUTO_UPGRADE into
+# /etc/supabase-backup-upgrade/upgrade.env, and ReadWritePaths= below can make
+# that directory writable but cannot bring it into existence. The `+` prefix
+# runs this with full privileges, before the sandbox is applied, which is the
+# one moment in this unit's life that /etc is writable. `-` because a host
+# where it already exists is the normal case, not a failure.
+ExecStartPre=-+/usr/bin/mkdir -p /etc/supabase-backup-upgrade
 ExecStart=/opt/supabase-backup/upgrade --drain
 
 # The privileged half of the Upgrade button. It replaces code and nothing else:
