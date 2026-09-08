@@ -581,6 +581,14 @@ apply_body() {  # apply_body <staging> <force>
     note "${changed} file(s) replaced"
   fi
 
+  # The console's Automatic switch writes into this directory, and its helper is
+  # sandboxed out of the rest of /etc - so it cannot create it, only write into
+  # it once it exists. The setup scripts make it; an upgrade run from a terminal
+  # is the other way a host can come to have all of this, and without this line
+  # that host gets a switch that can only ever answer "could not write".
+  install -d -m 0755 "$AUTO_CONF_DIR" 2>/dev/null \
+    || note "could not create ${AUTO_CONF_DIR} - the console's Automatic switch will not be able to write"
+
   ln -sf "${LIB_DIR}/restore" /usr/local/bin/supabase-restore \
     || note "could not link /usr/local/bin/supabase-restore"
   ln -sf "${LIB_DIR}/upgrade" /usr/local/bin/supabase-backup-upgrade \
