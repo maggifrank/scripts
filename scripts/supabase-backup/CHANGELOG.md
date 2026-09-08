@@ -7,6 +7,22 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.3 — 2026-09-08
+
+Every file in an upgrade now comes from one commit.
+
+- Downloads were made from a branch URL, which is served from a cache that lags
+  the API by minutes. That is not hypothetical: minutes after 1.2 was published
+  the API reported its commit while the branch URL still served 1.1's VERSION
+  and 1.1's code. Two silent ways it hurt — a payload fetched partway between
+  two commits, every file passing its own checks; and "same version, new
+  commit", which is the definition of a patch, so an automatic host would have
+  installed a release that bumped its version precisely to avoid that.
+- The commit is resolved first, and both the version and every file are then
+  read from that commit's immutable URL. Where the API cannot say what the
+  commit is there is nothing to pin to, and the upgrade says so rather than
+  pretending.
+
 ## 1.2 — 2026-09-08
 
 An upgrade finishes in one pass.
