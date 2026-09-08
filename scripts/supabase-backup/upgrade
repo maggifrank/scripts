@@ -424,11 +424,19 @@ save_rollback() {  # save_rollback <plan> <dir>
   local dir="$2" target dest mode
   install -d -m 0700 "$dir" || return 1
   : > "${dir}/state.tsv" || return 1
+  local was
   while IFS=$'\t' read -r target dest mode; do
     if [ -f "$dest" ]; then
       install -d -m 0700 "$(dirname "${dir}${dest}")" || return 1
       install -m 0600 "$dest" "${dir}${dest}" || return 1
-      printf '%s\t%s\n' "$dest" "$(stat -c '%a' "$dest")" >> "${dir}/state.tsv" || return 1
+      # The mode it has now, not the mode the release wants it to have - this
+      # row is for putting it back. Checked rather than interpolated blind: a
+      # stat that failed would write an empty field, restore_rollback would
+      # call `install -m ""`, and the rollback would fail at the one moment it
+      # is the only thing standing between a bad release and a dead console.
+      was="$(stat -c '%a' "$dest" 2>/dev/null)" || return 1
+      [[ "$was" =~ ^[0-7]{3,4}$ ]] || return 1
+      printf '%s\t%s\n' "$dest" "$was" >> "${dir}/state.tsv" || return 1
     else
       printf '%s\tABSENT\n' "$dest" >> "${dir}/state.tsv" || return 1
     fi
