@@ -4,8 +4,13 @@ name: supabase-backup release check
 # A required status check that is skipped never reports, and a pull request
 # waiting for a status that will never arrive is blocked for ever. Sixteen
 # seconds on every push is the cheaper mistake.
+# `push` is narrowed to main so a branch with a pull request open does not run
+# this twice - once for the push and once for the pull request - which is two
+# identical runs and, when it fails, two notifications saying the same thing.
+# Every pull request still gets a run, so the required check always reports.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
