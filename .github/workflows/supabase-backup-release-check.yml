@@ -1,13 +1,12 @@
 name: supabase-backup release check
 
-# Hosts install straight from main, so main is the release. This runs on every
-# push and pull request that touches the tool: a red run means what is
-# published would not install cleanly, or would install as the wrong version.
+# Deliberately no `paths:` filter, even though this only checks one directory.
+# A required status check that is skipped never reports, and a pull request
+# waiting for a status that will never arrive is blocked for ever. Sixteen
+# seconds on every push is the cheaper mistake.
 on:
   push:
-    paths: ['scripts/supabase-backup/**']
   pull_request:
-    paths: ['scripts/supabase-backup/**']
   workflow_dispatch:
 
 jobs:
