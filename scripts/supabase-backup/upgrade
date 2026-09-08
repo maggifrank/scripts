@@ -135,6 +135,7 @@ CORE_FILES=(
   "restore|${LIB_DIR}/restore|0755"
   "upgrade|${LIB_DIR}/upgrade|0755"
   "VERSION|${LIB_DIR}/VERSION|0644"
+  "CHANGELOG.md|${LIB_DIR}/CHANGELOG.md|0644"
   "supabase-backup@.service|${UNIT_DIR}/supabase-backup@.service|0644"
   "supabase-backup@.timer|${UNIT_DIR}/supabase-backup@.timer|0644"
   # Core, not web: a host that never installs the console should still be able
@@ -214,14 +215,39 @@ remote_version() {
   curl -fsSL --max-time 20 "${RAW_BASE}/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]'
 }
 
+# Commits that touched the directory this host installs from, newest first.
+# Only this directory: asking about the whole branch would report an upgrade
+# every time some unrelated script in the repo changed, and installing it would
+# replace nothing.
+#
+# One request answers both questions - what the newest commit is, and which
+# ones you would be getting - so the "what's new" list costs nothing extra.
+REMOTE_COMMITS_CACHE=""
+remote_commits() {
+  [ -n "$REMOTE_COMMITS_CACHE" ] && { printf '%s' "$REMOTE_COMMITS_CACHE"; return 0; }
+  REMOTE_COMMITS_CACHE="$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' \
+    "${API_BASE}/commits?sha=${BRANCH}&path=${REPO_PATH}&per_page=30" 2>/dev/null \
+    | jq -c 'if type=="array" then
+               [.[] | {sha: .sha,
+                       date: .commit.committer.date,
+                       subject: (.commit.message | split("\n")[0])}]
+             else [] end' 2>/dev/null)"
+  [ -n "$REMOTE_COMMITS_CACHE" ] || REMOTE_COMMITS_CACHE="[]"
+  printf '%s' "$REMOTE_COMMITS_CACHE"
+}
+
 remote_commit() {  # "<sha> <iso date>", or nothing
-  # The last commit that touched the directory this host installs from. Asking
-  # about the whole branch would report an upgrade every time some unrelated
-  # script in the repo changed, and installing it would replace nothing.
-  curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' \
-    "${API_BASE}/commits?sha=${BRANCH}&path=${REPO_PATH}&per_page=1" 2>/dev/null \
-    | jq -r 'if type=="array" and length>0
-             then "\(.[0].sha) \(.[0].commit.committer.date)" else empty end' 2>/dev/null
+  remote_commits | jq -r 'if length>0 then "\(.[0].sha) \(.[0].date)" else empty end' 2>/dev/null
+}
+
+# What you would be getting: everything above the commit already installed. If
+# the installed one is not in the window at all, say so rather than showing a
+# list that quietly means something else.
+changes_since() {  # changes_since <installed sha>
+  remote_commits | jq -c --arg base "$1" '
+    (map(.sha) | index($base)) as $i
+    | if $i == null then {truncated: true,  commits: .[0:10]}
+                    else {truncated: false, commits: .[0:$i]} end'
 }
 
 cache_read() {
@@ -315,6 +341,15 @@ check() {  # check [--refresh] -> one JSON object on stdout
     is_patch=true
   fi
 
+  # Only when there is something to describe, and only when we know where to
+  # start from: a list of "the last ten commits" against an unknown base is not
+  # what's new, it is just recent activity.
+  local changes='{"truncated":false,"commits":[]}'
+  if [ "$available" = "true" ] && [ -n "$have_commit" ] && [ "$basis" = "commit" ]; then
+    changes="$(changes_since "$have_commit")"
+    [ -n "$changes" ] || changes='{"truncated":false,"commits":[]}'
+  fi
+
   local body
   body="$(jq -nc \
     --argjson installed "$inst" \
@@ -324,9 +359,10 @@ check() {  # check [--refresh] -> one JSON object on stdout
     --argjson epoch "$(date -u +%s)" --arg comp "$(components)" \
     --arg repo "${GITHUB_USER}/${GITHUB_REPO}" --arg branch "$BRANCH" \
     --argjson patch "$is_patch" --arg auto "$(auto_policy)" \
+    --argjson changes "$changes" \
     '{installed: ($installed + {components: ($comp|split(" "))}),
       available: {version:$av, commit:$ac, committed_at:$ad},
-      upgrade_available:$up, is_patch:$patch, auto:$auto,
+      upgrade_available:$up, is_patch:$patch, auto:$auto, changes:$changes,
       basis:$basis, reason:$reason, error:$error,
       repo:$repo, branch:$branch, checked_at:$at, checked_at_epoch:$epoch}')"
   cache_write "$body"
@@ -353,6 +389,15 @@ print_check() {  # print_check <json>
     patch) printf '  %-11s %s\n' "Automatic" "patches, twice a day" ;;
     *)     printf '  %-11s %s\n' "Automatic" "off - checks twice a day, installs nothing" ;;
   esac
+  local n
+  n="$(jq -r '.changes.commits | length' <<<"$j" 2>/dev/null || echo 0)"
+  if [ "${n:-0}" -gt 0 ]; then
+    echo
+    echo "  What's new"
+    jq -r '.changes.commits[] | "    \(.sha[0:7])  \(.subject)"' <<<"$j"
+    [ "$(jq -r '.changes.truncated' <<<"$j")" = "true" ] \
+      && echo "    ... and older; this host's commit is not in the last 30"
+  fi
   echo
   if [ -n "$(jq -r '.error // ""' <<<"$j")" ]; then
     warn "$(jq -r '.error' <<<"$j")"

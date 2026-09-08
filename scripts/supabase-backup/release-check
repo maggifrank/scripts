@@ -1,0 +1,134 @@
+#!/bin/bash
+# release-check — refuse to publish a supabase-backup release that would not work.
+#
+#   ./release-check          check, and say what is wrong
+#   ./release-check --quiet  say nothing unless something is wrong (hooks, CI)
+#
+# Run from a checkout, not from a host. It checks the things that are silent
+# when they go wrong - the ones where the first symptom is a host that quietly
+# stopped updating, or updated to something broken.
+#
+# It exists because the alternative is remembering, and the whole design of the
+# upgrade path is an argument against relying on anyone remembering anything.
+
+set -uo pipefail
+cd "$(dirname "$0")"
+
+if [ -t 1 ] && [ "${1:-}" != "--quiet" ]; then
+  RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+else
+  RED=""; GREEN=""; YELLOW=""; BOLD=""; NC=""
+fi
+QUIET=""
+[ "${1:-}" = "--quiet" ] && QUIET=1
+
+PROBLEMS=0
+bad()  { printf '%s✗%s %s\n' "$RED" "$NC" "$1" >&2; PROBLEMS=$((PROBLEMS + 1)); }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$NC" "$1" >&2; }
+ok()   { [ -n "$QUIET" ] || printf '%s✓%s %s\n' "$GREEN" "$NC" "$1"; }
+
+# Files that live here and are deliberately not installed on a host. Anything
+# else new has to be in the payload, or hosts will never receive it.
+NOT_INSTALLED=(
+  "web/web.env.example"   # seeds web.env once; an upgrade must never rewrite a config
+  "release-check"         # this script; a development tool, not part of the tool
+)
+
+# ── 1. VERSION is the shape everything else assumes ──────────────────────────
+if [ ! -f VERSION ]; then
+  bad "VERSION does not exist"
+  VERSION=""
+else
+  VERSION="$(head -1 VERSION | tr -d '[:space:]')"
+  if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    ok "VERSION is ${BOLD}${VERSION}${NC}"
+  else
+    bad "VERSION is '${VERSION}', which is not <major>.<minor>. The commit is the patch level, so a third number has nowhere to go and 'is this a patch' stops being answerable."
+  fi
+fi
+
+# ── 2. Every version has an entry, and every entry a version ─────────────────
+# Only bumping VERSION needs an entry: a patch's record is its commit message.
+if [ ! -f CHANGELOG.md ]; then
+  bad "CHANGELOG.md does not exist"
+elif [ -n "$VERSION" ]; then
+  if grep -qE "^## ${VERSION//./\\.}( |$)" CHANGELOG.md; then
+    ok "CHANGELOG.md has an entry for ${VERSION}"
+  else
+    bad "CHANGELOG.md has no '## ${VERSION}' entry. Either write one, or you did not mean to change VERSION - and changing it is what stops hosts installing this on their own."
+  fi
+  # Newest first, so the top entry should be the version being published.
+  TOP="$(grep -m1 -E '^## ' CHANGELOG.md | awk '{print $2}')"
+  if [ -n "$TOP" ] && [ "$TOP" != "$VERSION" ]; then
+    warn "CHANGELOG.md's first entry is ${TOP}, not ${VERSION}. Entries are newest first."
+  fi
+fi
+
+# ── 3. The payload matches what is actually here ─────────────────────────────
+# The silent one. A file added here but not to CORE_FILES/WEB_FILES is a file
+# no host ever receives: the upgrade succeeds, reports success, and installs
+# something incomplete.
+if [ ! -f upgrade ]; then
+  bad "upgrade does not exist"
+else
+  payload="$(sed -n '/^CORE_FILES=(/,/^)/p;/^WEB_FILES=(/,/^)/p' upgrade \
+             | grep '|' | sed 's/^[[:space:]]*"//' | cut -d'|' -f1 | sort)"
+  here="$(find . -type f -not -path './web/__pycache__/*' -not -name '.*' \
+          | sed 's|^\./||' | sort)"
+  excluded="$(printf '%s\n' "${NOT_INSTALLED[@]}" | sort)"
+  expected="$(comm -23 <(printf '%s\n' "$here") <(printf '%s\n' "$excluded"))"
+
+  missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$payload"))"
+  if [ -n "$missing" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && bad "${f} is here but not in the upgrade payload - no host would ever receive it. Add it to CORE_FILES or WEB_FILES in ./upgrade, or to NOT_INSTALLED in this script if it is deliberate."
+    done <<<"$missing"
+  fi
+
+  phantom="$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$payload"))"
+  if [ -n "$phantom" ]; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && bad "the payload lists ${f}, which is not here - every upgrade would fail on the download and install nothing."
+    done <<<"$phantom"
+  fi
+
+  [ -z "$missing" ] && [ -z "$phantom" ] \
+    && ok "payload lists all $(printf '%s\n' "$payload" | grep -c . ) installed files, and nothing else"
+fi
+
+# ── 4. It parses as what it claims to be ─────────────────────────────────────
+# The same check `upgrade` makes before installing. Making it here means a
+# broken release is caught before it is published rather than after.
+parsed=0
+for f in *.sh backup.sh restore register reconfigure keys upgrade release-check; do
+  [ -f "$f" ] || continue
+  if ! bash -n "$f" 2>/dev/null; then bad "${f} is not valid bash"; fi
+  parsed=$((parsed + 1))
+done
+if [ -f web/server.py ]; then
+  if python3 -c 'import py_compile,sys; py_compile.compile(sys.argv[1], doraise=True)' web/server.py 2>/dev/null; then
+    parsed=$((parsed + 1))
+  else
+    bad "web/server.py does not compile"
+  fi
+fi
+if [ -f web/static/app.js ] && command -v node >/dev/null; then
+  if node --check web/static/app.js 2>/dev/null; then parsed=$((parsed + 1)); else bad "web/static/app.js is not valid JavaScript"; fi
+fi
+for f in *.service *.timer *.path; do
+  [ -f "$f" ] || continue
+  grep -q '^\[Unit\]' "$f" || bad "${f} has no [Unit] section"
+  parsed=$((parsed + 1))
+done
+ok "${parsed} files parse as what they claim to be"
+
+rm -rf web/__pycache__ 2>/dev/null
+
+# ── Verdict ──────────────────────────────────────────────────────────────────
+if [ "$PROBLEMS" -gt 0 ]; then
+  printf '\n%s%d problem(s).%s Not ready to publish.\n' "$RED" "$PROBLEMS" "$NC" >&2
+  exit 1
+fi
+[ -n "$QUIET" ] || printf '\n%sReady.%s %s\n' "$GREEN" "$NC" \
+  "$([ -n "$VERSION" ] && echo "Publishing as ${VERSION}; a commit that leaves VERSION alone is a patch and installs itself on hosts that asked for that.")"
+exit 0

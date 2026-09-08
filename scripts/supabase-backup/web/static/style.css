@@ -395,6 +395,45 @@ footer code { color: var(--text2); }
 .form.version .field.auto { margin: 0.85rem 0 0; padding-top: 0.75rem; border-top: 1px solid var(--border); }
 .form.version .field.auto .hint { margin-top: 0.3rem; }
 .form.version .field.auto .bar-msg { display: inline-block; margin-top: 0.35rem; }
+
+/* What's new: the commits this host would be getting, above the button that
+   gets them. Bordered rather than plain text - it is the one thing on the
+   panel worth reading before clicking. */
+.whats-new {
+  margin-top: 0.8rem;
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border2);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--surface3);
+}
+.whats-new-head {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text3);
+  margin-bottom: 0.45rem;
+}
+.commits { margin: 0; padding-left: 1rem; font-size: 0.76rem; line-height: 1.65; color: var(--text2); }
+.commits li { margin-bottom: 0.15rem; }
+.commits code { font-family: var(--font-mono); font-size: 0.72rem; color: var(--accent); }
+.commit-when { color: var(--text3); }
+.whats-new .hint { margin-top: 0.45rem; }
+
+/* Version history: closed by default. It is reference, not news. */
+.history { margin-top: 0.85rem; }
+.history summary {
+  cursor: pointer;
+  font-size: 0.75rem;
+  color: var(--text2);
+  padding: 0.2rem 0;
+  user-select: none;
+}
+.history summary:hover { color: var(--text); }
+.history .release { margin: 0.6rem 0 0; padding-left: 0.1rem; }
+.history .release-head { font-size: 0.78rem; color: var(--text); margin-bottom: 0.2rem; }
+.history .release-head b { font-family: var(--font-mono); font-weight: 700; }
 .upgrade-output:empty { display: none; }
 
 /* ── Restore ── */

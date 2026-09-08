@@ -1,0 +1,19 @@
+name: supabase-backup release check
+
+# Hosts install straight from main, so main is the release. This runs on every
+# push and pull request that touches the tool: a red run means what is
+# published would not install cleanly, or would install as the wrong version.
+on:
+  push:
+    paths: ['scripts/supabase-backup/**']
+  pull_request:
+    paths: ['scripts/supabase-backup/**']
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: release-check
+        run: scripts/supabase-backup/release-check

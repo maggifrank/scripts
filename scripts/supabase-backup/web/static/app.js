@@ -1427,6 +1427,8 @@ function paintVersion(wrap, payload) {
   if (payload.activity && Object.keys(payload.activity).length) {
     wrap._activity = payload.activity;
   }
+  if (typeof payload.changelog === "string") wrap._changelog = payload.changelog;
+  payload = { ...payload, changelog: payload.changelog ?? wrap._changelog };
   const nodes = [el("h3", null, "Version")];
 
   if (check.error) {
@@ -1486,7 +1488,16 @@ function paintVersion(wrap, payload) {
   upgrade.addEventListener("click",
     () => startUpgrade(check, wrap, upgrade, recheck, message, output));
   recheck.addEventListener("click", () => loadVersion(wrap, true));
-  nodes.push(bar, autoBox(check, activity, wrap), output);
+
+  // What you would be getting, above the button that gets it. Commit subjects
+  // rather than release notes: a patch never writes release notes, and the
+  // subject line is what it wrote instead.
+  const news = whatsNew(check);
+  if (news) nodes.push(news);
+  nodes.push(bar, autoBox(check, activity, wrap));
+  const history = versionHistory(payload.changelog, wrap);
+  if (history) nodes.push(history);
+  nodes.push(output);
 
   const last = activity.latest;
   if (last && last.state && last.state !== "running" && !upgradeBusy) {
@@ -1592,12 +1603,117 @@ async function setAuto(box, status, wrap) {
   setTimeout(tick, 500);
 }
 
+function whatsNew(check) {
+  const changes = check.changes || {};
+  const commits = changes.commits || [];
+  if (!commits.length) return null;
+
+  const box = el("div", "whats-new");
+  box.append(el("div", "whats-new-head",
+    commits.length === 1 ? "What's new — 1 commit" : `What's new — ${commits.length} commits`));
+  const list = el("ul", "commits");
+  for (const commit of commits) {
+    const item = el("li");
+    item.append(el("code", null, (commit.sha || "").slice(0, 7)));
+    item.append(document.createTextNode(" " + (commit.subject || "")));
+    if (commit.date) item.append(el("span", "commit-when", ` · ${relative(commit.date)}`));
+    list.append(item);
+  }
+  box.append(list);
+  if (changes.truncated) {
+    box.append(el("div", "hint",
+      "…and older. This host's commit is not in the last 30, so this is the recent " +
+      "history rather than the whole of what you would be getting."));
+  }
+  return box;
+}
+
+// The releases this host has notes for. What is ahead of it is the commit list
+// above instead - CHANGELOG.md arrives with an upgrade, so it can only ever
+// describe versions already installed, and saying otherwise would be inventing.
+function versionHistory(text, wrap) {
+  const releases = parseChangelog(text || "");
+  if (!releases.length) return null;
+
+  const details = document.createElement("details");
+  details.className = "history";
+  if (wrap._historyOpen) details.open = true;
+  details.addEventListener("toggle", () => { wrap._historyOpen = details.open; });
+  const summary = document.createElement("summary");
+  summary.textContent = `Version history (${releases.length})`;
+  details.append(summary);
+
+  for (const release of releases) {
+    const entry = el("div", "release");
+    const head = el("div", "release-head");
+    head.append(el("b", null, release.version));
+    if (release.date) head.append(el("span", "commit-when", ` · ${release.date}`));
+    entry.append(head);
+    if (release.lines.length) {
+      const list = el("ul", "commits");
+      for (const line of release.lines) list.append(inlineCode(el("li"), line));
+      entry.append(list);
+    }
+    details.append(entry);
+  }
+  return details;
+}
+
+// `backticks` are the only markdown worth honouring here - the notes are full
+// of unit and file names, and left raw they read as punctuation. Built as text
+// nodes and <code>, never innerHTML: this file is written by hand today, but
+// it arrives over the network with every upgrade.
+function inlineCode(node, text) {
+  const parts = String(text).split("`");
+  parts.forEach((part, i) => {
+    if (!part) return;
+    node.append(i % 2 ? el("code", null, part) : document.createTextNode(part));
+  });
+  return node;
+}
+
+// CHANGELOG.md is written by hand and read here, so this stays deliberately
+// dull: "## <version> — <date>" starts a release, "- " is a bullet, and prose
+// between them is kept as a line of its own. Anything it does not recognise it
+// leaves out rather than guessing.
+function parseChangelog(text) {
+  const releases = [];
+  let current = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trimEnd();
+    const heading = /^##\s+(\S+)(?:\s+[—-]\s+(.+))?$/.exec(line);
+    if (heading) {
+      current = { version: heading[1], date: (heading[2] || "").trim(), lines: [] };
+      releases.push(current);
+      continue;
+    }
+    if (!current || !line.trim()) continue;
+    if (line.startsWith("#")) continue;
+    current.lines.push(line.replace(/^[-*]\s+/, "").trim());
+  }
+  // A bullet wrapped across lines arrives as two entries; rejoin anything that
+  // is plainly a continuation rather than showing half a sentence per row.
+  for (const release of releases) {
+    const joined = [];
+    for (const line of release.lines) {
+      if (joined.length && /^[a-z(]/.test(line)) joined[joined.length - 1] += " " + line;
+      else joined.push(line);
+    }
+    release.lines = joined;
+  }
+  return releases;
+}
+
 function upgradeResult(result) {
   const ok = result.state === "ok";
   const box = el("div", `result ${ok ? "ok" : "bad"}`);
   box.append(el("div", null, ok
     ? "Upgraded."
-    : `Not upgraded — ${result.error || "the host reported a failure"}`));
+    // "Not upgraded" would be a guess for a stalled request: nothing read it,
+    // so nothing decided anything, and the upgrade may yet happen.
+    : result.state === "stalled"
+      ? `Still waiting — ${result.error}`
+      : `Not upgraded — ${result.error || "the host reported a failure"}`));
   if (Array.isArray(result.steps) && result.steps.length) {
     const ul = el("ul", "steps");
     for (const step of result.steps) ul.append(el("li", null, step));
@@ -1680,6 +1796,14 @@ function pollUpgrade(id, wrap, message, output) {
       message.textContent = result.state === "running"
         ? "downloading and installing…" : "waiting for the helper…";
       upgradePoll = setTimeout(tick, 2000);
+      return;
+    }
+    // Nothing has read the request. Not a failure - nothing decided anything -
+    // so it keeps polling in case the helper is only just starting, and says
+    // what is actually true meanwhile.
+    if (result.state === "stalled" && Date.now() < deadline) {
+      message.textContent = "nothing has picked this up yet…";
+      upgradePoll = setTimeout(tick, 3000);
       return;
     }
     // The gap between the helper taking the request and writing a result. Only

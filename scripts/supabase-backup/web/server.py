@@ -152,6 +152,11 @@ UPGRADE_UNIT    = env("WEB_UPGRADE_UNIT", f"{UNIT_PREFIX}-upgrade.service")
 # /var/lib/supabase-backup, which is root's; this process has exactly one
 # writable directory on a real disk, and this is it.
 UPGRADE_CACHE   = Path(env("WEB_UPGRADE_CACHE", str(STATE_DIR / "upgrade-check.json")))
+# Release notes for the versions this host has. What is *ahead* of it comes
+# from the commit list in the check instead: this file only ever describes
+# what is installed, which is the honest thing for it to describe.
+CHANGELOG_FILE  = Path(env("WEB_CHANGELOG", "/opt/supabase-backup/CHANGELOG.md"))
+CHANGELOG_MAX   = 256 * 1024
 
 # A proxy terminating TLS on another host, trusted to speak for the client.
 TRUSTED_PROXIES = {h.strip() for h in env("WEB_TRUSTED_PROXIES", "").split(",") if h.strip()}
@@ -164,6 +169,7 @@ SPOOL_UNITS = {
     "restore":    "supabase-backup-restore",
     "settings":   "supabase-backup-settings",
     "encryption": "supabase-backup-keys",
+    "upgrade":    "supabase-backup-upgrade",
 }
 MAX_BODY = 64 * 1024
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
@@ -1730,6 +1736,21 @@ def upgrade_check(refresh=False):
         return {"error": "the version check did not return JSON"}
 
 
+def changelog():
+    """The installed CHANGELOG.md, or nothing.
+
+    Read per request rather than cached: an upgrade replaces it underneath this
+    process, and a version history showing the previous release's notes would
+    be worse than showing none.
+    """
+    try:
+        if CHANGELOG_FILE.stat().st_size > CHANGELOG_MAX:
+            return ""
+        return CHANGELOG_FILE.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return ""
+
+
 def upgrade_activity():
     """Whether an upgrade is in flight, and what came of the last one.
 
@@ -2087,6 +2108,7 @@ class Handler(BaseHTTPRequestHandler):
                 refresh = query.get("refresh", ["0"])[0] in ("1", "true", "yes")
                 return self.send_json(200, {"check": upgrade_check(refresh),
                                             "activity": upgrade_activity(),
+                                            "changelog": changelog(),
                                             "allowed": allowed,
                                             "blocked_because": why})
             match = re.fullmatch(r"/api/upgrade/([^/]+)", path)

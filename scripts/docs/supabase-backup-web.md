@@ -259,6 +259,24 @@ A request names a verb and nothing else. There is no version to choose and no
 URL to supply — every one of those is fixed in `upgrade` itself — so a request
 that was rewritten on the way asks for exactly what an untampered one asks for.
 
+### What's new, and version history
+
+Above the Upgrade button, the panel lists the commits you would be getting —
+subject lines, straight from the commits that touched `scripts/supabase-backup`
+between the one installed here and the one published. Not release notes: a
+patch never writes release notes, and the subject line is what it wrote
+instead. If this host's commit is older than the last thirty it says so, rather
+than showing recent history as though it were the whole difference.
+
+Below it, **Version history** is `CHANGELOG.md`, which arrives with an upgrade
+and so can only describe versions this host already has. That split is
+deliberate: the file says where you have been, the commit list says what you
+would be getting, and neither pretends to the other's job.
+
+Writing that file is covered in [Changing
+it](supabase-backup.md#changing-it) — `release-check` refuses a `VERSION` bump
+with no entry.
+
 ### Automatic updates
 
 `supabase-backup-upgrade-scheduled.timer` runs at **00:00 and 12:00**, well

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Run the release checks for anything being committed that ships to a host.
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# This is the local half. The GitHub Actions workflow is the half that runs
+# whoever committed and from wherever, including when this hook is not enabled
+# or is skipped with --no-verify.
+set -uo pipefail
+
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+
+if grep -q '^scripts/supabase-backup' <<<"$staged"; then
+  if [ -x scripts/supabase-backup/release-check ]; then
+    scripts/supabase-backup/release-check --quiet || {
+      echo "" >&2
+      echo "pre-commit: scripts/supabase-backup/release-check failed (above)." >&2
+      echo "  Fix it, or commit with --no-verify if you know why it is wrong." >&2
+      exit 1
+    }
+  fi
+fi
+exit 0

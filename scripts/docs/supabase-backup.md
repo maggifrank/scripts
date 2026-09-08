@@ -381,6 +381,97 @@ cannot be reached over SQL:
 A restored project needs those configured by hand. Write down which ones you
 depend on before you need them.
 
+## Changing it
+
+Hosts install straight from `main`, so **`main` is the release**. There is no
+staging branch and no publish step: pushing is publishing.
+
+### The routine change
+
+Edit the files, commit, push. Leave `VERSION` alone and it is a patch — hosts
+with `AUTO_UPGRADE=patch` install it within twelve hours, everyone else sees
+**Upgrade** in the console. The commit subject is the record; that is what the
+console shows under "What's new", so write it as something you would want to
+read there.
+
+### The one decision that matters
+
+| Change | `VERSION` | On a host with auto-patch on |
+|---|---|---|
+| fix, tweak, refactor | leave it | installs itself within 12h |
+| new feature or behaviour | `1.0` → `1.1` | **waits for you** |
+| needs a person to do something on the host | `1.1` → `2.0` | waits for you |
+
+Bumping is how a change says "look at me". Note which way that cuts: *not*
+bumping is what makes something deploy itself, so the bump is the deliberate
+act. When in doubt, bump — the cost is clicking a button, and the cost of the
+other mistake is a change installing itself unwatched.
+
+Bumping `VERSION` requires a `## <version>` entry in
+[`CHANGELOG.md`](../supabase-backup/CHANGELOG.md), newest first. `release-check`
+refuses otherwise. Patches get no entry: their commit message is the entry.
+
+### Adding a file to the installation
+
+The one that fails silently if you get it wrong.
+
+1. Add it under `scripts/supabase-backup/`
+2. **Add it to `CORE_FILES` or `WEB_FILES` in `upgrade`** — miss this and no
+   host ever receives it, while every upgrade still reports success
+3. Add it to whichever setup script installs it on a fresh host
+4. If it is a `.path` or `.timer` that must be enabled, add it to the enable
+   loop in `apply_body`
+5. Bump the minor — a new file is not a patch
+
+`release-check` catches step 2 in both directions: a file here that the payload
+does not list, and a file the payload lists that is not here (which would make
+every upgrade fail on the download). A file that genuinely should not ship goes
+in that script's `NOT_INSTALLED` list, with a note saying why.
+
+### Adding a `web.env` key
+
+Five places, and missing one leaves the file and the behaviour disagreeing:
+`web/web.env.example`, `server.py` (the `env_bool` line, `current_settings`,
+`validate_settings`), `reconfigure` (note the deliberate rule that a *missing*
+key must never read as "off"), `web/static/app.js`, and
+`supabase-backup-web-setup.sh` so hosts that already have a `web.env` gain the
+line.
+
+### Adding a spool directory
+
+`supabase-backup-web.tmpfiles`, `supabase-backup-web.service`'s
+`ReadWritePaths`, the `.path` unit, and the enable loop in `apply_body`.
+
+### An upgrade never deletes
+
+It installs what the payload lists and nothing else. Remove a file from the
+repository and it stays on every host that already has it, forever. Removing
+something properly means a deliberate cleanup — an upgrade will not do it for
+you, on purpose: a code path that deletes files on a backup host is not one to
+add for tidiness.
+
+### The checks
+
+```bash
+scripts/supabase-backup/release-check
+```
+
+Verifies that `VERSION` is `<major>.<minor>`, that `CHANGELOG.md` has an entry
+for it, that the payload and the directory agree in both directions, and that
+every script parses as what it claims to be.
+
+It runs in three places, deliberately overlapping:
+
+- **A pre-commit hook**, once per clone: `git config core.hooksPath .githooks`
+- **GitHub Actions**, on every push and PR touching the tool — this one runs
+  whoever committed and from wherever, including when the hook is not enabled
+- **By hand**, before pushing something you care about
+
+The hook can be skipped with `--no-verify` and the workflow does not block a
+push, since nothing protects `main`. That is the honest limit of it: these make
+a mistake loud and immediate, not impossible. If you want it impossible, branch
+protection on `main` with the check required is the thing that does it.
+
 ## Rehearse it
 
 An unrehearsed restore is an assumption, not a backup. Restore into a throwaway
