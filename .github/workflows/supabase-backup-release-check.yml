@@ -4,10 +4,6 @@ name: supabase-backup release check
 # A required status check that is skipped never reports, and a pull request
 # waiting for a status that will never arrive is blocked for ever. Sixteen
 # seconds on every push is the cheaper mistake.
-# `push` is narrowed to main so a branch with a pull request open does not run
-# this twice - once for the push and once for the pull request - which is two
-# identical runs and, when it fails, two notifications saying the same thing.
-# Every pull request still gets a run, so the required check always reports.
 on:
   push:
     branches: [main]
@@ -19,5 +15,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The declaration check reads the commits on the branch, so it needs
+          # more than the shallow clone the default gives it.
+          fetch-depth: 0
+
       - name: release-check
         run: scripts/supabase-backup/release-check
+
+      # Only on a pull request, and only here. A squash merge composes a new
+      # message, so a `Release: patch` trailer written on the branch may not
+      # survive onto main - running this on push would turn that into a red
+      # main for something that was declared correctly when it mattered.
+      - name: release-check — was the change declared?
+        if: github.event_name == 'pull_request'
+        run: scripts/supabase-backup/release-check --against ${{ github.event.pull_request.base.sha }}
