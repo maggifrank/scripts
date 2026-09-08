@@ -1,0 +1,37 @@
+[Unit]
+Description=Scheduled supabase-backup version check
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/supabase-backup/upgrade --scheduled
+
+# What the twice-daily timer runs. It always checks, so the console's version
+# panel has a fresh answer without anyone opening it. Whether it also installs
+# is /etc/supabase-backup-upgrade/upgrade.env's decision, and the only thing it
+# will ever install on its own is a patch - a new commit against the version
+# already running. A release that bumped VERSION is left alone, which is what
+# bumping VERSION is for.
+#
+# Read-only to that policy file: this unit obeys it, and the two places that
+# may change it are a person at a terminal and the console's own helper.
+#
+# Same sandbox as supabase-backup-upgrade.service, because when it does install
+# it is doing exactly that job: code and nothing else, never a config, never a
+# credential, never an archive.
+ReadWritePaths=/opt/supabase-backup /etc/systemd/system /etc/tmpfiles.d -/usr/local/bin -/run/supabase-backup-web
+InaccessiblePaths=-/etc/supabase-backup -/etc/supabase-backup-web
+StateDirectory=supabase-backup
+StateDirectoryMode=0700
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true

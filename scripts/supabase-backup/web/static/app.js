@@ -1416,6 +1416,12 @@ function versionLine(version, commit, when, whenLabel) {
 
 function paintVersion(wrap, payload) {
   const check = payload.check || {};
+  // A repaint after an action carries a fresh check but no fresh activity -
+  // the helper reports what it did, not what systemd's timer is up to. Keep
+  // the last real one rather than redrawing as though the timer vanished.
+  if (payload.activity && Object.keys(payload.activity).length) {
+    wrap._activity = payload.activity;
+  }
   const nodes = [el("h3", null, "Version")];
 
   if (check.error) {
@@ -1464,7 +1470,7 @@ function paintVersion(wrap, payload) {
   // Installed but not watching: the helper would never see the request. It
   // looks exactly like an upgrade that is taking a while, so say which it is
   // before the button is pressed rather than after.
-  const activity = payload.activity || {};
+  const activity = wrap._activity || {};
   if (activity.helper_installed && !activity.helper_watching) {
     nodes.push(el("div", "notice",
       `${activity.unit} is installed but supabase-backup-upgrade.path is not watching the ` +
@@ -1475,13 +1481,110 @@ function paintVersion(wrap, payload) {
   upgrade.addEventListener("click",
     () => startUpgrade(check, wrap, upgrade, recheck, message, output));
   recheck.addEventListener("click", () => loadVersion(wrap, true));
-  nodes.push(bar, output);
+  nodes.push(bar, autoBox(check, activity, wrap), output);
 
   const last = activity.latest;
   if (last && last.state && last.state !== "running" && !upgradeBusy) {
     output.append(upgradeResult(last));
   }
   wrap.replaceChildren(...nodes);
+}
+
+// The twice-daily timer checks either way; this is only whether it may also
+// install. Its own control rather than a line in the settings form below,
+// because it is a decision about the host and not about this console - and
+// because saving the form would be a strange way to change what happens at
+// midnight.
+function autoBox(check, activity, wrap) {
+  const wrapper = el("div", "field auto");
+  const label = el("label", "check");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.id = "set-auto_upgrade";
+  box.checked = check.auto === "patch";
+  label.append(box, document.createTextNode("Install patches automatically"));
+  wrapper.append(label);
+
+  // What a patch is, said where the decision is made. The rule is not obvious
+  // and the consequence of misreading it is a host that updates itself when
+  // you thought it would ask.
+  const when = activity.timer_next
+    ? `Next check ${relative(activity.timer_next)}, ${localTime(activity.timer_next)}.`
+    : "";
+  wrapper.append(el("div", "hint",
+    "A patch is a new commit against the version already running. Anything that " +
+    "changes the version number is left for you — which is what changing it is for. " +
+    when));
+
+  if (activity.timer_installed && !activity.timer_active) {
+    wrapper.append(el("div", "notice",
+      "supabase-backup-upgrade-scheduled.timer is installed but not running, so nothing " +
+      "is checking on a schedule. On the host: systemctl enable --now " +
+      "supabase-backup-upgrade-scheduled.timer"));
+  } else if (activity.timer_installed === false) {
+    wrapper.append(el("div", "notice",
+      "The twice-daily timer is not installed on this host. Re-run " +
+      "supabase-backup-web-setup.sh, or upgrade once from here."));
+  }
+
+  const status = el("span", "bar-msg");
+  wrapper.append(status);
+  box.addEventListener("change", () => setAuto(box, status, wrap));
+  return wrapper;
+}
+
+async function setAuto(box, status, wrap) {
+  const want = box.checked ? "patch" : "off";
+  box.disabled = true;
+  status.className = "bar-msg";
+  status.textContent = "saving…";
+  let id;
+  try {
+    ({ id } = await api("/api/upgrade", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "auto", auto: want }),
+    }));
+  } catch (error) {
+    box.checked = !box.checked;          // it did not take; do not pretend it did
+    box.disabled = false;
+    status.className = "bar-msg err";
+    status.textContent = error.message;
+    return;
+  }
+
+  // The helper writes one small file - fast, and no restart - but it is still
+  // a round trip through root, so wait for the answer rather than assuming.
+  const deadline = Date.now() + 30_000;
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/upgrade/${enc(id)}`);
+    } catch (error) {
+      box.disabled = false;
+      status.className = "bar-msg err";
+      status.textContent = error.message;
+      return;
+    }
+    if ((result.state === "pending" || result.state === "running" ||
+         result.state === "unknown") && Date.now() < deadline) {
+      setTimeout(tick, 700);
+      return;
+    }
+    box.disabled = false;
+    if (result.state === "ok") {
+      status.className = "bar-msg";
+      status.textContent = want === "patch" ? "on" : "off";
+      // Repaint so the terminal and the panel agree on what the file says,
+      // rather than on what was clicked.
+      if (result.check) paintVersion(wrap, { check: result.check, activity: {}, allowed: true });
+    } else {
+      box.checked = !box.checked;
+      status.className = "bar-msg err";
+      status.textContent = result.error || "the host would not set it";
+    }
+  };
+  setTimeout(tick, 500);
 }
 
 function upgradeResult(result) {

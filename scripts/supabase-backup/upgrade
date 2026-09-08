@@ -57,6 +57,51 @@ WEB_UNIT="${WEB_UNIT:-supabase-backup-web.service}"
 CACHE_FILE="${UPGRADE_CACHE:-/var/lib/supabase-backup/upgrade-check.json}"
 CACHE_TTL="${UPGRADE_CACHE_TTL:-21600}"       # 6 hours
 
+# How this host updates itself, when the timer fires. Its own directory rather
+# than a corner of one that already exists: /etc/supabase-backup holds service
+# keys and this must be readable without them, /etc/supabase-backup-web belongs
+# to a console that need not be installed at all.
+AUTO_CONF_DIR="${AUTO_CONF_DIR:-/etc/supabase-backup-upgrade}"
+AUTO_CONF="${AUTO_CONF_DIR}/upgrade.env"
+
+# A version string is "<major>.<minor>", and the commit is the patch level. So
+# a release that did not change VERSION is a patch by definition - which is
+# what "auto" may install, and nothing else. Bumping VERSION is how a change
+# says it wants a person to look at it.
+auto_policy() {
+  local value=""
+  if [ -f "$AUTO_CONF" ]; then
+    value="$(sed -n 's|^[[:space:]]*AUTO_UPGRADE=||p' "$AUTO_CONF" | tail -1 | tr -d '"'"'"'[:space:]')"
+  fi
+  case "$value" in
+    patch) echo patch ;;
+    *)     echo off ;;
+  esac
+}
+
+write_auto_policy() {  # write_auto_policy <patch|off>
+  install -d -m 0755 "$AUTO_CONF_DIR" || return 1
+  local tmp
+  tmp="$(mktemp)" || return 1
+  cat > "$tmp" <<CONF
+# How this host updates itself when supabase-backup-upgrade-scheduled.timer
+# fires. Written by supabase-backup-upgrade; safe to edit by hand.
+#
+#   AUTO_UPGRADE=off      check only, and say so in the console. The default.
+#   AUTO_UPGRADE=patch    also install, but only when the published VERSION is
+#                         the one already running - a new commit against the
+#                         same version. Anything that bumped VERSION is left
+#                         for a person, which is what bumping it is for.
+#
+# Either way the timer refuses while a backup or a restore is running, keeps
+# what it replaced under /var/lib/supabase-backup/rollback, and puts it back if
+# the console will not start on the new code.
+AUTO_UPGRADE=${1}
+CONF
+  install -m 0644 "$tmp" "$AUTO_CONF" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
+}
+
 # ── Colors, only at a terminal ───────────────────────────────────────────────
 if [ -t 1 ]; then
   RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -92,6 +137,10 @@ CORE_FILES=(
   "VERSION|${LIB_DIR}/VERSION|0644"
   "supabase-backup@.service|${UNIT_DIR}/supabase-backup@.service|0644"
   "supabase-backup@.timer|${UNIT_DIR}/supabase-backup@.timer|0644"
+  # Core, not web: a host that never installs the console should still be able
+  # to notice that it is out of date.
+  "supabase-backup-upgrade-scheduled.timer|${UNIT_DIR}/supabase-backup-upgrade-scheduled.timer|0644"
+  "supabase-backup-upgrade-scheduled.service|${UNIT_DIR}/supabase-backup-upgrade-scheduled.service|0644"
 )
 
 WEB_FILES=(
@@ -141,7 +190,7 @@ installed_json() {
   fi
   local version=""
   if [ -f "${LIB_DIR}/VERSION" ]; then
-    version="$(tr -d '[:space:]' < "${LIB_DIR}/VERSION")"
+    version="$(head -1 "${LIB_DIR}/VERSION" | tr -d '[:space:]')"
   fi
   jq -nc --arg v "$version" --arg comp "$(components)" \
      '{version:$v, commit:"", installed_at:"", components:($comp|split(" "))}'
@@ -162,7 +211,7 @@ write_installed() {  # write_installed <version> <commit>
 # ── What is available ────────────────────────────────────────────────────────
 
 remote_version() {
-  curl -fsSL --max-time 20 "${RAW_BASE}/VERSION" 2>/dev/null | tr -d '[:space:]'
+  curl -fsSL --max-time 20 "${RAW_BASE}/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]'
 }
 
 remote_commit() {  # "<sha> <iso date>", or nothing
@@ -188,7 +237,10 @@ cache_read() {
   cached_commit="$(jq -r '.installed.commit // ""' "$CACHE_FILE" 2>/dev/null)"
   live_commit="$(installed_json | jq -r '.commit // ""')"
   [ "$cached_commit" = "$live_commit" ] || return 1
-  cat "$CACHE_FILE"
+  # The policy is not part of what was checked and can change between checks,
+  # so it is answered fresh rather than served back six hours stale.
+  jq -c --arg auto "$(auto_policy)" '.auto = $auto' "$CACHE_FILE" 2>/dev/null \
+    || cat "$CACHE_FILE"
 }
 
 cache_write() {
@@ -253,6 +305,16 @@ check() {  # check [--refresh] -> one JSON object on stdout
     reason="this installation has no recorded version, so what it is running cannot be compared"
   fi
 
+  # A patch is a new commit against the version already running. Only ever true
+  # when both commits are known: "the versions match" on its own is what the
+  # fallback below says when it could not read a commit at all, and installing
+  # on the strength of that would be installing on the strength of nothing.
+  local is_patch=false
+  if [ "$available" = "true" ] && [ "$basis" = "commit" ] \
+     && [ -n "$have_version" ] && [ "$have_version" = "$avail_version" ]; then
+    is_patch=true
+  fi
+
   local body
   body="$(jq -nc \
     --argjson installed "$inst" \
@@ -261,9 +323,11 @@ check() {  # check [--refresh] -> one JSON object on stdout
     --arg error "$error" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson epoch "$(date -u +%s)" --arg comp "$(components)" \
     --arg repo "${GITHUB_USER}/${GITHUB_REPO}" --arg branch "$BRANCH" \
+    --argjson patch "$is_patch" --arg auto "$(auto_policy)" \
     '{installed: ($installed + {components: ($comp|split(" "))}),
       available: {version:$av, commit:$ac, committed_at:$ad},
-      upgrade_available:$up, basis:$basis, reason:$reason, error:$error,
+      upgrade_available:$up, is_patch:$patch, auto:$auto,
+      basis:$basis, reason:$reason, error:$error,
       repo:$repo, branch:$branch, checked_at:$at, checked_at_epoch:$epoch}')"
   cache_write "$body"
   printf '%s\n' "$body"
@@ -285,6 +349,10 @@ print_check() {  # print_check <json>
   [ -n "$ac" ] && line="${line} · ${ac:0:7}"
   printf '  %-11s %s\n' "Available" "$line"
   printf '  %-11s %s\n' "Installed" "$(jq -r '.installed.components | join(", ")' <<<"$j")"
+  case "$(jq -r '.auto // "off"' <<<"$j")" in
+    patch) printf '  %-11s %s\n' "Automatic" "patches, twice a day" ;;
+    *)     printf '  %-11s %s\n' "Automatic" "off - checks twice a day, installs nothing" ;;
+  esac
   echo
   if [ -n "$(jq -r '.error // ""' <<<"$j")" ]; then
     warn "$(jq -r '.error' <<<"$j")"
@@ -466,6 +534,11 @@ apply_body() {  # apply_body <staging> <force>
     || note "could not link /usr/local/bin/supabase-backup-upgrade"
 
   systemctl daemon-reload || note "systemctl daemon-reload reported a problem"
+  # A release can add the timer to a host that predates it. Enabled either way:
+  # it only checks, and what it does beyond checking is the policy file's
+  # decision, which an upgrade does not touch.
+  systemctl enable --now supabase-backup-upgrade-scheduled.timer >/dev/null 2>&1 \
+    || note "could not enable supabase-backup-upgrade-scheduled.timer"
   if web_installed && [ -f "$TMPFILES" ]; then
     systemd-tmpfiles --create "$TMPFILES" >/dev/null 2>&1 \
       || note "systemd-tmpfiles could not create the spool directories"
@@ -505,7 +578,7 @@ apply_body() {  # apply_body <staging> <force>
   fi
 
   local new_version new_commit
-  new_version="$(tr -d '[:space:]' < "${LIB_DIR}/VERSION" 2>/dev/null || true)"
+  new_version="$(head -1 "${LIB_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
   new_commit="${AVAILABLE_COMMIT:-}"
   if [ -z "$new_commit" ]; then new_commit="$(remote_commit | cut -d' ' -f1)"; fi
   write_installed "$new_version" "$new_commit"
@@ -531,6 +604,52 @@ apply() {  # apply <force>
   rm -rf "$staging"
   return "$status"
 }
+
+# ── What the timer runs ──────────────────────────────────────────────────────
+
+scheduled() {
+  local j
+  # --refresh, always: the point of a timer is a fresh answer, and a cached one
+  # is what the console would have had anyway.
+  j="$(check --refresh)"
+
+  local up patch policy
+  up="$(jq -r '.upgrade_available' <<<"$j")"
+  patch="$(jq -r '.is_patch'       <<<"$j")"
+  policy="$(jq -r '.auto // "off"' <<<"$j")"
+
+  if [ "$up" != "true" ]; then
+    echo "up to date - $(jq -r '.reason' <<<"$j")"
+    return 0
+  fi
+  if [ "$policy" != "patch" ]; then
+    echo "an upgrade is available ($(jq -r '.reason' <<<"$j")) - AUTO_UPGRADE is off, installing nothing"
+    return 0
+  fi
+  if [ "$patch" != "true" ]; then
+    # Exactly what bumping VERSION is for: this one wants a person.
+    echo "$(jq -r '.installed.version' <<<"$j") → $(jq -r '.available.version' <<<"$j") is not a patch - leaving it for a person"
+    return 0
+  fi
+
+  echo "installing a patch: $(jq -r '.reason' <<<"$j")"
+  QUIET=""
+  STEPS=()
+  AVAILABLE_COMMIT="$(jq -r '.available.commit // ""' <<<"$j")"
+  APPLY_ERROR=""
+  if apply 0; then
+    echo "done"
+    return 0
+  fi
+  # A refusal is not a failure worth waking anyone for: a backup was running,
+  # and the next tick is twelve hours away. Anything else is.
+  echo "not installed: ${APPLY_ERROR}" >&2
+  case "$APPLY_ERROR" in
+    "a backup or a restore is running"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 
 # ── The spool, for the console's Upgrade button ──────────────────────────────
 # The same shape as every other privileged thing here: the console leaves a
@@ -572,12 +691,33 @@ process() {
   # while the download is still going.
   emit "$id" running ""
 
-  # One verb. A request to *check* would come through here too, and its result
-  # would be indistinguishable from an upgrade that installed nothing - so the
-  # console does its own checking, which needs no privilege at all, and this
-  # spool means one thing.
+  # Two verbs, and both are closed sets: "install what is published", and "set
+  # the policy to one of two values". A request to *check* is not among them -
+  # the console does its own checking, which needs no privilege at all, and a
+  # check result coming back through here would be indistinguishable from an
+  # upgrade that installed nothing.
   action="$(jq -r '.action // "apply"' <<<"$body")"
   case "$action" in
+    auto)
+      local want
+      want="$(jq -r '.auto // ""' <<<"$body")"
+      case "$want" in
+        patch|off) ;;
+        *) emit "$id" failed "the request does not name a policy this helper has"; return 0 ;;
+      esac
+      if [ "$(auto_policy)" = "$want" ]; then
+        note "already ${want}"
+      elif write_auto_policy "$want"; then
+        note "$([ "$want" = patch ] \
+              && echo "patches will be installed by the timer, twice a day" \
+              || echo "the timer will check and install nothing")"
+        note "wrote ${AUTO_CONF}"
+      else
+        emit "$id" failed "could not write ${AUTO_CONF}"
+        return 0
+      fi
+      emit "$id" ok "" "$(jq -c '{check: .}' <<<"$(check --refresh)")"
+      ;;
     apply)
       j="$(check --refresh)"
       AVAILABLE_COMMIT="$(jq -r '.available.commit // ""' <<<"$j")"
@@ -611,11 +751,18 @@ upgrade — bring this host's supabase-backup installation up to date.
   upgrade --check --json  the same, as JSON (what the console reads)
   upgrade --apply         apply without asking
   upgrade --drain         apply pending requests from the console's spool
+  upgrade --scheduled     what the twice-daily timer runs
+  upgrade --auto patch    let the timer install patches on its own
+  upgrade --auto off      let it check only (the default)
   upgrade --record        record what is installed right now (the setup scripts)
   upgrade --version       print the installed version
 
   --refresh   ignore the cached check and ask GitHub again
   --force     upgrade even while a backup or restore is running
+
+A version is <major>.<minor> and the commit is the patch level, so a release
+that did not change VERSION is a patch. That is the only thing --auto patch
+will install: bumping VERSION is how a change says it wants a person to look.
 
 Replaces only code: /opt/supabase-backup, the systemd units, and the console's
 static files. Never a config, never a credential, never an archive, and never
@@ -629,14 +776,17 @@ JSON=0
 REFRESH=""
 MODE="interactive"
 FORCE=0
+AUTO_WANT=""
 AVAILABLE_COMMIT=""
 APPLY_ERROR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --check)    MODE="check" ;;
-    --apply|-y) MODE="apply" ;;
-    --drain)    MODE="drain" ;;
+    --check)     MODE="check" ;;
+    --apply|-y)  MODE="apply" ;;
+    --drain)     MODE="drain" ;;
+    --scheduled) MODE="scheduled" ;;
+    --auto)      MODE="auto"; shift; AUTO_WANT="${1:-}" ;;
     --json)     JSON=1 ;;
     --refresh)  REFRESH="--refresh" ;;
     --force)    FORCE=1 ;;
@@ -680,11 +830,32 @@ case "$MODE" in
     need_root
     RECORD_VERSION=""
     if [ -f "${LIB_DIR}/VERSION" ]; then
-      RECORD_VERSION="$(tr -d '[:space:]' < "${LIB_DIR}/VERSION")"
+      RECORD_VERSION="$(head -1 "${LIB_DIR}/VERSION" | tr -d '[:space:]')"
     fi
     write_installed "$RECORD_VERSION" "$(remote_commit | cut -d' ' -f1)"
     rm -f "$CACHE_FILE" 2>/dev/null || true
     installed_json | jq -r '"\(.version // "unknown") · \(.commit[0:7] // "")"'
+    ;;
+
+  auto)
+    need_root
+    case "$AUTO_WANT" in
+      patch|off) ;;
+      *) fail "--auto takes 'patch' or 'off'" ;;
+    esac
+    write_auto_policy "$AUTO_WANT" || fail "could not write ${AUTO_CONF}"
+    if [ "$AUTO_WANT" = patch ]; then
+      info "patches will be installed by the timer, twice a day"
+      info "anything that bumps VERSION is still left for you"
+    else
+      info "the timer will check and install nothing"
+    fi
+    info "$AUTO_CONF"
+    ;;
+
+  scheduled)
+    need_root
+    scheduled
     ;;
 
   drain)

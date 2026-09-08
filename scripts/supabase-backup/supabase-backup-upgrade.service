@@ -23,7 +23,12 @@ ExecStart=/opt/supabase-backup/upgrade --drain
 # exactly what an untampered one asks for.
 # /var/lib/supabase-backup is not listed: StateDirectory= below makes it, and
 # makes it writable, before this sandbox is set up.
-ReadWritePaths=/opt/supabase-backup /etc/systemd/system /etc/tmpfiles.d -/usr/local/bin /run/supabase-backup-web
+# /etc/supabase-backup-upgrade is the one /etc path this may write, and it
+# holds one key saying whether the timer installs patches on its own. The
+# setup scripts create the directory; the - means a host that predates them
+# gets a unit that still starts, and a console toggle that says it could not
+# write rather than one that fails obscurely.
+ReadWritePaths=/opt/supabase-backup /etc/systemd/system /etc/tmpfiles.d -/etc/supabase-backup-upgrade -/usr/local/bin /run/supabase-backup-web
 InaccessiblePaths=-/etc/supabase-backup -/etc/supabase-backup-web
 StateDirectory=supabase-backup
 StateDirectoryMode=0700

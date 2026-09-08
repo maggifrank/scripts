@@ -108,12 +108,25 @@ chmod 0644 "${LIB_DIR}/catalog.sql" "${LIB_DIR}/VERSION"
 ln -sf "${LIB_DIR}/restore" /usr/local/bin/supabase-restore
 ln -sf "${LIB_DIR}/upgrade" /usr/local/bin/supabase-backup-upgrade
 
-for f in "supabase-backup@.service" "supabase-backup@.timer"; do
+for f in "supabase-backup@.service" "supabase-backup@.timer" \
+         supabase-backup-upgrade-scheduled.service supabase-backup-upgrade-scheduled.timer; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
     || error "could not download ${f}"
   chmod 0644 "${UNIT_DIR}/${f}"
 done
 systemctl daemon-reload
+
+# How this host updates itself. Created empty-handed here so the file exists to
+# be read and, on a host with the console, to be written by its helper - which
+# cannot create the directory itself, being sandboxed out of the rest of /etc.
+install -d -m 0755 /etc/supabase-backup-upgrade
+[ -f /etc/supabase-backup-upgrade/upgrade.env ] || "${LIB_DIR}/upgrade" --auto off >/dev/null 2>&1 || true
+
+# Checks at 00:00 and 12:00 and installs nothing unless told to. A host that
+# never looks is a host that finds out it was behind from the thing that went
+# wrong.
+systemctl enable --now supabase-backup-upgrade-scheduled.timer >/dev/null 2>&1 \
+  || warn "could not enable supabase-backup-upgrade-scheduled.timer"
 
 # Which commit this is, so `supabase-backup-upgrade` can later say whether there
 # is a newer one. Written by the one script that knows what a version is here;
@@ -323,6 +336,7 @@ cat <<EOF
   Add another       re-run this script
   Restore           supabase-restore
   Update            supabase-backup-upgrade
+  Automatic updates supabase-backup-upgrade --auto patch   (off by default)
 
   supabase-restore refuses to write to any project configured here, so it
   cannot overwrite the thing it backs up. Rehearse it against a throwaway

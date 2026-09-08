@@ -1,0 +1,14 @@
+[Unit]
+Description=Check twice a day whether supabase-backup is out of date
+Documentation=https://github.com/maggifrank/scripts/blob/main/scripts/docs/supabase-backup-web.md
+
+[Timer]
+# Midnight and noon. Far from the backup timer's 03:20, so a check - or the
+# patch it may install - is never competing with a run for the same files.
+OnCalendar=*-*-* 00,12:00:00
+# A backup host that was off at midnight should still find out it is behind,
+# rather than waiting until noon to notice.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

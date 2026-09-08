@@ -1736,6 +1736,10 @@ def upgrade_activity():
     props = systemctl_show(UPGRADE_UNIT, ["LoadState", "ActiveState"])
     unit_active = bool(props) and props.get("ActiveState") in ("activating", "active")
     watch = systemctl_show(f"{UNIT_PREFIX}-upgrade.path", ["LoadState", "ActiveState"])
+    # The twice-daily check. Installed but not running is a real state - and
+    # the difference between "nothing to report" and "nobody has looked".
+    timer = systemctl_show(f"{UNIT_PREFIX}-upgrade-scheduled.timer",
+                           ["LoadState", "ActiveState", "NextElapseUSecRealtime"])
     return {
         "running": bool(pending) or unit_active,
         "pending": pending,
@@ -1744,26 +1748,36 @@ def upgrade_activity():
         # request taking a long time to start, unless the console says which.
         "helper_installed": bool(props) and props.get("LoadState") == "loaded",
         "helper_watching": bool(watch) and watch.get("ActiveState") == "active",
+        "timer_installed": bool(timer) and timer.get("LoadState") == "loaded",
+        "timer_active": bool(timer) and timer.get("ActiveState") == "active",
+        "timer_next": iso(parse_systemd_time(timer.get("NextElapseUSecRealtime"))) if timer else None,
         "unit": UPGRADE_UNIT,
     }
 
 
-def submit_upgrade(action):
-    """Leave an upgrade request. It names one verb and nothing else.
+def submit_upgrade(action, auto=None):
+    """Leave an upgrade request. Two verbs, both closed sets.
 
-    No version, no URL, no file list: every one of those is fixed in the helper
-    script, so the worst a rewritten request can ask for is the upgrade someone
-    was already asking for. Checking is not in here either - it needs no
-    privilege, so this process does that itself and the spool means one thing.
+    "apply" names no version, no URL and no file list - every one of those is
+    fixed in the helper script, so the worst a rewritten request can ask for is
+    the upgrade someone was already asking for. "auto" carries one of exactly
+    two words. Checking is in neither: it needs no privilege, so this process
+    does that itself.
     """
-    if action != "apply":
+    if action not in ("apply", "auto"):
         return 400, {"error": "unknown action"}
+    if auto not in (None, "patch", "off"):
+        return 400, {"error": "the automatic setting is either 'patch' or 'off'"}
+    if action == "auto" and auto is None:
+        return 400, {"error": "no automatic setting given"}
     if upgrade_activity()["running"]:
         return 409, {"error": "an upgrade is already running on this host"}
 
     request_id = secrets.token_hex(16)
     request = {"kind": "upgrade", "action": action, "id": request_id,
                "requested_at": iso(time.time())}
+    if action == "auto":
+        request["auto"] = auto
     path = UPGRADE_DIR / f"{request_id}.json"
     try:
         UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2117,8 +2131,9 @@ class Handler(BaseHTTPRequestHandler):
                 body, error = self.read_json_body()
                 if error:
                     return self.send_json(400, {"error": error})
-                action = (body or {}).get("action", "apply")
-                code, payload = submit_upgrade(action)
+                body = body or {}
+                code, payload = submit_upgrade(body.get("action", "apply"),
+                                               body.get("auto"))
                 return self.send_json(code, payload)
             if path == "/api/register":
                 allowed, why = self.may_register()

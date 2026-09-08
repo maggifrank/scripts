@@ -390,6 +390,11 @@ footer code { color: var(--text2); }
 .form.version .hint { margin: 0 0 0.2rem; }
 .form.version .bar { margin-top: 0.75rem; }
 .form.version .notice { margin-top: 0.7rem; }
+/* The automatic-updates switch: part of the version panel, but a standing
+   decision rather than one of its buttons, so it sits below them with air. */
+.form.version .field.auto { margin: 0.85rem 0 0; padding-top: 0.75rem; border-top: 1px solid var(--border); }
+.form.version .field.auto .hint { margin-top: 0.3rem; }
+.form.version .field.auto .bar-msg { display: inline-block; margin-top: 0.35rem; }
 .upgrade-output:empty { display: none; }
 
 /* ── Restore ── */

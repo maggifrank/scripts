@@ -194,11 +194,18 @@ for f in backup.sh catalog.sql upgrade VERSION; do
 done
 chmod 0755 "${LIB_DIR}/backup.sh" "${LIB_DIR}/upgrade"
 chmod 0644 "${LIB_DIR}/catalog.sql" "${LIB_DIR}/VERSION"
-for f in "supabase-backup@.service" "supabase-backup@.timer"; do
+for f in "supabase-backup@.service" "supabase-backup@.timer" \
+         supabase-backup-upgrade-scheduled.service supabase-backup-upgrade-scheduled.timer; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
     || error "could not download ${f}"
   chmod 0644 "${UNIT_DIR}/${f}"
 done
+
+# The directory the console's Automatic switch writes into. Its helper is
+# sandboxed out of the rest of /etc and cannot create this itself, so it is
+# made here - and left saying "off", which is what it means to not have asked.
+install -d -m 0755 /etc/supabase-backup-upgrade
+[ -f /etc/supabase-backup-upgrade/upgrade.env ] || "${LIB_DIR}/upgrade" --auto off >/dev/null 2>&1 || true
 # An installation from before supabase-backup-setup.sh knew about any of this
 # has no upgrade command on PATH. It does now.
 ln -sf "${LIB_DIR}/upgrade" /usr/local/bin/supabase-backup-upgrade
@@ -211,7 +218,10 @@ done
 systemctl daemon-reload
 systemctl enable --now supabase-backup-upgrade.path >/dev/null 2>&1 \
   || error "could not enable supabase-backup-upgrade.path"
+systemctl enable --now supabase-backup-upgrade-scheduled.timer >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-upgrade-scheduled.timer"
 info "upgrade helper installed and watching the spool"
+info "checking for new versions at 00:00 and 12:00; installing nothing unless asked"
 
 # ── The restore helper ────────────────────────────────────────────────────────
 # The same restore an operator runs by hand, reading its answers from a request
@@ -388,6 +398,7 @@ echo "  Registrations     journalctl -u supabase-backup-register -n 30"
 echo "  Settings changes  journalctl -u supabase-backup-reconfigure -n 30"
 echo "  Encryption keys   journalctl -u supabase-backup-keys -n 30"
 echo "  Upgrades          journalctl -u supabase-backup-upgrade -n 50"
+echo "  Version checks    journalctl -u supabase-backup-upgrade-scheduled -n 50"
 echo "  Restores          journalctl -u supabase-backup-restore -n 50"
 echo "  Logs              journalctl -u supabase-backup-web -n 30"
 echo "  Settings          ${WEB_CONF_DIR}/web.env"

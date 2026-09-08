@@ -198,15 +198,18 @@ age -d -i backup.key <archive>.tar.gz.age | tar xz -C /tmp/restore   # by hand
 /etc/supabase-backup/<p>.conf   credentials, 0600, one per project
 /etc/supabase-backup-keys/      age recipients, 0644, public keys only
   <p>.recipients
+/etc/supabase-backup-upgrade/   upgrade.env, whether the timer installs patches
 /var/backups/supabase/<p>/      archives, 0700
 /var/lib/supabase-backup/       rollback/, what the last few upgrades replaced
 /etc/systemd/system/supabase-backup@.{service,timer}
 ```
 
-The two `/etc` directories are separate because their audiences are. One holds
-a service key and is readable by root alone; the other holds public keys, which
-are not secret and which the web console has to read to show what a project
-encrypts to.
+The `/etc` directories are separate because their audiences are. One holds a
+service key and is readable by root alone; one holds public keys, which are not
+secret and which the web console has to read to show what a project encrypts
+to; one holds a single line about how this host updates itself, which the
+upgrade helper must be able to write while being sandboxed out of the other
+two.
 
 ## Operating
 
@@ -245,12 +248,50 @@ first, and put back if the console does not come up on the new code.
 now — `VERSION` is the name a human reads, the commit is what decides. It
 refuses while a backup or a restore is running; `--force` overrides that.
 
+A version is `<major>.<minor>` and the commit is the patch level, so it reads
+`1.0 · bfad114`. A release that did not change `VERSION` is a patch by
+definition — which is what automatic updates key off, below.
+
+### Checking on a schedule
+
+`supabase-backup-upgrade-scheduled.timer` runs at **00:00 and 12:00**, clear of
+the backup timer's 03:20, and `Persistent=true` so a host that was off at
+midnight notices at boot instead of waiting for noon.
+
+```bash
+systemctl list-timers supabase-backup-upgrade-scheduled.timer
+journalctl -u supabase-backup-upgrade-scheduled -n 50
+```
+
+By default it only checks — which on a host with no console means the journal
+is where you find out, and on one with a console means the version panel is
+already current when you open it.
+
+```bash
+supabase-backup-upgrade --auto patch    # let it install patches too
+supabase-backup-upgrade --auto off      # back to checking only (the default)
+```
+
+That writes one key to `/etc/supabase-backup-upgrade/upgrade.env`. **Only ever
+a patch**: a new commit against the version already running, with both commits
+known. Anything that bumped `VERSION` is left alone, and so is the case where
+the commit could not be read at all.
+
+Worth being clear about what `patch` buys and costs. It means this host follows
+`main` and a push reaches it within twelve hours unwatched. The rollback catches
+a console that will not start; it does not catch a bug in `backup.sh` that runs
+perfectly and backs up the wrong thing. Note also which way the default cuts:
+*not* bumping `VERSION` is what makes a change auto-deployable, so remembering
+to bump is what holds one back. Leaving it `off` keeps the checking, which is
+the half with no downside.
+
 Re-running `supabase-backup-setup.sh` also updates the code, and still works.
 The difference is that it is an installer: it asks the questions an installer
 asks, including which project to add.
 
-The console has the same thing behind its gear icon — see
-[the console's Upgrading section](supabase-backup-web.md#upgrading).
+The console has the same thing behind its gear icon, including a switch for the
+automatic half — see [the console's Upgrading
+section](supabase-backup-web.md#upgrading).
 
 ## Configuration
 

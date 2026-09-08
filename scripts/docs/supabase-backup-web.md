@@ -198,11 +198,26 @@ installed   core, web
 source      maggifrank/scripts · main
 ```
 
-`VERSION` is a string someone typed into the repository. The commit is what
-actually decides, because a version string is only as honest as whoever
-remembered to bump it: the check asks GitHub for the last commit that touched
-`scripts/supabase-backup` and compares it with the one recorded here at install
-time. If the API cannot be reached it falls back to comparing the two `VERSION`
+### What a version number means here
+
+A version is `<major>.<minor>`, and **the commit is the patch level**:
+
+| | Version | Shown as |
+|---|---|---|
+| patch | unchanged | `1.0 · bfad114` |
+| minor | `1.0` → `1.1` | `1.1 · 9c31a02` |
+| major | `1.1` → `2.0` | `2.0 · 4e7b118` |
+
+So a release that did not change `VERSION` *is* a patch, by definition. That is
+not just a naming convention — it is what [automatic updates](#automatic-updates)
+key off, which makes bumping `VERSION` the deliberate act of saying "this one
+wants a person to look at it".
+
+`VERSION` is still a string someone typed. The commit is what actually decides
+whether an upgrade exists, because a version string is only as honest as
+whoever remembered to bump it: the check asks GitHub for the last commit that
+touched `scripts/supabase-backup` and compares it with the one recorded here at
+install time. If the API cannot be reached it falls back to comparing the two `VERSION`
 strings and says that is what it did — a smaller question, answered out loud
 rather than quietly.
 
@@ -243,6 +258,55 @@ supabase-backup-upgrade.service  (root, oneshot)
 A request names a verb and nothing else. There is no version to choose and no
 URL to supply — every one of those is fixed in `upgrade` itself — so a request
 that was rewritten on the way asks for exactly what an untampered one asks for.
+
+### Automatic updates
+
+`supabase-backup-upgrade-scheduled.timer` runs at **00:00 and 12:00**, well
+clear of the backup timer's 03:20. It is `Persistent=true`, so a host that was
+off at midnight finds out it is behind at boot rather than waiting for noon.
+
+By default it only checks. That alone is worth having: the console's version
+panel then has a fresh answer without anyone opening it, and a host that never
+looks is a host that finds out it was behind from the thing that went wrong.
+
+Whether it also installs is one key in `/etc/supabase-backup-upgrade/upgrade.env`:
+
+```
+AUTO_UPGRADE=off      check only, and say so in the console. The default.
+AUTO_UPGRADE=patch    also install, but only a patch.
+```
+
+Set it with the **Install patches automatically** switch in the version panel,
+or on the host:
+
+```sh
+supabase-backup-upgrade --auto patch
+supabase-backup-upgrade --auto off
+```
+
+**Only ever a patch** — a new commit against the version already running. The
+timer will not cross a version bump on its own, and it will not act on the
+version-string fallback either: `is_patch` is true only when both commits are
+known, because "the version numbers match" is exactly what the fallback says
+when it could not read a commit at all, and installing on the strength of that
+would be installing on the strength of nothing.
+
+It also inherits every guard the manual path has. It refuses while a backup or
+a restore is running — and a refusal is not treated as a failure, because the
+next tick is twelve hours away and nothing is wrong. It stages, checks, keeps a
+rollback, and puts everything back if the console will not start.
+
+#### What you are agreeing to
+
+Turning this on means this host follows `main`, and a push reaches it within
+twelve hours with nobody watching. The rollback catches a console that will not
+start. It does **not** catch a subtle bug in `backup.sh` that still runs.
+
+Note which way the default cuts: under this scheme, *not* bumping `VERSION` is
+what makes a change auto-deployable. So a change you would want looked at needs
+you to remember to bump — the same class of thing the commit-based check exists
+to avoid depending on. If that trade does not appeal, leave it `off` and let
+the timer do the checking, which is the part that has no downside.
 
 ### What an upgrade replaces, and what it will not touch
 
@@ -329,6 +393,13 @@ supabase-backup-upgrade --check         # say what is available and stop
 supabase-backup-upgrade --apply         # no questions
 supabase-backup-upgrade --refresh       # ignore the six-hour cached check
 supabase-backup-upgrade --force         # even while a backup is running
+supabase-backup-upgrade --auto patch    # let the timer install patches
+supabase-backup-upgrade --auto off      # let it check only
+```
+
+```sh
+systemctl list-timers supabase-backup-upgrade-scheduled.timer
+journalctl -u supabase-backup-upgrade-scheduled -n 50
 ```
 
 Re-running `supabase-backup-web-setup.sh` still works and still updates the
