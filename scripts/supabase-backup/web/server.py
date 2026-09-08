@@ -1360,6 +1360,25 @@ def validate_encryption(project, body):
     return {"project": project, "recipients": cleaned}, None
 
 
+def encryption_helper():
+    """Whether anything on this host is listening for encryption requests.
+
+    Installed but not enabled is a real state, and from the browser it looks
+    exactly like a request that is taking a while - the console writes the
+    request either way, and it simply sits there. The difference is only
+    visible from here, so it has to be reported from here.
+    """
+    unit = f"{UNIT_PREFIX}-keys.service"
+    watch = f"{UNIT_PREFIX}-keys.path"
+    props = systemctl_show(unit, ["LoadState"])
+    path = systemctl_show(watch, ["LoadState", "ActiveState"])
+    return {
+        "installed": bool(props) and props.get("LoadState") == "loaded",
+        "watching": bool(path) and path.get("ActiveState") == "active",
+        "unit": watch,
+    }
+
+
 def submit_encryption(request):
     known, _ = discover_projects()
     if request["project"] not in known:
@@ -2079,6 +2098,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload["capabilities"]["encryption"] = allowed
                 payload["capabilities"]["encryption_blocked_because"] = why
                 payload["restore"] = restore_activity() if ALLOW_RESTORE else None
+                # Only worth the two systemctl calls when the panel that uses
+                # it is being offered at all.
+                payload["encryption_helper"] = encryption_helper() if ALLOW_ENCRYPTION else None
                 return self.send_json(200, payload)
             match = re.fullmatch(r"/api/projects/([^/]+)/archives", path)
             if match:
