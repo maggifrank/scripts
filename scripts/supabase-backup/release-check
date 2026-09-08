@@ -20,7 +20,18 @@ else
   RED=""; GREEN=""; YELLOW=""; BOLD=""; NC=""
 fi
 QUIET=""
-[ "${1:-}" = "--quiet" ] && QUIET=1
+AGAINST=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet)   QUIET=1 ;;
+    --against) shift; AGAINST="${1:-}" ;;
+    # Loudly. A caller asking for a check this version does not have - a
+    # workflow calling a flag that was never committed, say - must not be
+    # answered with a pass.
+    *) printf 'release-check: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 PROBLEMS=0
 bad()  { printf '%s✗%s %s\n' "$RED" "$NC" "$1" >&2; PROBLEMS=$((PROBLEMS + 1)); }
@@ -94,9 +105,48 @@ else
 
   [ -z "$missing" ] && [ -z "$phantom" ] \
     && ok "payload lists all $(printf '%s\n' "$payload" | grep -c . ) installed files, and nothing else"
+  PAYLOAD_LIST="$payload"
 fi
 
-# ── 4. It parses as what it claims to be ─────────────────────────────────────
+# ── 4. A change that reaches hosts has to say what kind of change it is ──────
+# The rule with nothing behind it used to be judgement: whether a change
+# deserved a version bump. Leaving VERSION alone was an omission, and omissions
+# are what a tired person - or a fresh session that never read the docs -
+# produces by default. Here the default is also the dangerous one: a patch
+# installs itself on hosts running AUTO_UPGRADE=patch, unattended.
+#
+# So neither answer is the default any more. Change what ships and you either
+# bump VERSION or write down that you meant a patch. It cannot tell a fix from
+# a feature - nothing can - but it can refuse to let the question go unasked,
+# and an answer in the history is one that can be argued with later.
+if [ -n "$AGAINST" ]; then
+  if [ -z "${PAYLOAD_LIST:-}" ]; then
+    bad "cannot tell what ships from here, so the change declaration cannot be checked"
+  elif ! git rev-parse --verify --quiet "${AGAINST}^{commit}" >/dev/null; then
+    bad "cannot compare against '${AGAINST}' - it is not a commit this clone has. A shallow checkout is the usual reason."
+  else
+    SHIPPED=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      printf '%s\n' "$PAYLOAD_LIST" | grep -qxF "$f" && SHIPPED=$((SHIPPED + 1))
+    done < <(git diff --name-only "${AGAINST}...HEAD" -- . | sed 's|^scripts/supabase-backup/||')
+
+    BUMPED="$(git diff --name-only "${AGAINST}...HEAD" -- VERSION | grep -c . || true)"
+
+    if [ "$SHIPPED" -eq 0 ]; then
+      ok "nothing that ships to a host changed"
+    elif [ "${BUMPED:-0}" -gt 0 ]; then
+      ok "${SHIPPED} file(s) that ship changed, and VERSION was bumped"
+    elif git log --format='%B' "${AGAINST}..HEAD" \
+         | grep -qiE '^[[:space:]]*Release:[[:space:]]*patch[[:space:]]*$'; then
+      ok "${SHIPPED} file(s) that ship changed, declared a patch"
+    else
+      bad "${SHIPPED} file(s) that ship to hosts changed and VERSION did not, which makes this a patch - and a patch installs itself, unattended, on any host set to AUTO_UPGRADE=patch. Say which you meant: bump scripts/supabase-backup/VERSION and add a CHANGELOG.md entry, or put the line 'Release: patch' in a commit message on this branch."
+    fi
+  fi
+fi
+
+# ── 5. It parses as what it claims to be ─────────────────────────────────────
 # The same check `upgrade` makes before installing. Making it here means a
 # broken release is caught before it is published rather than after.
 parsed=0
