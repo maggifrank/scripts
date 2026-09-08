@@ -7,6 +7,26 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.2 — 2026-09-08
+
+An upgrade finishes in one pass.
+
+- An upgrade runs the script that was already installed, so it could only ever
+  install the file list *that* script knew about. A release adding a file
+  therefore landed incomplete — and then recorded a version whose files were
+  not all there, so the host looked up to date and was not. When the script
+  replaces itself it now hands over to the copy it just installed and lets it
+  finish with its own list. Once only; a second release in a row cannot turn it
+  into a loop.
+- `/etc/supabase-backup-upgrade` is created by an `ExecStartPre=` with the `+`
+  prefix, which runs before the sandbox is applied. The helper could always
+  write into that directory but never create it, so on a host that had never
+  run a setup script the console's **Install patches automatically** switch
+  could only answer "could not write".
+- An upgrade that replaced nothing no longer restarts the console. There was
+  nothing new for it to run, and the restart cost a second of downtime to
+  achieve it.
+
 ## 1.1 — 2026-09-08
 
 Release notes, and something that checks them.
