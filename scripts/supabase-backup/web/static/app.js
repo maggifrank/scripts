@@ -569,9 +569,14 @@ function pollEncryption(id, project, container, button, message, output) {
 
     const ok = result.state === "ok";
     const box = el("div", `result ${ok ? "ok" : "bad"}`);
+    // "Not applied" would be a guess for a stalled request: nothing read it, so
+    // nothing decided anything. Saying it is still sitting there is the fact,
+    // and the one that points at the thing to go and fix.
     box.append(el("div", null, ok
       ? "Applied. It takes effect on the next run — archives already on disk are unchanged."
-      : `Not applied — ${result.error || "the host reported a failure"}`));
+      : result.state === "stalled"
+        ? `Still waiting — ${result.error}`
+        : `Not applied — ${result.error || "the host reported a failure"}`));
     if (Array.isArray(result.steps) && result.steps.length) {
       const ul = el("ul", "steps");
       for (const step of result.steps) ul.append(el("li", null, step));

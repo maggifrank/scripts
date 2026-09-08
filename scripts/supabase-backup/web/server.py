@@ -155,6 +155,16 @@ UPGRADE_CACHE   = Path(env("WEB_UPGRADE_CACHE", str(STATE_DIR / "upgrade-check.j
 
 # A proxy terminating TLS on another host, trusted to speak for the client.
 TRUSTED_PROXIES = {h.strip() for h in env("WEB_TRUSTED_PROXIES", "").split(",") if h.strip()}
+# How long a request may sit unread before the console stops calling it
+# progress. Generous: the helpers test a database connection and a service key,
+# which is seconds, not minutes.
+STALL_SECONDS = float(env("WEB_STALL_SECONDS", "120"))
+SPOOL_UNITS = {
+    "register":   "supabase-backup-register",
+    "restore":    "supabase-backup-restore",
+    "settings":   "supabase-backup-settings",
+    "encryption": "supabase-backup-keys",
+}
 MAX_BODY = 64 * 1024
 LOOPBACK = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 
@@ -1275,6 +1285,12 @@ def spool_result(request_id, pending_dir):
     one, 'pending' while the request is still sitting there, and 'unknown' for
     an id with neither - a request that was applied before this console
     started, or one that never existed.
+
+    A fourth answer, 'stalled', is for a request nothing has picked up. Every
+    helper answers its request even when it fails, so a file still sitting in
+    the spool minutes later does not mean the work is slow - it means nothing
+    is reading the spool at all, and the page would otherwise say "applying"
+    for ever. The .path unit not being enabled is the way that happens.
     """
     if not REQUEST_ID_RE.match(request_id or ""):
         return 404, {"error": "no such request"}
@@ -1282,8 +1298,19 @@ def spool_result(request_id, pending_dir):
     try:
         return 200, json.loads(result.read_text())
     except FileNotFoundError:
-        pending = (pending_dir / f"{request_id}.json").exists()
-        return 200, {"id": request_id, "state": "pending" if pending else "unknown"}
+        request = pending_dir / f"{request_id}.json"
+        try:
+            waiting = time.time() - request.stat().st_mtime
+        except OSError:
+            return 200, {"id": request_id, "state": "unknown"}
+        if waiting > STALL_SECONDS:
+            unit = SPOOL_UNITS.get(pending_dir.name, "the helper")
+            return 200, {"id": request_id, "state": "stalled", "waiting_s": int(waiting),
+                         "error": f"nothing has picked this up in {int(waiting)}s. The "
+                                  f"privileged helper is not reading the spool - check "
+                                  f"`systemctl status {unit}.path` on the host, and "
+                                  f"`journalctl -u {unit}` for why it stopped."}
+        return 200, {"id": request_id, "state": "pending", "waiting_s": int(waiting)}
     except (OSError, ValueError) as exc:
         return 500, {"error": f"could not read the result: {exc}"}
 

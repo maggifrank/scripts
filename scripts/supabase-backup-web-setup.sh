@@ -165,6 +165,17 @@ curl -fsSL --max-time 30 "${RAW_BASE}/keys" -o "${LIB_DIR}/keys" \
   || error "could not download the encryption helper"
 chmod 0755 "${LIB_DIR}/keys"
 
+# Before the unit, not by it. supabase-backup-keys.service runs under
+# ProtectSystem=strict with this path in ReadWritePaths=, and systemd refuses
+# to start a unit whose ReadWritePaths= names a directory that does not exist -
+# it fails at namespace setup, before ExecStart, so the helper never runs to
+# create the directory itself. The console is left polling a result that will
+# never be written.
+#
+# 0755: these are public keys. The console has to read them to show what a
+# project encrypts to, and it runs as another user.
+install -d -m 0755 /etc/supabase-backup-keys
+
 for f in supabase-backup-keys.path supabase-backup-keys.service; do
   curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
     || error "could not download ${f}"

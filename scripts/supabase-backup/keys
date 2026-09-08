@@ -32,6 +32,12 @@ AGE_RE='^age1[023456789acdefghjklmnpqrstuvwxyz]{58}$'
 SSH_RE='^ssh-(ed25519|rsa) [A-Za-z0-9+/]+={0,3}( [^[:cntrl:]]{0,200})?$'
 
 STEPS=()
+# The console polls for a result and shows "applying" until one appears, so an
+# unanswered request is not a silent failure - it is a spinner that never
+# stops. These two exist so that every path out of this script answers.
+CURRENT_ID=""
+EMITTED=0
+
 note() { STEPS+=("$1"); printf '  %s\n' "$1"; }
 
 emit() {  # emit <id> <state> <error>
@@ -45,7 +51,24 @@ emit() {  # emit <id> <state> <error>
   chmod 0640 "${RES_DIR}/${id}.json.tmp"
   chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
   mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
+  EMITTED=1
 }
+
+on_exit() {
+  # Anything that reached here having read a request and not answered it: a
+  # set -e abort, a kill, a systemd timeout. The journal has the detail; the
+  # console gets told the attempt is over, which is the part it cannot work out
+  # for itself.
+  [ -n "$CURRENT_ID" ] && [ "$EMITTED" = "0" ] || return 0
+  STEPS=()
+  emit "$CURRENT_ID" failed "the helper stopped without finishing - journalctl -u supabase-backup-keys"
+}
+trap on_exit EXIT
+# An untrapped TERM kills the shell without running the EXIT trap, and a
+# systemd timeout or `systemctl stop` is exactly a TERM - the case where the
+# console most needs telling. Exiting from the handler is what gets it there.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # ALLOW_PLAINTEXT is backup.sh's answer to "the recipients file is gone and
 # there are encrypted archives here" — it refuses, rather than quietly writing
@@ -71,6 +94,9 @@ process() {
   local id
   id="$(basename "$file" .json)"
   [[ "$id" =~ ^[0-9a-f]{32}$ ]] || { rm -f "$file"; return 0; }
+  # From here on this request is answerable, so on_exit will answer it if
+  # nothing below does.
+  CURRENT_ID="$id"; EMITTED=0
 
   local body project count
   body="$(cat "$file")" || { emit "$id" failed "could not read the request"; rm -f "$file"; return 0; }
@@ -89,7 +115,13 @@ process() {
   count="$(jq -r '.recipients | length' <<<"$body")"
   [ "$count" -le 32 ] || { emit "$id" failed "too many recipients (${count})"; return 0; }
 
-  install -d -m 0755 "$KEYS_DIR"
+  # Normally already there - supabase-backup-web-setup.sh creates it, because
+  # this unit cannot start at all without it. Guarded anyway: failing here
+  # without an answer is what turns a missing directory into a spinner.
+  install -d -m 0755 "$KEYS_DIR" 2>/dev/null || {
+    emit "$id" failed "cannot create ${KEYS_DIR}. Run: install -d -m 0755 ${KEYS_DIR}"
+    return 0
+  }
   local target="${KEYS_DIR}/${project}.recipients"
 
   # ── Disabling ──
