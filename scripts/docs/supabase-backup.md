@@ -462,15 +462,48 @@ every script parses as what it claims to be.
 
 It runs in three places, deliberately overlapping:
 
-- **A pre-commit hook**, once per clone: `git config core.hooksPath .githooks`
-- **GitHub Actions**, on every push and PR touching the tool — this one runs
-  whoever committed and from wherever, including when the hook is not enabled
-- **By hand**, before pushing something you care about
+- **By hand**, before you push something you care about
+- **A pre-commit hook**, once per clone: `git config core.hooksPath .githooks`.
+  Fast, local, and skippable with `--no-verify`
+- **GitHub Actions**, on every push and pull request. This one runs whoever
+  committed and from wherever, and it is the one `main` is protected by
 
-The hook can be skipped with `--no-verify` and the workflow does not block a
-push, since nothing protects `main`. That is the honest limit of it: these make
-a mistake loud and immediate, not impossible. If you want it impossible, branch
-protection on `main` with the check required is the thing that does it.
+### `main` is protected
+
+Hosts install from `main`, and with `AUTO_UPGRADE=patch` some of them install
+without being asked. So `main` is not a branch you push to:
+
+- direct pushes are refused
+- changes land through a pull request
+- the `check` status must be green before it can merge
+- no bypass, including for you, and force-pushing and deletion are blocked
+
+No approving review is required, so a pull request you opened is one you can
+merge yourself as soon as CI is green — about twenty seconds.
+
+```bash
+git checkout -b fix-the-thing
+# ... edit, commit ...
+git push -u origin fix-the-thing
+gh pr create --fill
+gh pr merge --squash --delete-branch    # once the check is green
+```
+
+`--auto` is worth knowing about: `gh pr merge --auto --squash --delete-branch`
+queues the merge for the moment the check passes, so you do not have to come
+back to it.
+
+If this is ever the wrong trade — a CI outage, something that has to land
+now — the protection is one command away from being off, and putting it back
+is the same command with `active`:
+
+```bash
+gh api -X PUT repos/maggifrank/scripts/rulesets/22563743 -f enforcement=disabled
+```
+
+That is deliberately not a bypass actor. A standing exemption is one nobody
+notices using; a command you have to type is a decision you can see afterwards
+in the audit log.
 
 ## Rehearse it
 
