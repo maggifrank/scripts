@@ -746,6 +746,16 @@ async function fillArchive(body, project, archive) {
     const download = el("a", "btn-ghost", "Download");
     download.href = `/api/projects/${enc(project)}/archives/${enc(archive.name)}/download`;
     actions.append(download);
+  } else if (archive.encrypted) {
+    // Downloads are off because an archive holds every auth password hash and
+    // every stored object. That reasoning does not survive encryption - what
+    // would leave here is ciphertext - and saying nothing leaves someone with
+    // a key at a panel offering only "Check for damage", with no hint that
+    // taking the archive to the key is how an encrypted one is read at all.
+    actions.append(el("span", "bar-msg",
+      "Encrypted, so what would leave here is ciphertext — taking it to the machine that "
+      + "holds the key is how it gets read. Downloading over HTTP is off "
+      + "(WEB_ALLOW_DOWNLOAD, in the gear); scp from the host needs nothing turned on."));
   }
 
   // The form opens inside the archive it would restore, never beside it: which
