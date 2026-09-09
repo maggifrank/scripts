@@ -196,6 +196,7 @@ WEB_FILES=(
   "register|${LIB_DIR}/register|0755"
   "reconfigure|${LIB_DIR}/reconfigure|0755"
   "keys|${LIB_DIR}/keys|0755"
+  "credentials|${LIB_DIR}/credentials|0755"
   "web/server.py|${WEB_DIR}/server.py|0755"
   "web/static/index.html|${WEB_DIR}/static/index.html|0644"
   "web/static/app.js|${WEB_DIR}/static/app.js|0644"
@@ -208,6 +209,8 @@ WEB_FILES=(
   "supabase-backup-reconfigure.service|${UNIT_DIR}/supabase-backup-reconfigure.service|0644"
   "supabase-backup-keys.path|${UNIT_DIR}/supabase-backup-keys.path|0644"
   "supabase-backup-keys.service|${UNIT_DIR}/supabase-backup-keys.service|0644"
+  "supabase-backup-credentials.path|${UNIT_DIR}/supabase-backup-credentials.path|0644"
+  "supabase-backup-credentials.service|${UNIT_DIR}/supabase-backup-credentials.service|0644"
   "supabase-backup-restore.path|${UNIT_DIR}/supabase-backup-restore.path|0644"
   "supabase-backup-restore.service|${UNIT_DIR}/supabase-backup-restore.service|0644"
   "supabase-backup-upgrade.path|${UNIT_DIR}/supabase-backup-upgrade.path|0644"
@@ -747,7 +750,8 @@ apply_body() {  # apply_body <staging> <force>
     # at the setup script, and an upgrade is not the place to revisit it.
     local unit
     for unit in supabase-backup-register.path supabase-backup-reconfigure.path \
-                supabase-backup-keys.path supabase-backup-upgrade.path; do
+                supabase-backup-keys.path supabase-backup-credentials.path \
+                supabase-backup-upgrade.path; do
       systemctl enable --now "$unit" >/dev/null 2>&1 || true
     done
     note "helpers reloaded and watching their spools"

@@ -136,6 +136,14 @@ KEYS_DIR         = Path(env("KEYS_DIR", "/etc/supabase-backup-keys"))
 ENCRYPTION_DIR   = SPOOL_DIR / "encryption"
 ALLOW_ENCRYPTION = env_bool("WEB_ALLOW_ENCRYPTION", True)
 
+# Rotating a project's credentials. The console cannot read the ones in force -
+# /etc/supabase-backup is out of its reach and stays that way - so this only
+# ever carries new ones towards the helper that can. Rotation was an SSH
+# session and a text editor before this, which is why it did not happen, and a
+# credential that is never rotated has been exposed since the day it was made.
+CREDENTIALS_DIR   = SPOOL_DIR / "credentials"
+ALLOW_CREDENTIALS = env_bool("WEB_ALLOW_CREDENTIALS", True)
+
 # Upgrading. The console cannot replace the code it is running - /opt is
 # read-only to it - so this goes through the spool like everything else
 # privileged here: it asks, and supabase-backup-upgrade.service downloads and
@@ -1360,6 +1368,87 @@ def validate_encryption(project, body):
     return {"project": project, "recipients": cleaned}, None
 
 
+def validate_credentials(project, body):
+    """Check a credential rotation before it is written to the spool.
+
+    Every field is optional and at least one is required: a rotation is usually
+    one credential, and making someone re-type the two that did not change is
+    how a rotation becomes a typo. The helper fills the rest in from the file
+    this process cannot read.
+    """
+    if not isinstance(body, dict):
+        return None, "expected a JSON object"
+
+    request = {"kind": "credentials", "project": project}
+
+    database_url = (body.get("database_url") or "").strip()
+    if database_url:
+        if not database_url.startswith(("postgresql://", "postgres://")):
+            return None, "the session pooler URI must be a postgresql:// URI"
+        if ":5432/" not in database_url:
+            return None, ("the URI must use port 5432 (session pooler). Transaction mode on "
+                          "6543 does not hold a session across statements, so pg_dump fails "
+                          "partway through and the backup that proves it is the nightly one.")
+        request["database_url"] = database_url
+
+    supabase_url = (body.get("supabase_url") or "").strip().rstrip("/")
+    if supabase_url:
+        if not re.fullmatch(r"https://[a-z0-9-]+\.supabase\.(co|com)", supabase_url):
+            return None, "the project URL must look like https://<ref>.supabase.co"
+        request["supabase_url"] = supabase_url
+
+    service_key = (body.get("service_key") or "").strip()
+    if service_key:
+        if len(service_key) < 20:
+            return None, "that service key looks too short"
+        request["service_key"] = service_key
+
+    if len(request) == 2:                       # kind and project only
+        return None, "nothing to rotate — give at least one new credential"
+
+    # Both halves have to agree, and only both halves can be checked here. When
+    # one of them is staying as it is, the helper is the only side that can
+    # compare them, because it is the only side that can read the other.
+    if "database_url" in request and "supabase_url" in request:
+        db_ref = re.sub(r".*://(?:postgres\.)?([a-z0-9]+)[.:/].*", r"\1", database_url)
+        url_ref = re.sub(r"https://([a-z0-9-]+)\..*", r"\1", supabase_url)
+        if db_ref != url_ref:
+            return None, (f"credentials disagree: the URI names '{db_ref}' but the project "
+                          f"URL names '{url_ref}'")
+    return request, None
+
+
+def submit_credentials(request):
+    known, _ = discover_projects()
+    if request["project"] not in known:
+        return 404, {"error": "no such project"}
+
+    request_id = secrets.token_hex(16)
+    request["id"] = request_id
+    request["requested_at"] = iso(time.time())
+    path = CREDENTIALS_DIR / f"{request_id}.json"
+    try:
+        CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
+        # 0600 before a byte of it exists: it holds a database password and a
+        # service key until the helper shreds it.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(request, fh)
+    except OSError as exc:
+        return 500, {"error": f"could not write the request: {exc}. Is the spool directory present?"}
+    return 202, {"id": request_id, "project": request["project"], "state": "pending"}
+
+
+def credentials_helper():
+    """Whether anything on this host is listening for credential rotations."""
+    watch = systemctl_show(f"{UNIT_PREFIX}-credentials.path", ["LoadState", "ActiveState"])
+    return {
+        "installed": bool(watch) and watch.get("LoadState") == "loaded",
+        "watching": bool(watch) and watch.get("ActiveState") == "active",
+        "unit": f"{UNIT_PREFIX}-credentials.path",
+    }
+
+
 def encryption_helper():
     """Whether anything on this host is listening for encryption requests.
 
@@ -1986,6 +2075,24 @@ class Handler(BaseHTTPRequestHandler):
             "A restore sends the target project's database password and its service key, "
             "so it")
 
+    def may_rotate(self):
+        """Whether THIS connection may carry a project's new credentials.
+
+        The same rule as registration, for the same reason: what travels here
+        is a database password and a service key that bypasses RLS on the whole
+        project. That they are replacing an old pair rather than creating a new
+        one changes nothing about what a listener would get.
+        """
+        if not ALLOW_CREDENTIALS:
+            return False, ("rotating credentials from the console is disabled "
+                           "(WEB_ALLOW_CREDENTIALS=0). Edit the project's .conf on the host.")
+        if not CREDENTIALS_DIR.is_dir():
+            return False, (f"the rotation helper is not installed: {CREDENTIALS_DIR} does not "
+                           "exist, so a rotation would sit in the spool unread. Re-run "
+                           "supabase-backup-web-setup.sh on the host.")
+        return self.credential_channel(
+            "Rotating a credential sends a database password and a service key, so it")
+
     def may_encrypt(self):
         """Whether THIS connection may change what a project encrypts to.
 
@@ -2118,6 +2225,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Only worth the two systemctl calls when the panel that uses
                 # it is being offered at all.
                 payload["encryption_helper"] = encryption_helper() if ALLOW_ENCRYPTION else None
+                allowed, why = self.may_rotate()
+                payload["capabilities"]["credentials"] = allowed
+                payload["capabilities"]["credentials_blocked_because"] = why
+                payload["credentials_helper"] = credentials_helper() if ALLOW_CREDENTIALS else None
                 return self.send_json(200, payload)
             match = re.fullmatch(r"/api/projects/([^/]+)/archives", path)
             if match:
@@ -2166,6 +2277,10 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 code, payload = spool_result(match.group(1), ENCRYPTION_DIR)
                 return self.send_json(code, payload)
+            match = re.fullmatch(r"/api/credentials/([^/]+)", path)
+            if match:
+                code, payload = spool_result(match.group(1), CREDENTIALS_DIR)
+                return self.send_json(code, payload)
             match = re.fullmatch(r"/api/restore/([^/]+)", path)
             if match:
                 # Readable whether or not restores are still allowed: turning
@@ -2178,6 +2293,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not ALLOW_RUN:
                     return self.send_json(403, {"error": "starting runs is disabled (WEB_ALLOW_RUN=0)"})
                 return self.project_endpoint("run", match.group(1), None)
+            match = re.fullmatch(r"/api/projects/([^/]+)/credentials", path)
+            if match:
+                allowed, why = self.may_rotate()
+                if not allowed:
+                    return self.send_json(403, {"error": why})
+                body, error = self.read_json_body()
+                if error:
+                    return self.send_json(400, {"error": error})
+                return self.project_endpoint("credentials", match.group(1), None, body=body)
             match = re.fullmatch(r"/api/projects/([^/]+)/encryption", path)
             if match:
                 allowed, why = self.may_encrypt()
@@ -2251,6 +2375,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, journal_runs(project, limit))
         if action == "run":
             code, payload = start_run(project)
+            return self.send_json(code, payload)
+        if action == "credentials":
+            request, error = validate_credentials(project, body)
+            if error:
+                return self.send_json(400, {"error": error})
+            code, payload = submit_credentials(request)
             return self.send_json(code, payload)
         if action == "encryption":
             request, error = validate_encryption(project, body)

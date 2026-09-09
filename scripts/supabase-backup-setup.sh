@@ -221,6 +221,23 @@ if [ "$CLIENT_MAJOR" -lt "$SERVER_MAJOR" ]; then
   error "refusing to schedule a backup that cannot run"
 fi
 
+# What this credential can do, said while it is still being chosen. A backup
+# only ever reads - no part of it writes to the source - so a role that can also
+# write is a role that could destroy the project it is protecting, from a file
+# that then sits on this host until someone rotates it.
+WRITABLE="$(psql "$DATABASE_URL" -Atqc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public' and has_table_privilege(current_user, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')" 2>/dev/null || echo "")"
+TOTAL="$(psql "$DATABASE_URL" -Atqc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public'" 2>/dev/null || echo "")"
+if [[ "$WRITABLE" =~ ^[0-9]+$ && "$TOTAL" =~ ^[0-9]+$ ]]; then
+  if [ "$WRITABLE" -eq 0 ]; then
+    info "read-only role: it cannot write to any table in public"
+  else
+    warn "this role can write to ${WRITABLE} of ${TOTAL} table(s) in public."
+    warn "A backup only reads. A read-only role means a stolen copy of this"
+    warn "credential can read the project but not destroy it:"
+    warn "  https://github.com/${GITHUB_USER}/${GITHUB_REPO}/blob/${BRANCH}/scripts/docs/supabase-backup.md#least-privilege"
+  fi
+fi
+
 # ── Encryption ────────────────────────────────────────────────────────────────
 # Asked after the connection check, so nobody is invited to think about keys for
 # a project that turns out to be unreachable. Asked before the first run, so

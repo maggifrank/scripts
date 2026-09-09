@@ -186,6 +186,27 @@ systemctl enable --now supabase-backup-keys.path >/dev/null 2>&1 \
   || error "could not enable supabase-backup-keys.path"
 info "encryption helper installed and watching the spool"
 
+# ── The rotation helper ───────────────────────────────────────────────────────
+# A project's database password and service key live in a root-owned 0600 file
+# the console cannot read. Rotating them meant an SSH session and an editor,
+# which is why it did not happen - and an un-rotated credential has been exposed
+# since the day it was made. Same shape as the rest: the console carries the new
+# ones as far as a spool, root proves they work and only then replaces the old.
+step "Rotation helper"
+curl -fsSL --max-time 30 "${RAW_BASE}/credentials" -o "${LIB_DIR}/credentials" \
+  || error "could not download the rotation helper"
+chmod 0755 "${LIB_DIR}/credentials"
+
+for f in supabase-backup-credentials.path supabase-backup-credentials.service; do
+  curl -fsSL --max-time 30 "${RAW_BASE}/${f}" -o "${UNIT_DIR}/${f}" \
+    || error "could not download ${f}"
+  chmod 0644 "${UNIT_DIR}/${f}"
+done
+systemctl daemon-reload
+systemctl enable --now supabase-backup-credentials.path >/dev/null 2>&1 \
+  || error "could not enable supabase-backup-credentials.path"
+info "rotation helper installed and watching the spool"
+
 # ── The upgrade helper ────────────────────────────────────────────────────────
 # The console's version panel says what this host is running and what GitHub
 # publishes. Acting on the difference means writing /opt/supabase-backup and

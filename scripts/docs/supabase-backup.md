@@ -300,6 +300,64 @@ The console has the same thing behind its gear icon, including a switch for the
 automatic half — see [the console's Upgrading
 section](supabase-backup-web.md#upgrading).
 
+## Least privilege
+
+The credentials in `/etc/supabase-backup/<project>.conf` are the most valuable
+thing on the backup host — more valuable than the archives, which may well be
+encrypted. Anyone who reads that file can read the live project, and if the
+database role is the default one, destroy it. Encryption does nothing about
+this: the file has to be there for an unattended backup to run at all.
+
+Two things narrow it, and neither needs this tool to change.
+
+### A read-only database role
+
+**Nothing here writes to the source.** `backup.sh` runs `pg_dump`, `psql`
+selects and catalog queries; `catalog.sql` contains no `INSERT`, `UPDATE`,
+`CREATE` or `DROP`. So the credential does not need write access, and giving it
+none means a stolen copy can read the project but not destroy it.
+
+```sql
+create role backup_reader with login password '…';
+grant usage on schema public, auth, storage to backup_reader;
+grant select on all tables in schema public to backup_reader;
+grant select on auth.users, auth.identities, storage.objects, storage.buckets
+  to backup_reader;
+alter default privileges in schema public grant select on tables to backup_reader;
+```
+
+Then connect through the session pooler as `backup_reader.<project-ref>`.
+
+The cost is a grant to remember: a table created by a role whose default
+privileges were not altered will not be readable, and `pg_dump` will fail. That
+is a loud failure at 03:20 rather than a silent gap in an archive, which is the
+right way round, but it is a real thing to maintain.
+
+The setup script and the console both report what the credential can do when it
+is set — `this role can write to 7 of 7 table(s) in public` — so the question is
+put in front of you at the moment it can be answered.
+
+### A revocable API key
+
+Prefer a secret API key created for backups over the project's shared
+`service_role` key. The legacy key can only be rotated by rotating the project's
+JWT secret, which signs out every user and breaks the application — which is why
+in practice it never gets rotated at all. A key that can be revoked on its own
+can be killed the moment a host looks wrong, and nothing else notices.
+
+The backup uses it for exactly two calls: listing storage objects and
+downloading them. It needs nothing else.
+
+### Rotate them
+
+`supabase-restore` aside, the console can rotate a project's credentials —
+[Rotating credentials](supabase-backup-web.md#rotating-a-projects-credentials).
+The new ones are proved against Postgres and the storage API before the old ones
+are replaced, so a rotation cannot leave a project with a config that fails
+tonight. Rotation is what turns "exposed since it was created" into "exposed
+since the last rotation", and it is the only lever that keeps working after a
+credential has already leaked.
+
 ## Configuration
 
 `/etc/supabase-backup/<project>.conf`, mode 0600. Read by the script itself

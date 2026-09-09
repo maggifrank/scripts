@@ -314,6 +314,11 @@ function buildProjectBody(body, project) {
   body.append(encryption);
   renderEncryption(encryption, project);
 
+  const credentials = el("div", "encryption");
+  credentials.dataset.role = "credentials";
+  body.append(credentials);
+  renderCredentials(credentials, project);
+
   body.append(el("h3", null, "Archives"));
   const archives = el("div", "list");
   archives.dataset.role = "archives";
@@ -340,6 +345,8 @@ function refreshProjectBody(body, project) {
   }
   const encryption = body.querySelector('[data-role="encryption"]');
   if (encryption) renderEncryption(encryption, project);
+  const credentials = body.querySelector('[data-role="credentials"]');
+  if (credentials) renderCredentials(credentials, project);
   const message = body.querySelector('[data-role="msg"]');
   if (message && !(stickyMessage && stickyMessage.project === project.name)) {
     const partial = project.partials && project.partials[0];
@@ -667,6 +674,180 @@ function pollEncryption(id, project, container, button, message, output) {
     refresh();
   };
   encryptionPoll = setTimeout(tick, 800);
+}
+
+// ── Rotating a project's credentials ───────────────────────────────────────
+// The console cannot read what is in force - /etc/supabase-backup is out of its
+// reach and stays that way - so this panel never shows a current value. It only
+// carries new ones towards the helper that can, which then proves they work
+// before replacing anything.
+
+let credentialsPoll = null;
+let credentialsHelper = null;
+let credentialsOutcome = null;
+
+function renderCredentials(container, project) {
+  if (container.dataset.editing === "1") return;
+  const helper = credentialsHelper || {};
+  const outcome = credentialsOutcome || {};
+  const signature = [capabilities.credentials, helper.installed, helper.watching,
+                     outcome.project === project.name ? outcome.id : ""].join("|");
+  if (container.dataset.sig === signature) return;
+  container.dataset.sig = signature;
+  container.replaceChildren();
+
+  const head = el("div", "enc-head");
+  head.append(el("h3", null, "Credentials"));
+  container.append(head);
+
+  container.append(el("p", "hint",
+    "The database password and service key this project is backed up with. They live in a "
+    + "root-owned file this console cannot read, so nothing of them is shown here — only "
+    + "replaced. Rotating is the one thing that limits how long a leaked credential is "
+    + "worth having."));
+
+  const bar = el("div", "bar");
+  if (capabilities.credentials) {
+    const edit = el("button", "btn-ghost", "Rotate credentials");
+    edit.addEventListener("click", () => buildCredentialsForm(container, project));
+    bar.append(edit);
+  }
+  bar.append(el("span", "bar-msg"));
+  container.append(bar);
+
+  if (!capabilities.credentials && capabilities.credentials_blocked_because) {
+    container.append(el("div", "notice", capabilities.credentials_blocked_because));
+  } else if (capabilities.credentials && credentialsHelper && !credentialsHelper.watching) {
+    container.append(el("div", "notice", credentialsHelper.installed
+      ? `Rotations can be asked for here, but the host is not watching: `
+        + `${credentialsHelper.unit} is installed and not enabled. Enable it with `
+        + `systemctl enable --now ${credentialsHelper.unit}.`
+      : `The helper that applies a rotation is not installed: ${credentialsHelper.unit} `
+        + `is not on this host. Re-run supabase-backup-web-setup.sh.`));
+  }
+  if (credentialsOutcome && credentialsOutcome.project === project.name) {
+    container.append(encryptionOutcomeBox(credentialsOutcome));
+  }
+}
+
+function buildCredentialsForm(container, project) {
+  container.dataset.editing = "1";
+  const form = el("div", "form");
+  const uid = `cred-${project.name}`;
+
+  form.append(el("div", "notice",
+    "Leave a field empty to keep the one in force. A rotation is usually one credential, "
+    + "and re-typing the two that did not change is how a rotation becomes a typo. The host "
+    + "checks the new set against Postgres and the storage API before replacing anything, so "
+    + "a mistake here fails now rather than at 03:20."));
+
+  form.append(field("Session pooler URI", "database_url",
+    "Port 5432, not 6543. Leave empty to keep the current one.",
+    "password", "postgresql://postgres.<ref>:<password>@…pooler.supabase.com:5432/postgres", uid));
+  form.append(field("Project URL", "supabase_url",
+    "Only if it changed. It must still name the same project — a rotation cannot repoint a project at another one.",
+    "text", "https://<ref>.supabase.co", uid));
+  form.append(field("Service key", "service_key",
+    "Bypasses RLS. Prefer a key you can revoke on its own over the shared service_role key, so revoking it does not sign out your users.",
+    "password", "", uid));
+
+  const bar = el("div", "bar");
+  const save = el("button", "btn", "Rotate");
+  const cancel = el("button", "btn-ghost", "Cancel");
+  const message = el("span", "bar-msg");
+  bar.append(save, cancel, message);
+  form.append(bar);
+
+  cancel.addEventListener("click", () => {
+    container.dataset.editing = "0";
+    container.dataset.sig = "";
+    renderCredentials(container, project);
+  });
+
+  save.addEventListener("click", async () => {
+    const value = (name) => (form.querySelector(`#${uid}-${name}`).value || "").trim();
+    const body = {};
+    for (const name of ["database_url", "supabase_url", "service_key"]) {
+      if (value(name)) body[name] = value(name);
+    }
+    if (!Object.keys(body).length) {
+      message.className = "bar-msg err";
+      message.textContent = "nothing to rotate";
+      return;
+    }
+    if (!confirm(`Rotate ${Object.keys(body).length} credential(s) for '${project.name}'?\n\n`
+      + "The host will check them against Postgres and storage first, and change nothing "
+      + "if they do not work.")) return;
+
+    credentialsOutcome = null;
+    save.disabled = true;
+    message.className = "bar-msg";
+    message.textContent = "submitting…";
+    let id;
+    try {
+      ({ id } = await api(`/api/projects/${enc(project.name)}/credentials`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }));
+    } catch (error) {
+      message.className = "bar-msg err";
+      message.textContent = error.message;
+      save.disabled = false;
+      return;
+    }
+    // They have left the browser; do not leave them in the DOM.
+    for (const name of ["database_url", "supabase_url", "service_key"]) {
+      form.querySelector(`#${uid}-${name}`).value = "";
+    }
+    message.textContent = "applying…";
+    pollCredentials(id, project, container, save, message);
+  });
+
+  container.replaceChildren(form);
+}
+
+function pollCredentials(id, project, container, button, message) {
+  clearTimeout(credentialsPoll);
+  const deadline = Date.now() + 40_000;   // it makes two network round trips of its own
+  const tick = async () => {
+    let result;
+    try {
+      result = await api(`/api/credentials/${encodeURIComponent(id)}`);
+    } catch (error) {
+      message.className = "bar-msg err";
+      message.textContent = error.message;
+      button.disabled = false;
+      return;
+    }
+    if (result.state === "pending") {
+      if (Date.now() < deadline) {
+        credentialsPoll = setTimeout(tick, 1500);
+        return;
+      }
+      const unit = (credentialsHelper && credentialsHelper.unit) || "supabase-backup-credentials.path";
+      credentialsOutcome = {
+        project: project.name, id, ok: false,
+        text: `The request was written and nothing has picked it up, so nothing was changed. `
+          + `Check ${unit} and journalctl -u supabase-backup-credentials on the host.`,
+      };
+    } else {
+      const ok = result.state === "ok";
+      credentialsOutcome = {
+        project: project.name, id, ok,
+        text: ok
+          ? "Rotated. The next run uses the new credentials; the old ones are gone from this host."
+          : `Not rotated — ${result.error || "the host reported a failure"}`,
+        steps: Array.isArray(result.steps) ? result.steps : [],
+      };
+    }
+    button.disabled = false;
+    message.textContent = "";
+    container.dataset.editing = "0";
+    container.dataset.sig = "";
+    renderCredentials(container, project);
+  };
+  credentialsPoll = setTimeout(tick, 1200);
 }
 
 // ── Archives ───────────────────────────────────────────────────────────────
@@ -2279,6 +2460,7 @@ async function refresh() {
     const status = await api("/api/status");
     capabilities = status.capabilities;
     encryptionHelper = status.encryption_helper || null;
+    credentialsHelper = status.credentials_helper || null;
     // Before anyRunning is worked out: this is what sets restoreBusy, and a
     // restore in flight is exactly when the page should not be polling lazily.
     renderRestore(status);
