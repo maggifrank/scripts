@@ -133,6 +133,25 @@ if [ -n "$AGAINST" ]; then
 
     BUMPED="$(git diff --name-only "${AGAINST}...HEAD" -- VERSION | grep -c . || true)"
 
+    # Two branches bumping to the same number is the one collision git will not
+    # raise: VERSION is a single line, and when both sides write the same thing
+    # there is nothing to conflict over. It merges silently and two different
+    # releases go out calling themselves the same version. So the number has to
+    # be *ahead* of the base, not merely different from what was there before.
+    if [ "${BUMPED:-0}" -gt 0 ] && [ -n "$VERSION" ]; then
+      BASE_VERSION="$(git show "${AGAINST}:scripts/supabase-backup/VERSION" 2>/dev/null \
+                      | head -1 | tr -d '[:space:]')"
+      if [ -z "$BASE_VERSION" ]; then
+        warn "cannot read VERSION at ${AGAINST}, so it cannot be checked for going backwards"
+      elif [ "$BASE_VERSION" = "$VERSION" ]; then
+        bad "VERSION is ${VERSION} and the base branch is already ${VERSION}. Two branches have picked the same number - whichever merged first owns it, and this one needs the next. A published version cannot be renumbered afterwards."
+      elif [ "$(printf '%s\n%s\n' "$BASE_VERSION" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+        bad "VERSION is ${VERSION} but the base branch is already at ${BASE_VERSION}. Versions only go forwards."
+      else
+        ok "VERSION ${BASE_VERSION} → ${VERSION}"
+      fi
+    fi
+
     if [ "$SHIPPED" -eq 0 ]; then
       ok "nothing that ships to a host changed"
     elif [ "${BUMPED:-0}" -gt 0 ]; then

@@ -27,6 +27,12 @@ jobs:
       # message, so a `Release: patch` trailer written on the branch may not
       # survive onto main - running this on push would turn that into a red
       # main for something that was declared correctly when it mattered.
+      # Against the base branch as it stands *now*, not the merge base the pull
+      # request was opened from. Whether the version is still ahead depends on
+      # what has merged since, which is exactly how two branches end up
+      # claiming the same number.
       - name: release-check — was the change declared?
         if: github.event_name == 'pull_request'
-        run: scripts/supabase-backup/release-check --against ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --quiet origin "${{ github.base_ref }}"
+          scripts/supabase-backup/release-check --against "origin/${{ github.base_ref }}"
