@@ -1850,8 +1850,8 @@ def submit_upgrade(action, auto=None):
     """
     if action not in ("apply", "auto"):
         return 400, {"error": "unknown action"}
-    if auto not in (None, "patch", "off"):
-        return 400, {"error": "the automatic setting is either 'patch' or 'off'"}
+    if auto not in (None, "patch", "minor", "off"):
+        return 400, {"error": "the automatic setting is 'off', 'patch' or 'minor'"}
     if action == "auto" and auto is None:
         return 400, {"error": "no automatic setting given"}
     if upgrade_activity()["running"]:

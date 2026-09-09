@@ -1526,6 +1526,18 @@ function paintVersion(wrap, payload) {
   }
   nodes.push(list);
 
+  if (check.kind === "major" && check.upgrade_available) {
+    const box = el("div", "major-warning");
+    box.append(el("div", "major-head", "This is a major release"));
+    box.append(el("div", null,
+      `${installed.version || "what you have"} → ${available.version}. The first number ` +
+      "changed, which is how a release says it wants reading before it is installed — " +
+      "expect it to need something of you on the host, not just new code."));
+    box.append(el("div", null,
+      "No automatic setting installs a major, whatever it is set to. Read the release " +
+      "notes below, or on GitHub, before you press anything."));
+    nodes.push(box);
+  }
   if (check.reason) nodes.push(el("div", "hint", check.reason));
 
   const bar = el("div", "bar");
@@ -1585,24 +1597,35 @@ function paintVersion(wrap, payload) {
 // midnight.
 function autoBox(check, activity, wrap) {
   const wrapper = el("div", "field auto");
-  const label = el("label", "check");
-  const box = document.createElement("input");
-  box.type = "checkbox";
-  box.id = "set-auto_upgrade";
-  box.checked = check.auto === "patch";
-  label.append(box, document.createTextNode("Install patches automatically"));
-  wrapper.append(label);
+  const label = el("label", null, "Install automatically");
+  label.htmlFor = "set-auto_upgrade";
+  const select = document.createElement("select");
+  select.id = "set-auto_upgrade";
+  for (const [value, text] of [
+    ["off",   "Nothing — check only"],
+    ["patch", "Patches — a new commit against this version"],
+    ["minor", "Patches and minor releases — never a major"],
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    select.append(option);
+  }
+  select.value = ["off", "patch", "minor"].includes(check.auto) ? check.auto : "off";
+  // What the host actually has, as opposed to what the box is showing. A
+  // change that the helper refuses is put back to this.
+  select.dataset.applied = select.value;
+  wrapper.append(label, select);
 
-  // What a patch is, said where the decision is made. The rule is not obvious
-  // and the consequence of misreading it is a host that updates itself when
-  // you thought it would ask.
+  // Said where the decision is made, because the rule is not obvious and
+  // misreading it means a host that updates itself when you thought it asked.
   const when = activity.timer_next
-    ? `Next check ${relative(activity.timer_next)}, ${localTime(activity.timer_next)}.`
+    ? ` Next check ${relative(activity.timer_next)}, ${localTime(activity.timer_next)}.`
     : "";
   wrapper.append(el("div", "hint",
-    "A patch is a new commit against the version already running. Anything that " +
-    "changes the version number is left for you — which is what changing it is for. " +
-    when));
+    "A patch is a new commit against the version already running; a minor changes " +
+    "the second number. A major changes the first, and no setting here installs " +
+    "one — that is what changing it is for." + when));
 
   if (activity.timer_installed && !activity.timer_active) {
     wrapper.append(el("div", "notice",
@@ -1617,13 +1640,14 @@ function autoBox(check, activity, wrap) {
 
   const status = el("span", "bar-msg");
   wrapper.append(status);
-  box.addEventListener("change", () => setAuto(box, status, wrap));
+  select.addEventListener("change", () => setAuto(select, status, wrap));
   return wrapper;
 }
 
-async function setAuto(box, status, wrap) {
-  const want = box.checked ? "patch" : "off";
-  box.disabled = true;
+async function setAuto(select, status, wrap) {
+  const want = select.value;
+  const previous = select.dataset.applied || "off";
+  select.disabled = true;
   status.className = "bar-msg";
   status.textContent = "saving…";
   let id;
@@ -1634,8 +1658,8 @@ async function setAuto(box, status, wrap) {
       body: JSON.stringify({ action: "auto", auto: want }),
     }));
   } catch (error) {
-    box.checked = !box.checked;          // it did not take; do not pretend it did
-    box.disabled = false;
+    select.value = previous;             // it did not take; do not pretend it did
+    select.disabled = false;
     status.className = "bar-msg err";
     status.textContent = error.message;
     return;
@@ -1649,7 +1673,7 @@ async function setAuto(box, status, wrap) {
     try {
       result = await api(`/api/upgrade/${enc(id)}`);
     } catch (error) {
-      box.disabled = false;
+      select.disabled = false;
       status.className = "bar-msg err";
       status.textContent = error.message;
       return;
@@ -1659,15 +1683,16 @@ async function setAuto(box, status, wrap) {
       setTimeout(tick, 700);
       return;
     }
-    box.disabled = false;
+    select.disabled = false;
     if (result.state === "ok") {
+      select.dataset.applied = want;
       status.className = "bar-msg";
-      status.textContent = want === "patch" ? "on" : "off";
+      status.textContent = { off: "off", patch: "patches", minor: "patches and minors" }[want] || want;
       // Repaint so the terminal and the panel agree on what the file says,
       // rather than on what was clicked.
       if (result.check) paintVersion(wrap, { check: result.check, activity: {}, allowed: true });
     } else {
-      box.checked = !box.checked;
+      select.value = previous;
       status.className = "bar-msg err";
       status.textContent = result.error || "the host would not set it";
     }
@@ -1806,6 +1831,22 @@ async function startUpgrade(check, wrap, upgrade, recheck, message, output) {
     "console will not start, everything is put back as it was.",
   ];
   if (!confirm(lines.join("\n\n"))) return;
+
+  // A second time for a major, and not the same question worded again: the
+  // first asks whether to upgrade, this one asks whether the release notes
+  // have been read. One reflexive click gets through one dialog, not two that
+  // ask different things.
+  if (check.kind === "major") {
+    const from = (check.installed && check.installed.version) || "this host";
+    const to = (check.available && check.available.version) || "the new version";
+    if (!confirm(
+      `${from} → ${to} is a MAJOR release.\n\n` +
+      "The first number changed. That is reserved here for a release that needs " +
+      "something of you on the host — not just new code arriving.\n\n" +
+      "Have you read what this release does? Press Cancel to go and read it; the " +
+      "notes are in the panel behind this dialog and on GitHub.\n\n" +
+      "Install it now?")) return;
+  }
 
   upgrade.disabled = true;
   recheck.disabled = true;

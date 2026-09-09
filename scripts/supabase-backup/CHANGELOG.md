@@ -7,7 +7,7 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
-## 1.5 — 2026-09-09
+## 1.6 — 2026-09-09
 
 An encrypted archive can be restored from the console.
 
@@ -34,6 +34,24 @@ An encrypted archive can be restored from the console.
   without copying the key to the host.
 - A restore request carrying an identity for an archive that is not encrypted
   is refused rather than ignored.
+
+## 1.5 — 2026-09-09
+
+A major is now the one step nothing installs quietly.
+
+- `AUTO_UPGRADE=minor` takes patches and minor releases and stops at a major —
+  staying on a major and having everything within it. `patch` and `off` are
+  unchanged.
+- **No setting installs a major.** Not `patch`, not `minor`. The timer names it
+  and leaves it, because a release that changes the first number is one that
+  wants a person, and a setting able to wave it through would make bumping the
+  major number mean nothing.
+- The console says so where the decision is made: a red panel above the
+  Upgrade button when the waiting release is a major, and a second confirmation
+  that asks a different question from the first — whether the release notes
+  have been read. One reflexive click gets through one dialog, not two.
+- The automatic control is a three-way choice rather than a checkbox, since
+  there are now three answers.
 
 ## 1.4 — 2026-09-09
 
