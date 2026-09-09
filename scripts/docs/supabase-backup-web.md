@@ -451,12 +451,35 @@ backup source is refused there, whatever the request said.
 A restore request carries the target's database password and service key, so
 like registration it is refused over plain HTTP from the network.
 
-**An encrypted archive cannot be restored from here at all.** Opening one needs
-the age identity, and that is kept off this host on purpose — there is nothing
-the console could ask for that would make it possible. So the button is not
-offered on a `.tar.gz.age`, the reason is shown in its place, and a request
-naming one is refused on both sides rather than failing halfway through.
-`supabase-restore` at the terminal will ask for the key and restore it.
+### Restoring an encrypted archive
+
+Opening one needs the age identity, and the host has none — that is the point.
+So the form asks you for it, and the key travels the same road the target's
+database password and service key already travel:
+
+```
+browser  ──▶  console          only over loopback or a TLS proxy; the console
+                               refuses secrets on any other connection
+         ──▶  /run/…/restore/<id>.json      0600, on tmpfs, never on a disk
+         ──▶  restore (root)   shredded the moment it has been read
+         ──▶  age              through a process substitution, never a file
+```
+
+It is not stored anywhere. When the restore ends, nothing on the host can open
+another archive until someone supplies the key again — so the property that
+made encryption worth having, that a compromised host yields no readable
+backups, still holds for every moment except the one you chose.
+
+**What it costs, stated plainly.** For the length of that restore the identity
+is in the browser and in this console's memory, which it never was before. If
+the console itself were compromised at that moment, the key is capturable. The
+terminal path does not have that exposure, and is the better choice for a
+restore you are not in a hurry about. What it is emphatically better than is
+the thing people actually did instead: `scp` the private key onto the host,
+where it stays.
+
+An identity sent for an archive that is *not* encrypted is refused rather than
+ignored. A key that host has no use for should not arrive there quietly.
 
 ## Encrypting the archives
 
