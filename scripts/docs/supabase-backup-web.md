@@ -481,6 +481,39 @@ where it stays.
 An identity sent for an archive that is *not* encrypted is refused rather than
 ignored. A key that host has no use for should not arrive there quietly.
 
+## Rotating a project's credentials
+
+A project's database password and service key live in a root-owned `0600` file
+this console cannot read, and never could — the unit puts `/etc/supabase-backup`
+out of its reach. So the panel shows nothing that is in force. It only carries
+new credentials as far as the spool:
+
+```
+console  ──▶  /run/…/credentials/<id>.json   0600, tmpfs
+         ──▶  supabase-backup-credentials.service  (root)
+              re-validates every field
+              → proves the new set against Postgres and the storage API
+              → rewrites the .conf, keeping BACKUP_DIR, KEEP_DAYS and the rest
+              → shreds the request
+```
+
+Leave a field empty to keep the one in force; a rotation is usually one
+credential, and re-typing the two that did not change is how a rotation becomes
+a typo. **Nothing is replaced until the new set has been proved to work**, so a
+mistake fails while you are watching rather than at 03:20.
+
+A rotation cannot repoint a project at a different one. Credentials naming
+another project ref are refused — that would keep this project's archive
+directory and history while quietly backing up something else.
+
+The helper also reports what the database role can do: `this role can write to 7
+of 7 table(s) in public`. A backup only ever reads, so a role that can write is
+one that could destroy the project it protects — see
+[Least privilege](supabase-backup.md#least-privilege).
+
+Like registration, a rotation carries a database password and a service key, so
+it is refused over plain HTTP from the network.
+
 ## Encrypting the archives
 
 A project with an age recipients file gets its tarball encrypted to those

@@ -102,6 +102,20 @@ process() {
   fi
   note "pg_dump ${client_major} can dump a server ${server_major}"
 
+  # What this credential can do, which is worth saying while it is being chosen.
+  # A backup only reads; a role that can also write is one that could destroy
+  # the project it protects, from a file sitting on this host.
+  local writable total
+  writable="$(psql "$database_url" -Atqc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public' and has_table_privilege(current_user, c.oid, 'INSERT, UPDATE, DELETE, TRUNCATE')" 2>/dev/null || echo "")"
+  total="$(psql "$database_url" -Atqc "select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r','p') and n.nspname = 'public'" 2>/dev/null || echo "")"
+  if [[ "$writable" =~ ^[0-9]+$ && "$total" =~ ^[0-9]+$ ]]; then
+    if [ "$writable" -eq 0 ]; then
+      note "this role cannot write to any table in public - a stolen copy of it cannot destroy the project"
+    else
+      note "this role can write to ${writable} of ${total} table(s) in public, and a backup only ever reads. A read-only role would mean a stolen copy could not destroy the project - see the docs."
+    fi
+  fi
+
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
         "${supabase_url}/storage/v1/bucket" \

@@ -7,6 +7,31 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.8 — 2026-09-09
+
+Credentials can be rotated, and the console says what they can do.
+
+- A project's database password and service key could only be changed by
+  editing a root-owned file over SSH, which is why they were not changed. A
+  credential nobody rotates has been exposed since the day it was made, and on
+  a host that holds a service key that is the whole risk — bigger than the
+  archives, which may well be encrypted.
+- The console can now rotate them. Empty fields keep what is in force, so a
+  rotation can be one credential rather than three re-typed ones. The new set
+  is proved against Postgres and the storage API **before** anything is
+  replaced, so a typo fails while someone is watching instead of at 03:20, and
+  `BACKUP_DIR`, `KEEP_DAYS` and everything else in the file are kept.
+- A rotation cannot repoint a project at a different one. That would keep this
+  project's archive directory and history while backing up something else.
+- The console still cannot read a credential — `/etc/supabase-backup` is out of
+  its reach and stays that way. It carries new ones towards the helper and
+  learns nothing.
+- **Setup, registration and rotation now report what the database role can
+  do**: `this role can write to 7 of 7 table(s) in public`. Nothing in a backup
+  writes to the source — `catalog.sql` has no `INSERT`, `UPDATE`, `CREATE` or
+  `DROP` in it — so a read-only role would mean a stolen credential could read
+  the project but not destroy it. The docs carry the SQL.
+
 ## 1.7 — 2026-09-09
 
 A restore no longer stops on the one error a managed target always gives.

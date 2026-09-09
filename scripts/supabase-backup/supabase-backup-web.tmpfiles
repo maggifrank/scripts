@@ -22,4 +22,8 @@ d /run/supabase-backup-web/restore 0700 supabase-backup-web supabase-backup-web 
 # script - but only the console may leave one here.
 d /run/supabase-backup-web/upgrade 0700 supabase-backup-web supabase-backup-web -
 # Results: written by root, read by the console. No secrets.
+# Credential rotations: written by the console, read and shredded by root. Each
+# request is 0600 - it holds a database password and a service key until the
+# helper has read it.
+d /run/supabase-backup-web/credentials 0700 supabase-backup-web supabase-backup-web -
 d /run/supabase-backup-web/results  0750 root                supabase-backup-web -
