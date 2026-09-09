@@ -7,6 +7,33 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.7 — 2026-09-09
+
+A restore no longer stops on the one error a managed target always gives.
+
+- `ALTER DEFAULT PRIVILEGES FOR ROLE <r>` is refused unless the connection is a
+  member of `<r>`. The session pooler connects as `postgres`, which on a
+  managed project is not a superuser and does not own `supabase_admin`, so a
+  dump carrying default privileges for such a role produced a wall of
+  `permission denied to change default privileges` and the restore treated
+  every one of them as fatal. It stopped **after** `schema.sql` had been
+  applied in full — auth users, tables, rows, grants and policies all loaded —
+  and before catalog objects and storage. The target was left half restored by
+  a check, not by a failure.
+- Those errors are now expected, counted and reported, not fatal. They decide
+  what future objects those roles create inherit; they touch nothing being
+  restored, and the target carries Supabase's own defaults for `anon`,
+  `authenticated` and `service_role` already.
+- Every other error loading `schema.sql` still stops the restore, including
+  `relation ... already exists` — re-running into a target that is already
+  loaded is still refused, and still should be.
+- A failure now prints **all** of the unexpected errors, and names where to
+  read them. A console-driven restore has its work directory removed on the way
+  out, so the `full log: /tmp/supabase-restore-XXXXXX/schema.log` it used to
+  offer was a path that no longer existed by the time anyone looked. It names
+  the journal instead, which survives, and the console's own list is capped at
+  ten with the remainder counted rather than silently dropped.
+
 ## 1.6 — 2026-09-09
 
 An encrypted archive can be restored from the console.
