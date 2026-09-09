@@ -390,11 +390,23 @@ async function startRun(name, body, button) {
 // ── Encryption ─────────────────────────────────────────────────────────────
 
 let encryptionPoll = null;
+// Whether the host is listening for encryption requests at all. Part of the
+// panel's signature below, so it redraws when the answer changes.
+let encryptionHelper = null;
+// What came of the last change, kept here rather than in the DOM. The panel
+// redraws whenever the host's state changes - which a change causes, and
+// promptly - so an outcome appended to the container is wiped a moment after
+// it appears, by the very refresh that proves it worked.
+let encryptionOutcome = null;
 
 function encryptionSignature(project) {
   const e = project.encryption || {};
+  const helper = encryptionHelper || {};
+  const outcome = encryptionOutcome || {};
   return [e.enabled, (e.recipients || []).join(","), e.error,
-          e.archives_encrypted, e.archives_plain].join("|");
+          e.archives_encrypted, e.archives_plain,
+          helper.installed, helper.watching,
+          outcome.project === project.name ? outcome.id : ""].join("|");
 }
 
 function renderEncryption(container, project) {
@@ -457,8 +469,39 @@ function renderEncryption(container, project) {
 
   if (!capabilities.encryption && capabilities.encryption_blocked_because) {
     container.append(el("div", "notice", capabilities.encryption_blocked_because));
+  } else if (capabilities.encryption && encryptionHelper && !encryptionHelper.watching) {
+    // Allowed here, but nothing on the host is watching the spool: a request
+    // would be written and simply never read. Said before the form is filled
+    // in rather than after a change appears to hang.
+    container.append(el("div", "notice", encryptionHelper.installed
+      ? `Changes can be made here, but the host is not watching for them: `
+        + `${encryptionHelper.unit} is installed and not enabled. Until it is, a change `
+        + `would sit in the spool unread. Enable it with `
+        + `systemctl enable --now ${encryptionHelper.unit}.`
+      : `Changes can be made here, but the helper that applies them is not installed: `
+        + `${encryptionHelper.unit} is not on this host, so a change would sit in the `
+        + `spool unread. Re-run supabase-backup-web-setup.sh.`));
   }
   container.append(el("div", "enc-out"));
+  if (encryptionOutcome && encryptionOutcome.project === project.name) {
+    container.append(encryptionOutcomeBox(encryptionOutcome));
+  }
+}
+
+function encryptionOutcomeBox(outcome) {
+  const box = el("div", `result ${outcome.ok ? "ok" : "bad"}`);
+  box.append(el("div", null, outcome.text));
+  if (Array.isArray(outcome.steps) && outcome.steps.length) {
+    const ul = el("ul", "steps");
+    for (const step of outcome.steps) ul.append(el("li", null, step));
+    box.append(ul);
+  }
+  return box;
+}
+
+// Nothing about a change is worth showing next to the outcome of the last one.
+function clearEncryptionOutcome() {
+  encryptionOutcome = null;
 }
 
 function buildEncryptionForm(container, project) {
@@ -530,6 +573,7 @@ function disableEncryption(container, project) {
 }
 
 async function submitEncryption(project, recipients, container, button, message, output) {
+  clearEncryptionOutcome();
   if (button) button.disabled = true;
   if (message) { message.className = "bar-msg"; message.textContent = "submitting…"; }
   if (output) output.replaceChildren();
@@ -549,8 +593,15 @@ async function submitEncryption(project, recipients, container, button, message,
   pollEncryption(id, project, container, button, message, output);
 }
 
+// How long a request may sit unapplied before the console stops waiting. The
+// helper is a oneshot that validates a few keys and writes a file; if it has
+// not answered in this long, it is not going to, and a spinner that never ends
+// is the least useful thing to show someone whose change has not happened.
+const ENCRYPTION_DEADLINE_MS = 25_000;
+
 function pollEncryption(id, project, container, button, message, output) {
   clearTimeout(encryptionPoll);
+  const deadline = Date.now() + ENCRYPTION_DEADLINE_MS;
   const tick = async () => {
     let result;
     try {
@@ -561,39 +612,57 @@ function pollEncryption(id, project, container, button, message, output) {
       return;
     }
     if (result.state === "pending") {
-      encryptionPoll = setTimeout(tick, 1200);
+      if (Date.now() < deadline) {
+        encryptionPoll = setTimeout(tick, 1200);
+        return;
+      }
+      // Still sitting in the spool. Name the unit that was supposed to have
+      // taken it, because that is the one thing someone needs in order to
+      // find out why - and it is not visible from a browser.
+      const unit = (encryptionHelper && encryptionHelper.unit) || "supabase-backup-keys.path";
+      if (button) button.disabled = false;
+      if (message) message.textContent = "";
+      encryptionOutcome = {
+        project: project.name, id, ok: false,
+        text: `The request was written and nothing has picked it up. It is still in the `
+          + `spool, so the change has not been made. Check ${unit} and `
+          + `journalctl -u supabase-backup-keys on the host; the request is applied `
+          + `whenever that unit next runs.`,
+      };
+      // Closed, like any other ending. renderEncryption will not draw over an
+      // open form - correctly, it would wipe what someone is typing - so
+      // leaving it open here means the outcome has nowhere to appear.
+      container.dataset.editing = "0";
+      container.dataset.sig = "";
+      renderEncryption(container, project);
       return;
     }
     if (button) button.disabled = false;
     if (message) message.textContent = "";
 
     const ok = result.state === "ok";
-    const box = el("div", `result ${ok ? "ok" : "bad"}`);
     // "Not applied" would be a guess for a stalled request: nothing read it, so
     // nothing decided anything. Saying it is still sitting there is the fact,
     // and the one that points at the thing to go and fix.
-    box.append(el("div", null, ok
+    let text = ok
       ? "Applied. It takes effect on the next run — archives already on disk are unchanged."
       : result.state === "stalled"
         ? `Still waiting — ${result.error}`
-        : `Not applied — ${result.error || "the host reported a failure"}`));
-    if (Array.isArray(result.steps) && result.steps.length) {
-      const ul = el("ul", "steps");
-      for (const step of result.steps) ul.append(el("li", null, step));
-      box.append(ul);
-    }
+        : `Not applied — ${result.error || "the host reported a failure"}`;
+    let steps = Array.isArray(result.steps) ? result.steps : [];
     if (result.state === "unknown") {
-      box.replaceChildren(el("div", null,
-        "No result came back. The privileged helper may not be installed — check "
-        + "systemctl status supabase-backup-keys.path on the host."));
+      text = "No result came back. The privileged helper may not be installed — check "
+        + "systemctl status supabase-backup-keys.path on the host.";
+      steps = [];
     }
+    encryptionOutcome = { project: project.name, id, ok, text, steps };
 
-    // Back to the read-only view, with the outcome kept under it. The next
-    // poll brings the new state from the host rather than this guessing at it.
+    // Back to the read-only view. The outcome is drawn from module state, so
+    // the refresh below - which is what makes the new recipients appear -
+    // redraws it rather than destroying it.
     container.dataset.editing = "0";
     container.dataset.sig = "";
     renderEncryption(container, project);
-    container.append(box);
     clearTimeout(pollTimer);
     refresh();
   };
@@ -2143,6 +2212,7 @@ async function refresh() {
   try {
     const status = await api("/api/status");
     capabilities = status.capabilities;
+    encryptionHelper = status.encryption_helper || null;
     // Before anyRunning is worked out: this is what sets restoreBusy, and a
     // restore in flight is exactly when the page should not be polling lazily.
     renderRestore(status);
