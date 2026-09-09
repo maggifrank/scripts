@@ -7,6 +7,24 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.4 — 2026-09-09
+
+Only changes you would actually install count as an upgrade.
+
+- The check watched the whole `scripts/supabase-backup/` directory, so a commit
+  touching only `release-check` — which never leaves the repository — announced
+  an upgrade that downloaded thirty files and replaced none of them. With
+  automatic patches on, a host did that to itself and called it an upgrade.
+- Each commit newer than the installed one is now asked what it changed, and
+  only the ones touching a file *this host installs* count. A host without the
+  console is not told to upgrade because `app.js` moved. A commit whose answer
+  cannot be fetched counts anyway: hiding a real change is the worse mistake.
+- When nothing installable has changed, the available commit reported is the
+  one already running — a panel that says "up to date" should not also show two
+  different commits.
+- What gets recorded is that same commit, so a later check compares like with
+  like rather than treating every tooling commit as a version skipped.
+
 ## 1.3 — 2026-09-08
 
 Every file in an upgrade now comes from one commit.

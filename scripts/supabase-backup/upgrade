@@ -257,18 +257,80 @@ remote_commits() {
   printf '%s' "$REMOTE_COMMITS_CACHE"
 }
 
-remote_commit() {  # "<sha> <iso date>", or nothing
-  remote_commits | jq -r 'if length>0 then "\(.[0].sha) \(.[0].date)" else empty end' 2>/dev/null
+# The newest commit that changed something an upgrade would install. This is
+# what gets recorded, so that a later check comparing against it is comparing
+# like with like - recording the newest commit in the directory instead would
+# make every tooling commit look like a version this host had skipped.
+newest_payload_commit() {
+  payload_delta "" | jq -r '.sha // ""' 2>/dev/null
 }
 
-# What you would be getting: everything above the commit already installed. If
-# the installed one is not in the window at all, say so rather than showing a
-# list that quietly means something else.
-changes_since() {  # changes_since <installed sha>
-  remote_commits | jq -c --arg base "$1" '
-    (map(.sha) | index($base)) as $i
-    | if $i == null then {truncated: true,  commits: .[0:10]}
-                    else {truncated: false, commits: .[0:$i]} end'
+# How far back to ask what a commit changed. Each answer is one request, and
+# the walk stops at the installed commit anyway, so this only bites on a host
+# that has not been updated in a very long time.
+MAX_COMMIT_DETAIL="${UPGRADE_MAX_COMMIT_DETAIL:-15}"
+
+commit_files() {  # commit_files <sha> - what it changed, relative to REPO_PATH
+  curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' \
+    "${API_BASE}/commits/$1" 2>/dev/null \
+    | jq -r '.files[]?.filename // empty' 2>/dev/null \
+    | sed "s|^${REPO_PATH}/||"
+}
+
+# What you would be getting, and whether it is anything at all.
+#
+# Not every commit in this directory is an upgrade. release-check never leaves
+# the repository, and on a host without the console neither does app.js - so a
+# commit touching only those is real history that would download thirty files
+# and replace none of them. Worse with automatic patches on, where the host
+# does that to itself twice a day and calls it an upgrade.
+#
+# So each commit newer than the installed one is asked what it changed, and
+# only the ones that touched something *this host installs* count. A commit
+# whose answer cannot be fetched counts, deliberately: hiding a real change is
+# the worse mistake of the two.
+payload_delta() {  # payload_delta <installed sha> -> JSON
+  local all paths n idx limit i sha files hits truncated=false
+  all="$(remote_commits)"
+  paths="$(payload | cut -d'|' -f1)"
+  n="$(jq 'length' <<<"$all")"
+  [ "${n:-0}" -gt 0 ] || { printf '{"sha":"","date":"","commits":[],"truncated":false}'; return 0; }
+
+  idx="$(jq -r --arg b "${1:-}" 'map(.sha) | index($b) // -1' <<<"$all")"
+  if [ "$idx" -lt 0 ]; then
+    # The installed commit is older than this window, or was never recorded.
+    limit="$MAX_COMMIT_DETAIL"
+    [ "$limit" -gt "$n" ] && limit="$n"
+    truncated=true
+  else
+    limit="$idx"
+    [ "$limit" -gt "$MAX_COMMIT_DETAIL" ] && { limit="$MAX_COMMIT_DETAIL"; truncated=true; }
+  fi
+
+  hits="[]"
+  i=0
+  while [ "$i" -lt "$limit" ]; do
+    sha="$(jq -r ".[$i].sha" <<<"$all")"
+    files="$(commit_files "$sha")"
+    if [ -z "$files" ] \
+       || printf '%s\n' "$files" | grep -qxF -f <(printf '%s\n' "$paths"); then
+      hits="$(jq -c --argjson c "$(jq -c ".[$i]" <<<"$all")" '. + [$c]' <<<"$hits")"
+      # No installed commit to walk back to, so the caller only wants the
+      # newest - one more request each would buy nothing.
+      [ -z "${1:-}" ] && break
+    fi
+    i=$((i + 1))
+  done
+
+  # Nothing this host installs has changed, however many commits went by. The
+  # available commit is then the one already running: saying anything else
+  # would put two different sevens on a panel that also says "up to date".
+  jq -nc --argjson hits "$hits" --arg installed "${1:-}" --argjson trunc "$truncated" \
+     --argjson all "$all" \
+     'if ($hits | length) > 0
+      then {sha: $hits[0].sha, date: $hits[0].date, commits: $hits, truncated: $trunc}
+      else {sha: (if $installed == "" then ($all[0].sha // "") else $installed end),
+            date: "", commits: [], truncated: false} end'
 }
 
 cache_read() {
@@ -307,23 +369,26 @@ check() {  # check [--refresh] -> one JSON object on stdout
     if cached="$(cache_read)"; then printf '%s\n' "$cached"; return 0; fi
   fi
 
-  local inst avail_version commit_line avail_commit avail_date error=""
+  local inst avail_version avail_commit avail_date error=""
   inst="$(installed_json)"
-  # The commit first: the version is then read from that commit rather than
-  # from whatever the branch URL happens to be serving, so the two always
-  # describe the same thing.
-  commit_line="$(remote_commit)" || true
-  avail_commit="${commit_line%% *}"
-  if [ -n "$commit_line" ] && [ "$avail_commit" != "$commit_line" ]; then
-    avail_date="${commit_line#* }"
-  else
-    avail_date=""
-  fi
-  avail_version="$(remote_version "$avail_commit")" || true
 
   local have_commit have_version
   have_commit="$(jq -r '.commit  // ""' <<<"$inst")"
   have_version="$(jq -r '.version // ""' <<<"$inst")"
+
+  # What has changed that this host would actually install, if anything. The
+  # commit comes back from here rather than from the top of the branch, so a
+  # run of commits that touched nothing installable reports the commit already
+  # running - which is what "up to date" has to look like to be believed.
+  local delta
+  delta="$(payload_delta "$have_commit")" || true
+  [ -n "$delta" ] || delta='{"sha":"","date":"","commits":[],"truncated":false}'
+  avail_commit="$(jq -r '.sha  // ""' <<<"$delta")"
+  avail_date="$(jq -r '.date // ""' <<<"$delta")"
+
+  # The version is read from that commit, not from the branch URL, whose cache
+  # lags it by minutes.
+  avail_version="$(remote_version "$avail_commit")" || true
 
   # Three ways to answer, in descending order of how much they actually know.
   local available=false basis reason
@@ -369,8 +434,8 @@ check() {  # check [--refresh] -> one JSON object on stdout
   # start from: a list of "the last ten commits" against an unknown base is not
   # what's new, it is just recent activity.
   local changes='{"truncated":false,"commits":[]}'
-  if [ "$available" = "true" ] && [ -n "$have_commit" ] && [ "$basis" = "commit" ]; then
-    changes="$(changes_since "$have_commit")"
+  if [ "$available" = "true" ] && [ "$basis" = "commit" ]; then
+    changes="$(jq -c '{truncated, commits}' <<<"$delta")"
     [ -n "$changes" ] || changes='{"truncated":false,"commits":[]}'
   fi
 
@@ -717,7 +782,7 @@ apply_body() {  # apply_body <staging> <force>
   local new_version new_commit
   new_version="$(head -1 "${LIB_DIR}/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
   new_commit="${AVAILABLE_COMMIT:-}"
-  if [ -z "$new_commit" ]; then new_commit="$(remote_commit | cut -d' ' -f1)"; fi
+  if [ -z "$new_commit" ]; then new_commit="$(newest_payload_commit)"; fi
   write_installed "$new_version" "$new_commit"
   # The console keeps its own cache under its state directory; that one is
   # invalidated by the recorded commit changing, which it just did.
@@ -969,7 +1034,7 @@ case "$MODE" in
     if [ -f "${LIB_DIR}/VERSION" ]; then
       RECORD_VERSION="$(head -1 "${LIB_DIR}/VERSION" | tr -d '[:space:]')"
     fi
-    write_installed "$RECORD_VERSION" "$(remote_commit | cut -d' ' -f1)"
+    write_installed "$RECORD_VERSION" "$(newest_payload_commit)"
     rm -f "$CACHE_FILE" 2>/dev/null || true
     installed_json | jq -r '"\(.version // "unknown") · \(.commit[0:7] // "")"'
     ;;
