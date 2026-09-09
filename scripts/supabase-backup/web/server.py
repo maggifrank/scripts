@@ -1977,6 +1977,19 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "supabase-backup-web"
     sys_version = ""
     protocol_version = "HTTP/1.1"
+    # Whether this request's body has been taken off the socket. HTTP/1.1 means
+    # the connection is reused, and a response sent without reading the body
+    # leaves those bytes to be parsed as the *next* request - see drain_body,
+    # which is what stops that from happening.
+    body_read = False
+    # How much of an unread body is worth reading just to throw away. Past this
+    # the connection is closed instead: the point is to keep it usable, and
+    # reading a megabyte to do that is no longer keeping anything.
+    DRAIN_MAX = 1 << 20
+    # A body that was promised and is not arriving must not hold a thread for
+    # as long as the client feels like. Applied only around the drain, never to
+    # a response: send_archive streams gigabytes to whoever asked for them.
+    DRAIN_TIMEOUT = 5
 
     def client_label(self):
         """Who to name in the log.
@@ -2005,6 +2018,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Decided before the response in the one case that can know it - a body
+        # too large to read - so that client is told rather than finding out.
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         for key, value in (extra or {}).items():
@@ -2025,11 +2042,70 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0:
             return None, "empty request body"
         if length > MAX_BODY:
+            # Not read, and not worth draining either. Say so in the response
+            # rather than closing the connection out from under the client.
+            self.close_connection = True
             return None, "request body too large"
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8")), None
-        except (OSError, ValueError, UnicodeDecodeError):
+            raw = self.rfile.read(length)
+        except OSError:
+            self.close_connection = True
+            return None, "could not read the request body"
+        # Before the parse, not after: a body that arrived and would not parse
+        # is still a body that is off the socket.
+        self.body_read = True
+        try:
+            return json.loads(raw.decode("utf-8")), None
+        except (ValueError, UnicodeDecodeError):
             return None, "body is not valid JSON"
+
+    def drain_body(self):
+        """Take an unread request body off the socket, or stop reusing it.
+
+        Every path that answers without reading the body ends up here: a 401
+        before anything is dispatched, a 403 from one of the channel checks, a
+        body over MAX_BODY, a 404 on a POST. On HTTP/1.1 the connection is
+        reused, so bytes left behind are what the next request gets parsed
+        from - the client's *following* request fails at the transport level
+        ("NetworkError when attempting to fetch resource" in a browser), which
+        is both baffling to whoever sees it and invisible here: this log
+        records the 403 that caused it and nothing else.
+        """
+        if self.body_read or self.close_connection:
+            return
+        # Chunked has no Content-Length to say where the body ends, and
+        # BaseHTTPRequestHandler does not decode it. Nowhere to skip to.
+        if self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return                                  # no body to begin with
+        if length > self.DRAIN_MAX:
+            self.close_connection = True
+            return
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(self.DRAIN_TIMEOUT)
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 65536))
+                if not chunk:                       # client stopped early
+                    self.close_connection = True
+                    return
+                remaining -= len(chunk)
+            self.body_read = True
+        except OSError:                             # timeout included
+            self.close_connection = True
+        finally:
+            try:
+                self.connection.settimeout(previous)
+            except OSError:
+                pass
 
     def credential_channel(self, what):
         """Whether THIS connection may carry a project's credentials.
@@ -2187,16 +2263,25 @@ class Handler(BaseHTTPRequestHandler):
         self.route("POST")
 
     def route(self, method):
-        if not self.authorised():
-            return
-        split = urllib.parse.urlsplit(self.path)
+        self.body_read = False
         try:
-            self.dispatch(method, split.path, urllib.parse.parse_qs(split.query))
-        except BrokenPipeError:
-            pass
-        except Exception as exc:                       # never leak a traceback
-            self.log_message("unhandled error on %s %s: %r", method, self.path, exc)
-            self.send_json(500, {"error": "internal error"})
+            if not self.authorised():
+                return
+            split = urllib.parse.urlsplit(self.path)
+            try:
+                self.dispatch(method, split.path, urllib.parse.parse_qs(split.query))
+            except BrokenPipeError:
+                pass
+            except Exception as exc:                   # never leak a traceback
+                self.log_message("unhandled error on %s %s: %r", method, self.path, exc)
+                self.send_json(500, {"error": "internal error"})
+        finally:
+            # After the response, not before: by here every path has had its
+            # chance to read the body, and what is left is what nobody wanted.
+            try:
+                self.drain_body()
+            except Exception:                          # never fail a served request
+                self.close_connection = True
 
     def dispatch(self, method, path, query):
         if method == "GET":
