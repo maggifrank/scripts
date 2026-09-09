@@ -182,9 +182,16 @@ recorded — otherwise a damaged archive arrives as "could not decrypt", which
 reads like the wrong key and sends you looking for a better one that does not
 exist.
 
-A restore asked for from the web console is refused for an encrypted archive.
-The console holds no identity, by design, so there is nowhere it could have got
-one; run `supabase-restore` at the terminal instead.
+The paste accepts a whole SSH private key, not just a one-line age identity —
+SSH public keys are accepted as recipients, so restoring with one has to work
+without first copying the key onto the host.
+
+A restore asked for from the web console works too: because the host holds no
+identity, the console asks you for one, and it is used once and shredded rather
+than kept. That is a real widening — the key passes through the browser and the
+console for the length of the restore — and
+[the console's docs](supabase-backup-web.md#restoring-an-encrypted-archive) set
+out exactly what it costs. The terminal remains the narrower path.
 
 ```bash
 age -d -i backup.key <archive>.tar.gz.age | tar xz -C /tmp/restore   # by hand

@@ -831,14 +831,7 @@ async function fillArchive(body, project, archive) {
   // archive is being written into a live project is not a thing to select from
   // a list a second time and get wrong.
   const restoreHost = el("div");
-  if (capabilities.restore && archive.encrypted) {
-    // Not a button that fails: the identity that opens this is deliberately
-    // not on the host, so there is nothing the console could ask for that
-    // would make the restore possible from here.
-    actions.append(el("span", "bar-msg",
-      "Encrypted — restoring it needs the age identity, which is kept off this host. " +
-      "Run supabase-restore at the terminal and supply the key there."));
-  } else if (capabilities.restore) {
+  if (capabilities.restore) {
     const toggle = el("button", "btn-ghost", "Restore this archive…");
     toggle.addEventListener("click", () => {
       const open = !restoreHost.firstChild;
@@ -2015,6 +2008,32 @@ function buildRestoreForm(project, archive) {
     "Uploads the storage objects. The request holding it is shredded as soon as the host has read it.",
     "password", "", uid));
 
+  // Only for an archive nothing on the host can open. The key comes from
+  // whoever is at the browser, is used once, and is gone - see the note below,
+  // which is the part worth reading before pasting a private key anywhere.
+  if (archive.encrypted) {
+    const wrap = el("div", "field");
+    const label = el("label", null, "Age identity");
+    const id = `${uid}-identity`;
+    label.htmlFor = id;
+    const area = document.createElement("textarea");
+    area.id = id;
+    area.rows = 4;
+    area.spellcheck = false;
+    area.autocomplete = "off";
+    area.placeholder = "AGE-SECRET-KEY-…  or a whole SSH private key, BEGIN and END lines included";
+    wrap.append(label, area);
+    wrap.append(el("div", "hint",
+      "This archive is encrypted and the host holds no key for it, so the key has to come "
+      + "from you. It is sent only over this connection — which the console refuses unless "
+      + "it is loopback or TLS — written to a 0600 file on tmpfs, and shredded by the host "
+      + "the moment it has been read. It is never stored, and never written to a disk."));
+    wrap.append(el("div", "hint",
+      "It is in this browser and this host's memory while the restore runs. If that is not "
+      + "a trade you want to make, run supabase-restore at the terminal instead."));
+    form.append(wrap);
+  }
+
   const confirmField = field("Type the target project ref", "confirm_ref",
     "The last thing restore asks for at a terminal, and the one thing here that cannot be clicked.",
     "text", "", uid);
@@ -2068,6 +2087,9 @@ async function submitRestore(project, archive, form, uid, submit, message) {
     allow_nonempty: ticked("allow_nonempty"),
     continue_on_catalog_errors: ticked("continue_on_catalog_errors"),
   };
+  // Only sent for an archive that needs it. The host refuses one it has no use
+  // for rather than ignoring it, so this must not send an empty string either.
+  if (archive.encrypted) body.identity = value("identity");
 
   if (restoreBusy) {
     message.className = "bar-msg err";
@@ -2099,9 +2121,12 @@ async function submitRestore(project, archive, form, uid, submit, message) {
     return;
   }
 
-  // The credentials have left the browser; do not leave them in the DOM.
-  for (const name of ["database_url", "service_key"]) {
-    form.querySelector(`#${uid}-${name}`).value = "";
+  // The credentials have left the browser; do not leave them in the DOM. The
+  // identity most of all: it opens every archive this project has written, not
+  // just the one being restored.
+  for (const name of ["database_url", "service_key", "identity"]) {
+    const input = form.querySelector(`#${uid}-${name}`);
+    if (input) input.value = "";
   }
   submit.disabled = false;
   message.textContent = "handed to the host — it is running at the top of this page";

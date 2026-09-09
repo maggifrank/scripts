@@ -506,7 +506,9 @@ footer code { color: var(--text2); }
 .encryption .bar { margin-top: 0.65rem; }
 .encryption .notice { margin-top: 0.6rem; }
 .enc-form { padding: 0; }
-.enc-form textarea {
+/* Recipients in the encryption panel, and the identity in a restore form: both
+   are keys, both are multi-line, both want the same monospaced box. */
+.form textarea {
   width: 100%;
   min-height: 4.5rem;
   padding: 0.45rem 0.55rem;
@@ -519,7 +521,7 @@ footer code { color: var(--text2); }
   line-height: 1.6;
   resize: vertical;
 }
-.enc-form textarea:focus { outline: none; border-color: var(--accent); }
+.form textarea:focus { outline: none; border-color: var(--accent); }
 
 /* A marker on an archive row, not a state of the whole project. */
 .tag {

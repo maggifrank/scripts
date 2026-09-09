@@ -1420,13 +1420,27 @@ def validate_restore(project, archive, body):
     if not isinstance(body, dict):
         return None, "expected a JSON object"
 
-    # The helper refuses this too, and has to - it is the side that cannot be
-    # talked out of anything. Saying it here as well saves a round trip that
-    # could only ever end one way, and says it while the form is still open.
+    # An encrypted archive needs an identity, and it has to arrive here: there
+    # is none on the host, which is the point of encrypting to a recipient. It
+    # is checked for shape only. Whether it is the *right* key is not knowable
+    # here and is not worth guessing at - age will say, in seconds.
+    identity = (body.get("identity") or "").strip()
     if archive.endswith(".age"):
-        return None, (f"{archive} is encrypted. Opening it needs the age identity, which is "
-                      "kept off this host on purpose and so cannot travel in a request. Run "
-                      "supabase-restore at the terminal and supply the key there.")
+        if not identity:
+            return None, (f"{archive} is encrypted, so restoring it needs the age identity. "
+                          "Nothing on this host holds one - that is what makes the archive "
+                          "worth encrypting - so it has to come from you, now.")
+        if not (identity.startswith("AGE-SECRET-KEY-")
+                or "BEGIN OPENSSH PRIVATE KEY" in identity
+                or "BEGIN RSA PRIVATE KEY" in identity):
+            return None, ("that does not look like a private key. An age identity is the "
+                          "'AGE-SECRET-KEY-...' line age-keygen prints; an SSH one is the whole "
+                          "file including its BEGIN and END lines. A public key will not open "
+                          "anything.")
+    elif identity:
+        # Refused rather than ignored. Sending a private key to a host that has
+        # no use for it is worth stopping, not quietly tolerating.
+        return None, f"{archive} is not encrypted, so it needs no identity. None was sent on."
 
     database_url = (body.get("database_url") or "").strip()
     if not database_url.startswith(("postgresql://", "postgres://")):
@@ -1465,6 +1479,9 @@ def validate_restore(project, archive, body):
         "database_url": database_url,
         "supabase_url": supabase_url,
         "service_key": service_key,
+        # Empty for a plaintext archive, so the spool file for one carries no
+        # key at all rather than an empty field someone has to reason about.
+        "identity": identity,
         "confirm_ref": db_ref,
         "dry_run": bool(body.get("dry_run", True)),
         # Each of these is a prompt `restore` would have stopped on. Absent

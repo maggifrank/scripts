@@ -53,6 +53,11 @@ DECRYPTED=0
 REQ=0; ID=""; STEPS=(); STARTED=""; FINISHED=0
 PROJECT=""; ARCHIVE_NAME=""; DB_REF=""; CONFIRM_REF=""
 ALLOW_NONEMPTY=0; CATALOG_OK=0
+# The age identity, when one came with a request. It lives in this variable and
+# reaches age through a process substitution, so it is never written to disk
+# here. It must never reach STEPS or the result file, both of which the console
+# can read - so nothing below prints it, and nothing puts it in a message.
+IDENTITY=""
 
 # Debian's psql is a Perl wrapper that emits a wall of locale warnings under an
 # ungenerated LANG, which some consoles hand us.
@@ -185,7 +190,7 @@ ref_of()  { sed -E 's|.*://(postgres\.)?([a-z0-9]+)[.:/].*|\2|; s|/+$||' <<<"$1"
 # decrypt", which reads like the wrong key and sends someone hunting for a
 # better one that does not exist.
 decrypt_into() {
-  local dest="$1" meta want sum choice idfile key r
+  local dest="$1" meta want sum choice idfile key line r
   local -a recipients=()
 
   command -v age >/dev/null \
@@ -209,18 +214,41 @@ decrypt_into() {
     info "Encrypted to:"
     for r in "${recipients[@]}"; do info "  $r"; done
   fi
+
+  # A request brought its own. Nothing is asked, and nothing is echoed: the
+  # console is reading every line printed here.
+  if (( REQ )); then
+    age -d -i <(printf '%s\n' "$IDENTITY") "$ARCHIVE" | tar xz -C "$dest" \
+      || die "could not decrypt with the identity in the request. Either it is not one of the recipients above, or the archive is damaged."
+    IDENTITY=""
+    DECRYPTED=1
+    ok "decrypted with the identity from the request"
+    return 0
+  fi
+
   info ""
   info "The matching private key is not on this host, by design. Supply one:"
   info "  1) a path to an identity file — an age key, or an SSH private key"
-  info "  2) paste an age identity (AGE-SECRET-KEY-…)"
+  info "  2) paste a key — an age identity, or a whole SSH private key"
   read -rp "    Choice [1]: " choice
 
   if [[ "${choice:-1}" == "2" ]]; then
-    ask_secret "Identity" key
+    # Read to a blank line rather than a single line. An SSH private key is
+    # several lines and cannot be pasted otherwise, and refusing it does not
+    # keep it off the host - it pushes whoever needs it into copying the file
+    # here instead, which is the same key and a worse place for it.
+    info ""
+    info "Paste the key, then press Enter on an empty line. Nothing is echoed."
+    key=""
+    while IFS= read -rs line; do
+      [[ -z "$line" ]] && break
+      key+="${line}"$'\n'
+    done
+    [[ -n "$key" ]] || die "no key was given"
     # A process substitution, not a temp file: the key exists as a pipe for the
     # length of one command and is never written to the disk being restored
     # from - which, on this host, is the disk the archive is on.
-    age -d -i <(printf '%s\n' "$key") "$ARCHIVE" | tar xz -C "$dest" \
+    age -d -i <(printf '%s' "$key") "$ARCHIVE" | tar xz -C "$dest" \
       || die "could not decrypt. Either that is not one of the identities above, or the archive is damaged."
     key=""
   else
@@ -253,6 +281,7 @@ if [[ -n "$REQUEST" ]]; then
   TARGET_SUPABASE_URL="$(jq -r '.supabase_url // empty' <<<"$BODY")"
   TARGET_SERVICE_KEY="$(jq -r '.service_key // empty'   <<<"$BODY")"
   CONFIRM_REF="$(jq -r '.confirm_ref // empty'    <<<"$BODY")"
+  IDENTITY="$(jq -r '.identity // empty'          <<<"$BODY")"
   # Absent means no, for all three. A request cannot get past a question by
   # not mentioning it.
   if [[ "$(jq -r '.dry_run // false' <<<"$BODY")" == "true" ]]; then DRY_RUN=1; fi
@@ -267,12 +296,20 @@ if [[ -n "$REQUEST" ]]; then
   [[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid project name"
   [[ "$ARCHIVE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*-[0-9]{8}T[0-9]{6}Z\.tar\.gz(\.age)?$ ]] \
     || die "not an archive name: ${ARCHIVE_NAME}"
-  # Matched, then refused - deliberately in that order. Falling out of the shape
-  # check would tell the console the name is malformed, which is not true and
-  # sends whoever asked looking for a typo. The name is fine; the thing it names
-  # cannot be opened from here, and that is worth saying in those words.
-  if [[ "$ARCHIVE_NAME" == *.age ]]; then
-    die "${ARCHIVE_NAME} is encrypted. Opening it needs the age identity, which is kept off this host on purpose and so cannot travel in a request. Run supabase-restore at the terminal and supply the key there."
+  # An encrypted archive needs an identity, and the request has to carry it:
+  # there is nothing on this host to fall back on, which is the whole point of
+  # encrypting to a recipient. It arrives the way the target's service key
+  # already does - over a channel the console refuses to take secrets on unless
+  # it is loopback or TLS, into a 0600 file on tmpfs, shredded above before any
+  # of this ran - and it is gone from the host again when this process exits.
+  if [[ "$ARCHIVE_NAME" == *.age && -z "$IDENTITY" ]]; then
+    die "${ARCHIVE_NAME} is encrypted and the request carried no identity. Nothing here can open it, deliberately, so the key has to come with the request or from someone at the terminal."
+  fi
+  # An identity for something that is not encrypted is not a reason to stop, but
+  # it is a reason not to keep holding it.
+  if [[ "$ARCHIVE_NAME" != *.age && -n "$IDENTITY" ]]; then
+    IDENTITY=""
+    warn "the request carried an identity for an archive that is not encrypted; discarded"
   fi
   [[ "$ARCHIVE_NAME" == "${PROJECT}-"* ]] \
     || die "archive '${ARCHIVE_NAME}' does not belong to project '${PROJECT}'"

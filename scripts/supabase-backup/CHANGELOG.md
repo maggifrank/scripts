@@ -7,6 +7,34 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.6 — 2026-09-09
+
+An encrypted archive can be restored from the console.
+
+- Until now it could not be restored from anywhere but a terminal, and only by
+  someone willing to put the identity on the host. The console offered a
+  sentence explaining why instead of a button, which was honest and not much
+  use to whoever needed the backup.
+- The restore form now asks for the identity when the archive is encrypted.
+  The key comes from the browser at the moment it is needed and is used once:
+  sent only over a connection the console already refuses to take secrets on
+  unless it is loopback or TLS, written 0600 to tmpfs, shredded by the host as
+  soon as it has been read, and handed to `age` through a process substitution
+  so it never touches a disk. It is not stored, and nothing on the host can
+  open an archive without someone supplying it again.
+- **This is a deliberate widening.** The identity now passes through the
+  browser and the console's memory for the length of a restore, which it never
+  did before. That is the same path the target's database password and service
+  key already take, and the alternative people were actually reaching for was
+  copying a private key onto the host's disk, which is worse and permanent.
+  The terminal remains the narrower option and the form says so.
+- `supabase-restore` also accepts a pasted multi-line key now, so an SSH
+  private key can be given without writing it to a file first. SSH public keys
+  have always been accepted as recipients; restoring with one was not possible
+  without copying the key to the host.
+- A restore request carrying an identity for an archive that is not encrypted
+  is refused rather than ignored.
+
 ## 1.5 — 2026-09-09
 
 A major is now the one step nothing installs quietly.
