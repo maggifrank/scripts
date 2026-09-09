@@ -574,10 +574,46 @@ step "Loading schema and data"
 # avoid that would strip Supabase's grants to anon/authenticated and break the
 # application in ways that only surface much later.
 psql "$TARGET_DB_URL" -q -f "$WORK/schema.sql" > "$WORK/schema.log" 2>&1 || true
-OTHER="$(grep -i '^psql:.*ERROR' "$WORK/schema.log" | grep -viE 'schema "[a-z_]+" already exists' || true)"
+ERRS="$(grep -i '^psql:.*ERROR' "$WORK/schema.log" || true)"
+# Two errors are expected here, and neither means the load failed.
+#
+# CREATE SCHEMA, as above.
+#
+# ALTER DEFAULT PRIVILEGES FOR ROLE <r>, where <r> is a role this connection is
+# not a member of. The session pooler connects as `postgres`, which on a
+# managed project is not a superuser and does not own supabase_admin, so every
+# default privilege the dump carries for such a role is refused. What those
+# statements govern is privileges on objects that role creates in *future* -
+# not one row of what is being restored now - and the target already carries
+# Supabase's own defaults for anon, authenticated and service_role. It is a
+# real difference from the source, so it is said out loud below rather than
+# dropped; it is not a reason to abandon a restore that otherwise worked.
+DEFPRIV=0; OTHER=""
+if [[ -n "$ERRS" ]]; then
+  DEFPRIV="$(grep -ci 'permission denied to change default privileges' <<<"$ERRS" || true)"
+  OTHER="$(grep -viE 'schema "[a-z_]+" already exists' <<<"$ERRS" \
+         | grep -vi 'permission denied to change default privileges' || true)"
+fi
 if [[ -n "$OTHER" ]]; then
+  COUNT="$(printf '%s\n' "$OTHER" | wc -l | tr -d ' ')"
   while IFS= read -r l; do record warn "$l"; printf '    %s\n' "$l"; done < <(printf '%s\n' "$OTHER" | head -10)
-  die "unexpected errors loading schema.sql (full log: $WORK/schema.log)"
+  # The console's list is capped at ten, so the rest go to the journal rather
+  # than nowhere. They cannot be left to schema.log: a console-driven restore
+  # has its $WORK removed on the way out, and naming a file that will not exist
+  # by the time anyone looks is worse than naming nothing.
+  if (( COUNT > 10 )); then
+    warn "... and $((COUNT - 10)) more:"
+    printf '%s\n' "$OTHER" | tail -n +11 >&2
+  fi
+  if (( REQ )); then
+    die "unexpected errors loading schema.sql ($COUNT) - read them with: journalctl -u ${RESTORE_UNIT}"
+  fi
+  die "unexpected errors loading schema.sql ($COUNT) - full log: $WORK/schema.log"
+fi
+if (( DEFPRIV )); then
+  warn "$DEFPRIV default-privilege statement(s) refused: this connection is not a"
+  warn "member of the roles they name. They decide what future objects those roles"
+  warn "create inherit - nothing restored here - and the target has its own."
 fi
 ok "loaded (expected 'schema already exists' ignored)"
 

@@ -365,12 +365,22 @@ constraint violation, leaving a project that looks complete and holds no data.
 `non-public.sql` goes last because its triggers call functions that `schema.sql`
 creates.
 
-Expect one error from step 2: `schema "public" already exists`. Let it through.
-Do **not** `drop schema public` to avoid it — Supabase preconfigures that schema
-with grants and default privileges for `anon`, `authenticated` and
-`service_role`, the dump does not recreate them, and dropping it strips the
-application's ability to read its own tables in a way that only surfaces later
-as confusing permission errors.
+Expect two errors from step 2, and let both through.
+
+`schema "public" already exists`. Do **not** `drop schema public` to avoid it —
+Supabase preconfigures that schema with grants and default privileges for
+`anon`, `authenticated` and `service_role`, the dump does not recreate them, and
+dropping it strips the application's ability to read its own tables in a way
+that only surfaces later as confusing permission errors.
+
+`permission denied to change default privileges`, usually several. `ALTER
+DEFAULT PRIVILEGES FOR ROLE <r>` needs membership in `<r>`; you connect as
+`postgres`, which on a managed project is not a superuser and does not own
+`supabase_admin`. Those statements decide what *future* objects those roles
+create inherit — they touch nothing you are restoring, and the target has its
+own already.
+
+Any other error is worth stopping for.
 
 Then re-upload `files/<bucket>/…` through the Storage API, preserving paths, and
 check the restored row counts against `manifest.json`.
