@@ -88,15 +88,22 @@ AUTO_CONF="${AUTO_CONF_DIR}/upgrade.env"
 # a release that did not change VERSION is a patch by definition - which is
 # what "auto" may install, and nothing else. Bumping VERSION is how a change
 # says it wants a person to look at it.
+# The policies that exist, in one place. There were four copies of this list -
+# the file reader, the spool handler, the command line, and the scheduler - and
+# adding 'minor' updated three. The console offered a setting its own helper
+# then refused, because the copy that mattered was the one nobody thought about.
+valid_policy() {
+  case "${1:-}" in patch|minor|off) return 0 ;; *) return 1 ;; esac
+}
+
 auto_policy() {
   local value=""
   if [ -f "$AUTO_CONF" ]; then
     value="$(sed -n 's|^[[:space:]]*AUTO_UPGRADE=||p' "$AUTO_CONF" | tail -1 | tr -d '"'"'"'[:space:]')"
   fi
-  case "$value" in
-    patch|minor) echo "$value" ;;
-    *)           echo off ;;
-  esac
+  # Anything unreadable reads as off: a policy file hand-edited into nonsense
+  # must not become permission to install.
+  if valid_policy "$value"; then echo "$value"; else echo off; fi
 }
 
 # What kind of step this would be. The version is <major>.<minor> and the commit
@@ -115,7 +122,7 @@ version_kind() {  # version_kind <installed> <available>
   fi
 }
 
-write_auto_policy() {  # write_auto_policy <patch|off>
+write_auto_policy() {  # write_auto_policy <off|patch|minor>
   install -d -m 0755 "$AUTO_CONF_DIR" || return 1
   local tmp
   tmp="$(mktemp)" || return 1
@@ -947,16 +954,18 @@ process() {
     auto)
       local want
       want="$(jq -r '.auto // ""' <<<"$body")"
-      case "$want" in
-        patch|off) ;;
-        *) emit "$id" failed "the request does not name a policy this helper has"; return 0 ;;
-      esac
+      if ! valid_policy "$want"; then
+        emit "$id" failed "'${want}' is not a policy this helper has - it takes off, patch or minor"
+        return 0
+      fi
       if [ "$(auto_policy)" = "$want" ]; then
         note "already ${want}"
       elif write_auto_policy "$want"; then
-        note "$([ "$want" = patch ] \
-              && echo "patches will be installed by the timer, twice a day" \
-              || echo "the timer will check and install nothing")"
+        case "$want" in
+          patch) note "patches will be installed by the timer, twice a day" ;;
+          minor) note "patches and minor releases will be installed by the timer, twice a day - never a major" ;;
+          *)     note "the timer will check and install nothing" ;;
+        esac
         note "wrote ${AUTO_CONF}"
       else
         emit "$id" failed "could not write ${AUTO_CONF}"
@@ -1086,10 +1095,7 @@ case "$MODE" in
 
   auto)
     need_root
-    case "$AUTO_WANT" in
-      patch|minor|off) ;;
-      *) fail "--auto takes 'patch', 'minor' or 'off'" ;;
-    esac
+    valid_policy "$AUTO_WANT" || fail "--auto takes 'patch', 'minor' or 'off'"
     write_auto_policy "$AUTO_WANT" || fail "could not write ${AUTO_CONF}"
     case "$AUTO_WANT" in
       patch)
