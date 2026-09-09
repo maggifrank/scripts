@@ -94,9 +94,25 @@ auto_policy() {
     value="$(sed -n 's|^[[:space:]]*AUTO_UPGRADE=||p' "$AUTO_CONF" | tail -1 | tr -d '"'"'"'[:space:]')"
   fi
   case "$value" in
-    patch) echo patch ;;
-    *)     echo off ;;
+    patch|minor) echo "$value" ;;
+    *)           echo off ;;
   esac
+}
+
+# What kind of step this would be. The version is <major>.<minor> and the commit
+# is the patch level, so: same version string is a patch, same major is a minor,
+# a different major is a major. Anything it cannot read is "unknown", which no
+# policy ever installs - guessing is the one thing that must not happen here.
+version_kind() {  # version_kind <installed> <available>
+  local a="${1:-}" b="${2:-}" am bm
+  { [ -n "$a" ] && [ -n "$b" ]; } || { echo unknown; return 0; }
+  [ "$a" = "$b" ] && { echo patch; return 0; }
+  am="${a%%.*}"; bm="${b%%.*}"
+  { [[ "$am" =~ ^[0-9]+$ ]] && [[ "$bm" =~ ^[0-9]+$ ]]; } || { echo unknown; return 0; }
+  if   [ "$bm" -gt "$am" ]; then echo major
+  elif [ "$bm" -eq "$am" ]; then echo minor
+  else echo unknown            # backwards is not a thing to automate
+  fi
 }
 
 write_auto_policy() {  # write_auto_policy <patch|off>
@@ -110,8 +126,13 @@ write_auto_policy() {  # write_auto_policy <patch|off>
 #   AUTO_UPGRADE=off      check only, and say so in the console. The default.
 #   AUTO_UPGRADE=patch    also install, but only when the published VERSION is
 #                         the one already running - a new commit against the
-#                         same version. Anything that bumped VERSION is left
-#                         for a person, which is what bumping it is for.
+#                         same version.
+#   AUTO_UPGRADE=minor    also install a new minor, so 1.4 to 1.5 but never
+#                         1.9 to 2.0. Staying on a major and taking everything
+#                         within it.
+#
+# A major is never installed automatically under any setting. It is the one
+# step that exists to say a person should look first.
 #
 # Either way the timer refuses while a backup or a restore is running, keeps
 # what it replaced under /var/lib/supabase-backup/rollback, and puts it back if
@@ -424,10 +445,10 @@ check() {  # check [--refresh] -> one JSON object on stdout
   # when both commits are known: "the versions match" on its own is what the
   # fallback below says when it could not read a commit at all, and installing
   # on the strength of that would be installing on the strength of nothing.
-  local is_patch=false
-  if [ "$available" = "true" ] && [ "$basis" = "commit" ] \
-     && [ -n "$have_version" ] && [ "$have_version" = "$avail_version" ]; then
-    is_patch=true
+  local kind="unknown" is_patch=false
+  if [ "$available" = "true" ] && [ "$basis" = "commit" ]; then
+    kind="$(version_kind "$have_version" "$avail_version")"
+    [ "$kind" = "patch" ] && is_patch=true
   fi
 
   # Only when there is something to describe, and only when we know where to
@@ -447,11 +468,11 @@ check() {  # check [--refresh] -> one JSON object on stdout
     --arg error "$error" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --argjson epoch "$(date -u +%s)" --arg comp "$(components)" \
     --arg repo "${GITHUB_USER}/${GITHUB_REPO}" --arg branch "$BRANCH" \
-    --argjson patch "$is_patch" --arg auto "$(auto_policy)" \
+    --argjson patch "$is_patch" --arg kind "$kind" --arg auto "$(auto_policy)" \
     --argjson changes "$changes" \
     '{installed: ($installed + {components: ($comp|split(" "))}),
       available: {version:$av, commit:$ac, committed_at:$ad},
-      upgrade_available:$up, is_patch:$patch, auto:$auto, changes:$changes,
+      upgrade_available:$up, is_patch:$patch, kind:$kind, auto:$auto, changes:$changes,
       basis:$basis, reason:$reason, error:$error,
       repo:$repo, branch:$branch, checked_at:$at, checked_at_epoch:$epoch}')"
   cache_write "$body"
@@ -476,7 +497,13 @@ print_check() {  # print_check <json>
   printf '  %-11s %s\n' "Installed" "$(jq -r '.installed.components | join(", ")' <<<"$j")"
   case "$(jq -r '.auto // "off"' <<<"$j")" in
     patch) printf '  %-11s %s\n' "Automatic" "patches, twice a day" ;;
+    minor) printf '  %-11s %s\n' "Automatic" "patches and minor releases, twice a day - never a major" ;;
     *)     printf '  %-11s %s\n' "Automatic" "off - checks twice a day, installs nothing" ;;
+  esac
+  case "$(jq -r '.kind // "unknown"' <<<"$j")" in
+    major) printf '  %-11s %s\n' "This step" "MAJOR - read the release notes before installing it" ;;
+    minor) printf '  %-11s %s\n' "This step" "minor" ;;
+    patch) printf '  %-11s %s\n' "This step" "patch" ;;
   esac
   local n
   n="$(jq -r '.changes.commits | length' <<<"$j" 2>/dev/null || echo 0)"
@@ -815,26 +842,43 @@ scheduled() {
   # is what the console would have had anyway.
   j="$(check --refresh)"
 
-  local up patch policy
+  local up kind policy from to
   up="$(jq -r '.upgrade_available' <<<"$j")"
-  patch="$(jq -r '.is_patch'       <<<"$j")"
-  policy="$(jq -r '.auto // "off"' <<<"$j")"
+  kind="$(jq -r '.kind // "unknown"' <<<"$j")"
+  policy="$(jq -r '.auto // "off"'   <<<"$j")"
+  from="$(jq -r '.installed.version // "?"' <<<"$j")"
+  to="$(jq -r '.available.version // "?"'   <<<"$j")"
 
   if [ "$up" != "true" ]; then
     echo "up to date - $(jq -r '.reason' <<<"$j")"
     return 0
   fi
-  if [ "$policy" != "patch" ]; then
+  if [ "$policy" = "off" ]; then
     echo "an upgrade is available ($(jq -r '.reason' <<<"$j")) - AUTO_UPGRADE is off, installing nothing"
     return 0
   fi
-  if [ "$patch" != "true" ]; then
-    # Exactly what bumping VERSION is for: this one wants a person.
-    echo "$(jq -r '.installed.version' <<<"$j") → $(jq -r '.available.version' <<<"$j") is not a patch - leaving it for a person"
+
+  # What this policy is willing to install, and nothing wider. A major is not
+  # on any of these lists: it is the one step whose whole purpose is to stop
+  # and be read, and a setting that could wave it through would make bumping
+  # the major number mean nothing.
+  local allowed=0
+  case "${policy}:${kind}" in
+    patch:patch)             allowed=1 ;;
+    minor:patch|minor:minor) allowed=1 ;;
+  esac
+
+  if [ "$allowed" -ne 1 ]; then
+    case "$kind" in
+      major)   echo "${from} → ${to} is a major - never installed automatically, whatever AUTO_UPGRADE says. Read the release notes and upgrade from the console or the terminal." ;;
+      minor)   echo "${from} → ${to} is a minor and AUTO_UPGRADE is 'patch' - leaving it for a person" ;;
+      unknown) echo "cannot tell what kind of step ${from} → ${to} is, so it is left for a person" ;;
+      *)       echo "${from} → ${to} is not something AUTO_UPGRADE=${policy} installs - leaving it for a person" ;;
+    esac
     return 0
   fi
 
-  echo "installing a patch: $(jq -r '.reason' <<<"$j")"
+  echo "installing a ${kind}: $(jq -r '.reason' <<<"$j")"
   QUIET=""
   STEPS=()
   AVAILABLE_COMMIT="$(jq -r '.available.commit // ""' <<<"$j")"
@@ -955,6 +999,7 @@ upgrade — bring this host's supabase-backup installation up to date.
   upgrade --drain         apply pending requests from the console's spool
   upgrade --scheduled     what the twice-daily timer runs
   upgrade --auto patch    let the timer install patches on its own
+  upgrade --auto minor    also let it install minor releases, never a major
   upgrade --auto off      let it check only (the default)
   upgrade --record        record what is installed right now (the setup scripts)
   upgrade --version       print the installed version
@@ -1042,16 +1087,20 @@ case "$MODE" in
   auto)
     need_root
     case "$AUTO_WANT" in
-      patch|off) ;;
-      *) fail "--auto takes 'patch' or 'off'" ;;
+      patch|minor|off) ;;
+      *) fail "--auto takes 'patch', 'minor' or 'off'" ;;
     esac
     write_auto_policy "$AUTO_WANT" || fail "could not write ${AUTO_CONF}"
-    if [ "$AUTO_WANT" = patch ]; then
-      info "patches will be installed by the timer, twice a day"
-      info "anything that bumps VERSION is still left for you"
-    else
-      info "the timer will check and install nothing"
-    fi
+    case "$AUTO_WANT" in
+      patch)
+        info "patches will be installed by the timer, twice a day"
+        info "anything that bumps VERSION is still left for you" ;;
+      minor)
+        info "patches and minor releases will be installed by the timer, twice a day"
+        info "a major is still left for you - no setting installs one" ;;
+      *)
+        info "the timer will check and install nothing" ;;
+    esac
     info "$AUTO_CONF"
     ;;
 
