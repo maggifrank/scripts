@@ -219,7 +219,13 @@ info "Caddyfile written."
 
 # ── Validate Caddyfile ────────────────────────────────────────────────────────
 step "7. Validating Caddyfile"
+# caddy validate is a plain process — it doesn't load EnvironmentFile the way
+# systemd will, so {env.CLOUDFLARE_API_TOKEN} would resolve empty without this.
+set -a
+source "$CF_ENV"
+set +a
 caddy validate --config "$CADDYFILE" && info "Caddyfile is valid." || error "Caddyfile has errors — check above output."
+unset CLOUDFLARE_API_TOKEN
 
 # ── Systemd service ───────────────────────────────────────────────────────────
 step "8. Creating systemd service"
@@ -304,8 +310,15 @@ cat >> "\$CADDYFILE" << EOF
 }
 EOF
 
-# Validate before reloading
-caddy validate --config "\$CADDYFILE" > /dev/null 2>&1 || {
+# Validate before reloading — caddy validate is a plain process and won't
+# load EnvironmentFile the way systemd does, so export it here first.
+set -a
+source /etc/caddy/cloudflare.env
+set +a
+caddy validate --config "\$CADDYFILE" > /dev/null 2>&1
+VALIDATE_STATUS=\$?
+unset CLOUDFLARE_API_TOKEN
+[ "\$VALIDATE_STATUS" -ne 0 ] && {
   echo -e "\${RED}[ERROR]\${NC} Caddyfile validation failed — changes rolled back."
   # Remove the block we just added
   head -n -7 "\$CADDYFILE" > "\${CADDYFILE}.tmp" && mv "\${CADDYFILE}.tmp" "\$CADDYFILE"
