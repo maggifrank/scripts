@@ -1,0 +1,43 @@
+#!/bin/bash
+# dns-add-cname — add a CNAME record to BIND9
+# Usage: dns-add-cname <alias> <target> [zone]
+# If [zone] is omitted: auto-picked if only one zone exists, otherwise prompted.
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: dns-add-cname <alias> <target> [zone]"
+  exit 1
+fi
+
+ALIAS="$1"
+TARGET="$2"
+ZONE_ARG="${3:-}"
+
+ZONE=$(select_zone "$ZONE_ARG")
+FORWARD_ZONE=$(zone_file_for "$ZONE")
+[ -z "$FORWARD_ZONE" ] && { error "Could not resolve zone file for $ZONE in $NAMED_CONF_LOCAL."; exit 1; }
+
+if [[ "$TARGET" != *"." ]]; then
+  if [[ "$TARGET" != *"$ZONE" ]]; then
+    TARGET="${TARGET}.${ZONE}."
+  else
+    TARGET="${TARGET}."
+  fi
+fi
+
+if grep -q "^${ALIAS}[[:space:]]" "$FORWARD_ZONE"; then
+  warn "$ALIAS already exists in $ZONE. Use dns-update-cname to change it."
+  exit 1
+fi
+
+SERIAL=$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$FORWARD_ZONE"
+
+echo "${ALIAS}     IN  CNAME   ${TARGET}" >> "$FORWARD_ZONE"
+info "Added CNAME record: ${ALIAS}.${ZONE} -> ${TARGET}"
+
+named-checkzone "$ZONE" "$FORWARD_ZONE" > /dev/null && rndc reload > /dev/null
+info "Zone reloaded."

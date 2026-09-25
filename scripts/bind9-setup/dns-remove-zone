@@ -1,0 +1,171 @@
+#!/bin/bash
+# dns-remove-zone — remove a BIND9 zone (and its paired reverse zone, if any)
+# Usage: dns-remove-zone <zone> [network-prefix] [--forward-only] [--keep-files]
+#                         [--force] [--secondary-ssh-alias alias] [--no-secondary]
+#                         [--dry-run]
+#
+# If this zone has a paired reverse zone (recorded by dns-add-zone when it
+# was created with a network-prefix), it's found and removed automatically
+# — you don't need to pass the prefix again. Pass network-prefix explicitly
+# to override/force a specific one (e.g. for zones created before pairing
+# was tracked). Pass --forward-only to skip reverse-zone cleanup entirely.
+#
+# --keep-files   remove the named.conf.local stanza(s) but leave the zone
+#                file(s) on disk (e.g. to archive them instead of deleting).
+# --force        proceed even if the forward zone still has A/CNAME/etc
+#                records beyond the SOA/NS header (normally refused).
+# --no-secondary don't touch the secondary (edge01) at all.
+# --dry-run      print what would change, do nothing.
+#
+# By default this also SSHes to the secondary (--secondary-ssh-alias, default
+# edge01-ssh) and removes the matching slave stanza(s) there, then reloads.
+# If the zone isn't slaved on the secondary, or the SSH step fails, it warns
+# and moves on — it does not undo the primary-side removal.
+#
+# named.conf.local is backed up (timestamped, alongside the original)
+# before it's edited, on both primary and secondary.
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+usage() {
+  echo "Usage: dns-remove-zone <zone> [network-prefix] [--forward-only] [--keep-files] [--force] [--secondary-ssh-alias alias] [--no-secondary] [--dry-run]"
+  exit 1
+}
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+[ "$#" -lt 1 ] && usage
+
+ZONE="$1"; shift
+
+NETWORK_PREFIX=""
+if [ "$#" -gt 0 ] && [[ "$1" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+  NETWORK_PREFIX="$1"; shift
+fi
+
+KEEP_FILES=0
+FORCE=0
+FORWARD_ONLY=0
+NO_SECONDARY=0
+DRY_RUN=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --keep-files) KEEP_FILES=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --forward-only) FORWARD_ONLY=1; shift ;;
+    --secondary-ssh-alias) SECONDARY_SSH_ALIAS="$2"; shift 2 ;;
+    --no-secondary) NO_SECONDARY=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    *) usage ;;
+  esac
+done
+
+# If no network-prefix was given explicitly, see if dns-add-zone recorded a
+# paired reverse zone for this forward zone and use that.
+if [ -z "$NETWORK_PREFIX" ] && [ "$FORWARD_ONLY" -eq 0 ]; then
+  PAIR=$(zone_pair_for "$ZONE")
+  if [ -n "$PAIR" ]; then
+    NETWORK_PREFIX="${PAIR##*:}"
+    info "Found paired reverse zone for $ZONE (network ${NETWORK_PREFIX}) — will remove it too. Use --forward-only to skip."
+  fi
+fi
+
+FORWARD_FILE=$(zone_file_for "$ZONE")
+[ -z "$FORWARD_FILE" ] && { error "Zone $ZONE not found in $NAMED_CONF_LOCAL."; exit 1; }
+
+# Safety check: refuse if the zone still has real records (A/CNAME/MX/TXT/SRV),
+# unless --force. SOA/apex-NS header lines don't match this pattern.
+if [ -f "$FORWARD_FILE" ] && [ "$FORCE" -eq 0 ]; then
+  RECORD_COUNT=$(grep -cE '^[A-Za-z0-9_.*-]+[[:space:]]+IN[[:space:]]+(A|CNAME|MX|TXT|SRV)' "$FORWARD_FILE" 2>/dev/null || true)
+  if [ "${RECORD_COUNT:-0}" -gt 0 ]; then
+    error "$ZONE still has ${RECORD_COUNT} record(s) in $FORWARD_FILE. Remove them first (dns-remove), or pass --force."
+    exit 1
+  fi
+fi
+
+REVERSE_ZONE_NAME=""
+REVERSE_FILE=""
+if [ -n "$NETWORK_PREFIX" ]; then
+  REV_OCTETS=$(echo "$NETWORK_PREFIX" | awk -F. '{print $3"."$2"."$1}')
+  REVERSE_ZONE_NAME="${REV_OCTETS}.in-addr.arpa"
+  REVERSE_FILE=$(zone_file_for "$REVERSE_ZONE_NAME")
+  if [ -z "$REVERSE_FILE" ]; then
+    warn "Reverse zone $REVERSE_ZONE_NAME not found in $NAMED_CONF_LOCAL — skipping reverse cleanup."
+    NETWORK_PREFIX=""
+  fi
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "--- Would remove zone stanza \"${ZONE}\" from $NAMED_CONF_LOCAL ---"
+  [ "$KEEP_FILES" -eq 0 ] && echo "--- Would delete $FORWARD_FILE ---"
+  if [ -n "$NETWORK_PREFIX" ]; then
+    echo "--- Would remove zone stanza \"${REVERSE_ZONE_NAME}\" from $NAMED_CONF_LOCAL ---"
+    [ "$KEEP_FILES" -eq 0 ] && echo "--- Would delete $REVERSE_FILE ---"
+    echo "--- Would remove ${NETWORK_PREFIX} entry from $REVERSE_MAP ---"
+  fi
+  if [ "$NO_SECONDARY" -eq 0 ]; then
+    echo "--- Would run on ${SECONDARY_SSH_ALIAS} (via sudo dns-slave-apply): remove \"${ZONE}\" (if present) ---"
+    [ -n "$NETWORK_PREFIX" ] && echo "--- Would run on ${SECONDARY_SSH_ALIAS} (via sudo dns-slave-apply): remove \"${REVERSE_ZONE_NAME}\" (if present) ---"
+  fi
+  exit 0
+fi
+
+BACKUP=$(remove_zone_stanza "$ZONE")
+info "Removed zone stanza for $ZONE from $NAMED_CONF_LOCAL (backup: $BACKUP)"
+
+if [ "$KEEP_FILES" -eq 0 ] && [ -f "$FORWARD_FILE" ]; then
+  rm -f "$FORWARD_FILE"
+  info "Deleted $FORWARD_FILE"
+fi
+
+if [ -n "$NETWORK_PREFIX" ]; then
+  remove_zone_stanza "$REVERSE_ZONE_NAME" > /dev/null
+  info "Removed zone stanza for $REVERSE_ZONE_NAME from $NAMED_CONF_LOCAL"
+
+  if [ "$KEEP_FILES" -eq 0 ] && [ -f "$REVERSE_FILE" ]; then
+    rm -f "$REVERSE_FILE"
+    info "Deleted $REVERSE_FILE"
+  fi
+
+  if [ -f "$REVERSE_MAP" ]; then
+    sed -i "/^${NETWORK_PREFIX}:/d" "$REVERSE_MAP"
+    info "Removed ${NETWORK_PREFIX} entry from $REVERSE_MAP"
+  fi
+
+  remove_zone_pair "$ZONE"
+fi
+
+named-checkconf || { error "named.conf validation failed after edit — check $NAMED_CONF_LOCAL (restore from $BACKUP if needed)."; exit 1; }
+rndc reload > /dev/null
+info "BIND9 reloaded on primary."
+
+if [ "$NO_SECONDARY" -eq 0 ]; then
+  if ! secondary_ssh_ok; then
+    warn "Could not SSH to secondary (${SECONDARY_SSH_ALIAS}) — remove \"${ZONE}\" there by hand if it's slaved."
+  else
+    if SEC_BACKUP=$(secondary_remove_slave_zone "$ZONE"); then
+      info "Removed slave zone $ZONE on ${SECONDARY_SSH_ALIAS} (backup: $SEC_BACKUP)."
+    else
+      rc=$?
+      if [ "$rc" -eq 1 ]; then
+        info "$ZONE was not slaved on ${SECONDARY_SSH_ALIAS} — nothing to remove there."
+      else
+        warn "Failed to remove $ZONE from ${SECONDARY_SSH_ALIAS} — check it by hand."
+      fi
+    fi
+
+    if [ -n "$NETWORK_PREFIX" ]; then
+      if SEC_BACKUP=$(secondary_remove_slave_zone "$REVERSE_ZONE_NAME"); then
+        info "Removed slave zone $REVERSE_ZONE_NAME on ${SECONDARY_SSH_ALIAS} (backup: $SEC_BACKUP)."
+      else
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+          info "$REVERSE_ZONE_NAME was not slaved on ${SECONDARY_SSH_ALIAS} — nothing to remove there."
+        else
+          warn "Failed to remove $REVERSE_ZONE_NAME from ${SECONDARY_SSH_ALIAS} — check it by hand."
+        fi
+      fi
+    fi
+  fi
+fi

@@ -1,0 +1,221 @@
+#!/bin/bash
+# dns-add-zone — create a new BIND9 forward zone, and optionally its reverse zone
+# Usage: dns-add-zone <zone> [network-prefix] [-n primary-ns-fqdn] [-e admin-email]
+#                      [-s secondary-transfer-ip] [-p primary-master-ip]
+#                      [--secondary-ssh-alias alias] [--no-secondary] [--dry-run]
+#
+# Examples:
+#   dns-add-zone lab.talva.is
+#   dns-add-zone lab.talva.is 10.100.54
+#   dns-add-zone lab.talva.is 10.100.54 -n ns1.talva.is -e hostmaster.talva.is
+#   dns-add-zone lab.talva.is 10.100.54 --no-secondary   # skip replication entirely
+#
+# network-prefix is a /24, e.g. 10.100.54 (no trailing octet). If given, a
+# matching reverse zone is created too and registered in reverse-map.conf
+# so dns-add/dns-update/dns-remove can find it automatically.
+#
+# By default, both zone stanzas on the primary get allow-query { any; }; plus
+# AXFR/notify to a secondary (-s, default 10.100.53.41 = edge01). After the
+# primary succeeds, this script also SSHes to the secondary (--secondary-ssh-alias,
+# default edge01-ssh) and adds matching "type slave" stanzas there, pointing
+# masters { } at -p (default 10.100.53.73 = bind9-01), then reloads it.
+# If that SSH step fails, the primary change is NOT rolled back — the stanza
+# that needed to go on the secondary is printed so you can add it by hand.
+#
+# Review with --dry-run before running for real, especially the first time —
+# this script assumes the standard Debian named.conf.local zone-block layout
+# (see dns-common.sh header comment).
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+usage() {
+  echo "Usage: dns-add-zone <zone> [network-prefix] [-n primary-ns-fqdn] [-e admin-email] [-s secondary-transfer-ip] [-p primary-master-ip] [--secondary-ssh-alias alias] [--no-secondary] [--dry-run]"
+  exit 1
+}
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+[ "$#" -lt 1 ] && usage
+
+ZONE="$1"; shift
+
+NETWORK_PREFIX=""
+if [ "$#" -gt 0 ] && [[ "$1" =~ ^([0-9]{1,3}\.){2}[0-9]{1,3}$ ]]; then
+  NETWORK_PREFIX="$1"; shift
+fi
+
+DRY_RUN=0
+PRIMARY_NS=""
+ADMIN_EMAIL=""
+SECONDARY_IP=""
+PRIMARY_MASTER_IP=""
+NO_SECONDARY=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -n) PRIMARY_NS="$2"; shift 2 ;;
+    -e) ADMIN_EMAIL="$2"; shift 2 ;;
+    -s) SECONDARY_IP="$2"; shift 2 ;;
+    -p) PRIMARY_MASTER_IP="$2"; shift 2 ;;
+    --secondary-ssh-alias) SECONDARY_SSH_ALIAS="$2"; shift 2 ;;
+    --no-secondary) NO_SECONDARY=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    *) usage ;;
+  esac
+done
+
+PRIMARY_NS="${PRIMARY_NS:-ns1.talva.is}"
+ADMIN_EMAIL="${ADMIN_EMAIL:-hostmaster.talva.is}"
+SECONDARY_IP="${SECONDARY_IP:-10.100.53.41}"
+PRIMARY_MASTER_IP="${PRIMARY_MASTER_IP:-10.100.53.73}"
+
+REPLICATION_BLOCK=""
+if [ "$NO_SECONDARY" -eq 0 ]; then
+  REPLICATION_BLOCK="
+    allow-transfer { ${SECONDARY_IP}; };
+    notify yes;
+    also-notify { ${SECONDARY_IP}; };"
+fi
+
+FORWARD_FILE="${ZONES_DIR}/db.${ZONE}"
+
+if grep -q "zone[[:space:]]\+\"${ZONE}\"" "$NAMED_CONF_LOCAL" 2>/dev/null; then
+  error "Zone $ZONE already exists in $NAMED_CONF_LOCAL."
+  exit 1
+fi
+
+if [ -e "$FORWARD_FILE" ]; then
+  error "$FORWARD_FILE already exists."
+  exit 1
+fi
+
+SERIAL=$(date +%Y%m%d%H)
+
+FORWARD_CONTENT="\$TTL 86400
+@   IN  SOA ${PRIMARY_NS}. ${ADMIN_EMAIL}. (
+        ${SERIAL}        ; Serial
+        3600              ; Refresh
+        900               ; Retry
+        604800            ; Expire
+        86400 )           ; Negative Cache TTL
+
+    IN  NS  ${PRIMARY_NS}.
+"
+
+FORWARD_STANZA="zone \"${ZONE}\" {
+    type master;
+    file \"${FORWARD_FILE}\";
+    allow-query { any; };${REPLICATION_BLOCK}
+};"
+
+REVERSE_ZONE_NAME=""
+REVERSE_FILE=""
+REVERSE_CONTENT=""
+REVERSE_STANZA=""
+
+if [ -n "$NETWORK_PREFIX" ]; then
+  REV_OCTETS=$(echo "$NETWORK_PREFIX" | awk -F. '{print $3"."$2"."$1}')
+  REVERSE_ZONE_NAME="${REV_OCTETS}.in-addr.arpa"
+  REVERSE_FILE="${ZONES_DIR}/db.${REV_OCTETS}.in-addr.arpa"
+
+  if grep -q "zone[[:space:]]\+\"${REVERSE_ZONE_NAME}\"" "$NAMED_CONF_LOCAL" 2>/dev/null; then
+    error "Reverse zone $REVERSE_ZONE_NAME already exists in $NAMED_CONF_LOCAL."
+    exit 1
+  fi
+
+  REVERSE_CONTENT="\$TTL 86400
+@   IN  SOA ${PRIMARY_NS}. ${ADMIN_EMAIL}. (
+        ${SERIAL}        ; Serial
+        3600              ; Refresh
+        900               ; Retry
+        604800            ; Expire
+        86400 )           ; Negative Cache TTL
+
+    IN  NS  ${PRIMARY_NS}.
+"
+
+  REVERSE_STANZA="zone \"${REVERSE_ZONE_NAME}\" {
+    type master;
+    file \"${REVERSE_FILE}\";
+    allow-query { any; };${REPLICATION_BLOCK}
+};"
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "--- Would write $FORWARD_FILE ---"
+  echo "$FORWARD_CONTENT"
+  echo "--- Would append to $NAMED_CONF_LOCAL ---"
+  echo "$FORWARD_STANZA"
+  if [ -n "$NETWORK_PREFIX" ]; then
+    echo "--- Would write $REVERSE_FILE ---"
+    echo "$REVERSE_CONTENT"
+    echo "--- Would append to $NAMED_CONF_LOCAL ---"
+    echo "$REVERSE_STANZA"
+    echo "--- Would append to $REVERSE_MAP ---"
+    echo "${NETWORK_PREFIX}:${REVERSE_FILE}"
+  fi
+  if [ "$NO_SECONDARY" -eq 0 ]; then
+    echo "--- Would run on ${SECONDARY_SSH_ALIAS} (via sudo dns-slave-apply): add ---"
+    slave_stanza_for "$ZONE" "db.${ZONE}" "$PRIMARY_MASTER_IP"
+    if [ -n "$NETWORK_PREFIX" ]; then
+      slave_stanza_for "$REVERSE_ZONE_NAME" "db.${REV_OCTETS}.in-addr.arpa" "$PRIMARY_MASTER_IP"
+    fi
+  fi
+  exit 0
+fi
+
+echo "$FORWARD_CONTENT" > "$FORWARD_FILE"
+{ echo ""; echo "$FORWARD_STANZA"; } >> "$NAMED_CONF_LOCAL"
+info "Created forward zone $ZONE ($FORWARD_FILE)"
+
+if [ -n "$NETWORK_PREFIX" ]; then
+  echo "$REVERSE_CONTENT" > "$REVERSE_FILE"
+  { echo ""; echo "$REVERSE_STANZA"; } >> "$NAMED_CONF_LOCAL"
+  echo "${NETWORK_PREFIX}:${REVERSE_FILE}" >> "$REVERSE_MAP"
+  record_zone_pair "$ZONE" "$REVERSE_ZONE_NAME" "$NETWORK_PREFIX"
+  info "Created reverse zone $REVERSE_ZONE_NAME ($REVERSE_FILE)"
+  info "Registered ${NETWORK_PREFIX} -> ${REVERSE_FILE} in $REVERSE_MAP"
+fi
+
+named-checkconf || { error "named.conf validation failed — check $NAMED_CONF_LOCAL"; exit 1; }
+named-checkzone "$ZONE" "$FORWARD_FILE" > /dev/null || { error "Forward zone validation failed."; exit 1; }
+if [ -n "$NETWORK_PREFIX" ]; then
+  named-checkzone "$REVERSE_ZONE_NAME" "$REVERSE_FILE" > /dev/null || { error "Reverse zone validation failed."; exit 1; }
+fi
+
+rndc reload > /dev/null
+info "BIND9 reloaded on primary."
+
+if [ "$NO_SECONDARY" -eq 0 ]; then
+  if ! secondary_ssh_ok; then
+    warn "Could not SSH to secondary (${SECONDARY_SSH_ALIAS}). Add these by hand:"
+    slave_stanza_for "$ZONE" "db.${ZONE}" "$PRIMARY_MASTER_IP"
+    [ -n "$NETWORK_PREFIX" ] && slave_stanza_for "$REVERSE_ZONE_NAME" "db.${REV_OCTETS}.in-addr.arpa" "$PRIMARY_MASTER_IP"
+  else
+    if secondary_push_slave_zone "$ZONE" "db.${ZONE}" "$PRIMARY_MASTER_IP"; then
+      info "Added slave zone $ZONE on ${SECONDARY_SSH_ALIAS} and reloaded."
+    else
+      rc=$?
+      if [ "$rc" -eq 1 ]; then
+        warn "$ZONE already exists on ${SECONDARY_SSH_ALIAS} — left as-is."
+      else
+        warn "Failed to push $ZONE to ${SECONDARY_SSH_ALIAS}. Add this by hand:"
+        slave_stanza_for "$ZONE" "db.${ZONE}" "$PRIMARY_MASTER_IP"
+      fi
+    fi
+
+    if [ -n "$NETWORK_PREFIX" ]; then
+      if secondary_push_slave_zone "$REVERSE_ZONE_NAME" "db.${REV_OCTETS}.in-addr.arpa" "$PRIMARY_MASTER_IP"; then
+        info "Added slave zone $REVERSE_ZONE_NAME on ${SECONDARY_SSH_ALIAS} and reloaded."
+      else
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+          warn "$REVERSE_ZONE_NAME already exists on ${SECONDARY_SSH_ALIAS} — left as-is."
+        else
+          warn "Failed to push $REVERSE_ZONE_NAME to ${SECONDARY_SSH_ALIAS}. Add this by hand:"
+          slave_stanza_for "$REVERSE_ZONE_NAME" "db.${REV_OCTETS}.in-addr.arpa" "$PRIMARY_MASTER_IP"
+        fi
+      fi
+    fi
+  fi
+fi
