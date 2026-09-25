@@ -40,6 +40,40 @@ if command -v caddy &>/dev/null && [ -f /etc/caddy/Caddyfile ]; then
   apt-get update -q
   DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -q caddy
   caddy upgrade || warn "Caddy binary upgrade failed — may need manual intervention."
+
+  # Ensure the systemd unit is the one this script manages, not the stock
+  # package unit (which lacks EnvironmentFile=). A host whose first run
+  # failed before step 8 would otherwise stay stuck running Caddy without
+  # its Cloudflare token, even after subsequent updates.
+  cat > /etc/systemd/system/caddy.service << 'EOF'
+[Unit]
+Description=Caddy Reverse Proxy
+Documentation=https://caddyserver.com/docs/
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=3
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+EnvironmentFile=/etc/caddy/cloudflare.env
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=strict
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/lib/caddy /var/log/caddy /etc/caddy
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
   systemctl restart caddy
   info "Updated to: $(caddy version)"
   systemctl is-active caddy &>/dev/null && info "Caddy is running." || warn "Caddy failed to restart — check: journalctl -xe -u caddy"
