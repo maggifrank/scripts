@@ -1,0 +1,48 @@
+#!/bin/bash
+# dns-remove — remove an A or CNAME record (and PTR, if applicable) from BIND9
+# Usage: dns-remove <hostname> [zone]
+# If [zone] is omitted: auto-picked if only one zone exists, otherwise prompted.
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+  echo "Usage: dns-remove <hostname> [zone]"
+  exit 1
+fi
+
+HOST="$1"
+ZONE_ARG="${2:-}"
+
+ZONE=$(select_zone "$ZONE_ARG")
+FORWARD_ZONE=$(zone_file_for "$ZONE")
+[ -z "$FORWARD_ZONE" ] && { error "Could not resolve zone file for $ZONE in $NAMED_CONF_LOCAL."; exit 1; }
+
+if ! grep -q "^${HOST}[[:space:]]" "$FORWARD_ZONE"; then
+  warn "$HOST not found in $ZONE."
+  exit 1
+fi
+
+IP=$(grep "^${HOST}[[:space:]]" "$FORWARD_ZONE" | awk '{print $NF}')
+RECORD_TYPE=$(grep "^${HOST}[[:space:]]" "$FORWARD_ZONE" | awk '{print $2}')
+sed -i "/^${HOST}[[:space:]]/d" "$FORWARD_ZONE"
+info "Removed ${RECORD_TYPE} record: ${HOST}.${ZONE}"
+
+REVERSE_ZONE_FILE=""
+if [ "$RECORD_TYPE" = "A" ] && [ -n "$IP" ]; then
+  REVERSE_ZONE_FILE=$(get_reverse_zone_file_for_ip "$IP")
+  if [ -n "$REVERSE_ZONE_FILE" ]; then
+    LAST=$(echo "$IP" | cut -d'.' -f4)
+    sed -i "/^${LAST}[[:space:]]/d" "$REVERSE_ZONE_FILE"
+    info "Removed PTR record: ${LAST}"
+  fi
+fi
+
+SERIAL=$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$FORWARD_ZONE"
+[ -n "$REVERSE_ZONE_FILE" ] && sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$REVERSE_ZONE_FILE"
+
+named-checkzone "$ZONE" "$FORWARD_ZONE" > /dev/null || { error "Zone validation failed."; exit 1; }
+rndc reload > /dev/null
+info "BIND9 reloaded."

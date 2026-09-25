@@ -1,0 +1,44 @@
+#!/bin/bash
+# dns-update-cname — update an existing CNAME record's target in BIND9
+# Usage: dns-update-cname <alias> <new-target> [zone]
+# If [zone] is omitted: auto-picked if only one zone exists, otherwise prompted.
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: dns-update-cname <alias> <new-target> [zone]"
+  exit 1
+fi
+
+ALIAS="$1"
+NEW_TARGET="$2"
+ZONE_ARG="${3:-}"
+
+ZONE=$(select_zone "$ZONE_ARG")
+FORWARD_ZONE=$(zone_file_for "$ZONE")
+[ -z "$FORWARD_ZONE" ] && { error "Could not resolve zone file for $ZONE in $NAMED_CONF_LOCAL."; exit 1; }
+
+if ! grep -q "^${ALIAS}[[:space:]]\+IN[[:space:]]\+CNAME" "$FORWARD_ZONE"; then
+  warn "$ALIAS is not an existing CNAME record in $ZONE. Use dns-add-cname instead."
+  exit 1
+fi
+
+if [[ "$NEW_TARGET" != *"." ]]; then
+  if [[ "$NEW_TARGET" != *"$ZONE" ]]; then
+    NEW_TARGET="${NEW_TARGET}.${ZONE}."
+  else
+    NEW_TARGET="${NEW_TARGET}."
+  fi
+fi
+
+sed -i "s/^${ALIAS}[[:space:]].*$/${ALIAS}     IN  CNAME   ${NEW_TARGET}/" "$FORWARD_ZONE"
+info "Updated CNAME record: ${ALIAS}.${ZONE} -> ${NEW_TARGET}"
+
+SERIAL=$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$FORWARD_ZONE"
+
+named-checkzone "$ZONE" "$FORWARD_ZONE" > /dev/null || { error "Zone validation failed."; exit 1; }
+rndc reload > /dev/null
+info "BIND9 reloaded."

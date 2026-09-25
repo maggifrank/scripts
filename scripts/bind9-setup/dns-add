@@ -1,0 +1,52 @@
+#!/bin/bash
+# dns-add — add an A record and PTR record to BIND9
+# Usage: dns-add <hostname> <ip> [zone]
+# If [zone] is omitted: auto-picked if only one zone exists, otherwise prompted.
+
+set -euo pipefail
+source /usr/local/bin/dns-common.sh
+
+[ "$EUID" -ne 0 ] && { error "Run as root."; exit 1; }
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+  echo "Usage: dns-add <hostname> <ip> [zone]"
+  exit 1
+fi
+
+HOST="$1"
+IP="$2"
+ZONE_ARG="${3:-}"
+
+if ! [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  error "Invalid IP: $IP"
+  exit 1
+fi
+
+ZONE=$(select_zone "$ZONE_ARG")
+FORWARD_ZONE=$(zone_file_for "$ZONE")
+[ -z "$FORWARD_ZONE" ] && { error "Could not resolve zone file for $ZONE in $NAMED_CONF_LOCAL."; exit 1; }
+
+if grep -q "^${HOST}[[:space:]]" "$FORWARD_ZONE"; then
+  warn "$HOST already exists in $ZONE. Use dns-update to change it."
+  exit 1
+fi
+
+REVERSE_ZONE_FILE=$(get_reverse_zone_file_for_ip "$IP")
+
+SERIAL=$(date +%Y%m%d%H)
+sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$FORWARD_ZONE"
+[ -n "$REVERSE_ZONE_FILE" ] && sed -i "s/[0-9]\{10\}.*; Serial/${SERIAL}        ; Serial/" "$REVERSE_ZONE_FILE"
+
+echo "${HOST}     IN  A   ${IP}" >> "$FORWARD_ZONE"
+info "Added A record: ${HOST}.${ZONE} -> ${IP}"
+
+if [ -n "$REVERSE_ZONE_FILE" ]; then
+  LAST=$(echo "$IP" | cut -d'.' -f4)
+  echo "${LAST}    IN  PTR ${HOST}.${ZONE}." >> "$REVERSE_ZONE_FILE"
+  info "Added PTR record: ${LAST} -> ${HOST}.${ZONE}"
+else
+  warn "No reverse zone registered for this /24 — skipping PTR. (Create one with dns-add-zone, or add an entry to $REVERSE_MAP.)"
+fi
+
+named-checkzone "$ZONE" "$FORWARD_ZONE" > /dev/null || { error "Zone validation failed."; exit 1; }
+rndc reload > /dev/null
+info "BIND9 reloaded."

@@ -31,31 +31,58 @@ Installs and configures BIND9 as a local DNS server with split-horizon. Internal
 8. Validates config with `named-checkconf` and `named-checkzone`
 9. Starts and enables BIND9
 10. Tests local resolution and forwarder connectivity
-11. Installs `dns-add`, `dns-update`, and `dns-remove` helper commands
+11. Registers the zone it just created with `reverse-map.conf` and `zone-pairs.conf`, so the helper commands below can find it automatically
+12. Installs `dns-common.sh` and the `dns-add`, `dns-add-cname`, `dns-add-zone`, `dns-remove`, `dns-remove-zone`, `dns-update`, and `dns-update-cname` helper commands, fetched from this repo (`scripts/bind9-setup/`)
 
 ## Managing DNS Records After Setup
 
-Three helper commands are installed automatically:
+Seven helper commands are installed automatically, sharing a common library (`dns-common.sh`). They're zone-aware: pass a zone name as the last argument, or omit it — it's auto-picked if only one zone exists, otherwise you're prompted.
 
 **Add a record:**
 ```bash
-dns-add <hostname> <ip>
+dns-add <hostname> <ip> [zone]
 dns-add homeassistant 10.0.0.20
+```
+
+**Add a CNAME:**
+```bash
+dns-add-cname <alias> <target> [zone]
+dns-add-cname www homeassistant
 ```
 
 **Update an existing record:**
 ```bash
-dns-update <hostname> <new-ip>
+dns-update <hostname> <new-ip> [zone]
 dns-update homeassistant 10.0.0.25
 ```
 
-**Remove a record:**
+**Update an existing CNAME's target:**
 ```bash
-dns-remove <hostname>
+dns-update-cname <alias> <new-target> [zone]
+dns-update-cname www homeassistant2
+```
+
+**Remove a record (A or CNAME):**
+```bash
+dns-remove <hostname> [zone]
 dns-remove homeassistant
 ```
 
-All three helpers automatically update both the A record and PTR record, bump the zone serial, validate the zone file, and reload BIND9.
+**Add a new zone** (and its paired reverse zone, if a network prefix is given):
+```bash
+dns-add-zone <zone> [network-prefix] [-n primary-ns-fqdn] [-e admin-email] [-s secondary-transfer-ip] [-p primary-master-ip] [--secondary-ssh-alias alias] [--no-secondary] [--dry-run]
+dns-add-zone lab.talva.is 10.100.54
+```
+
+**Remove a zone** (and its paired reverse zone, unless `--forward-only`):
+```bash
+dns-remove-zone <zone> [network-prefix] [--forward-only] [--keep-files] [--force] [--secondary-ssh-alias alias] [--no-secondary] [--dry-run]
+dns-remove-zone lab.talva.is
+```
+
+`dns-add-zone`/`dns-remove-zone` default to also replicating the change to a secondary DNS server over SSH (`edge01-ssh` by default, applying it there via a restricted `sudo -n dns-slave-apply` wrapper — see the header comment in `dns-common.sh`). Pass `--no-secondary` to skip that, or review with `--dry-run` first.
+
+All of these bump the affected zone serial(s), validate the zone file, and reload BIND9.
 
 To edit records manually:
 
@@ -84,9 +111,18 @@ dig @<server-ip> google.com
 | `/etc/bind/named.conf.local` | Zone definitions |
 | `/etc/bind/zones/db.<domain>` | Forward zone records |
 | `/etc/bind/zones/db.<reverse>` | Reverse zone PTR records |
-| `/usr/local/bin/dns-add` | Helper to add records |
-| `/usr/local/bin/dns-update` | Helper to update records |
-| `/usr/local/bin/dns-remove` | Helper to remove records |
+| `/etc/bind/zones/reverse-map.conf` | `<network-prefix>:<reverse-zone-file>` — lets the helpers find the right reverse zone for a given IP |
+| `/etc/bind/zones/zone-pairs.conf` | `<forward-zone>:<reverse-zone>:<network-prefix>` — lets `dns-remove-zone` find a zone's paired reverse zone automatically |
+| `/usr/local/bin/dns-common.sh` | Shared library sourced by all the `dns-*` helpers below |
+| `/usr/local/bin/dns-add` | Add an A record (+ PTR) |
+| `/usr/local/bin/dns-add-cname` | Add a CNAME record |
+| `/usr/local/bin/dns-add-zone` | Create a new forward (and optionally reverse) zone |
+| `/usr/local/bin/dns-update` | Update an existing A record (+ PTR) |
+| `/usr/local/bin/dns-update-cname` | Update an existing CNAME's target |
+| `/usr/local/bin/dns-remove` | Remove an A or CNAME record (+ PTR) |
+| `/usr/local/bin/dns-remove-zone` | Remove a zone (and its paired reverse zone) |
+
+The source for the `dns-*` helpers lives in this repo at `scripts/bind9-setup/` — the setup script downloads them fresh on every install/update rather than generating them inline.
 
 ## Updating
 
@@ -96,7 +132,7 @@ Run the script again on the same system — it will detect the existing installa
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/maggifrank/scripts/main/install.sh)"
 ```
 
-Select the same script from the menu. No configuration prompts — just updates packages and restarts services.
+Select the same script from the menu. No configuration prompts — it updates packages, restarts services, and re-downloads the latest `dns-*` helper scripts.
 
 ## Useful Commands
 
