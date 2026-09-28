@@ -21,9 +21,12 @@ FORWARD_ZONE=$(zone_file_for "$ZONE")
 [ -z "$FORWARD_ZONE" ] && { error "Could not resolve zone file for $ZONE in $NAMED_CONF_LOCAL."; exit 1; }
 
 if [[ "$TARGET" != *"." ]]; then
-  if [[ "$TARGET" != *"$ZONE" ]]; then
+  if [[ "$TARGET" != *.* ]]; then
+    # No dot anywhere: a bare relative name, e.g. "homeassistant" -> resolve in this zone.
     TARGET="${TARGET}.${ZONE}."
   else
+    # Already has a dot somewhere: an FQDN missing only its trailing root dot
+    # (e.g. "myapp.netlify.app" or "host.${ZONE}") -- don't re-qualify it.
     TARGET="${TARGET}."
   fi
 fi
