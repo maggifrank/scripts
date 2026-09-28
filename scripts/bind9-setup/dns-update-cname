@@ -26,9 +26,12 @@ if ! grep -q "^${ALIAS}[[:space:]]\+IN[[:space:]]\+CNAME" "$FORWARD_ZONE"; then
 fi
 
 if [[ "$NEW_TARGET" != *"." ]]; then
-  if [[ "$NEW_TARGET" != *"$ZONE" ]]; then
+  if [[ "$NEW_TARGET" != *.* ]]; then
+    # No dot anywhere: a bare relative name, e.g. "homeassistant2" -> resolve in this zone.
     NEW_TARGET="${NEW_TARGET}.${ZONE}."
   else
+    # Already has a dot somewhere: an FQDN missing only its trailing root dot
+    # (e.g. "myapp.netlify.app" or "host.${ZONE}") -- don't re-qualify it.
     NEW_TARGET="${NEW_TARGET}."
   fi
 fi
