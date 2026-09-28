@@ -7,6 +7,28 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.9 — 2026-09-09
+
+The console stops corrupting the request after one it refused.
+
+- It speaks HTTP/1.1, so a browser reuses the connection. Several paths answered
+  a POST without ever reading its body — a 401, a 403 from one of the channel
+  checks, a body over `MAX_BODY`, a 404 — and those unread bytes were then
+  parsed as the *next* request on that connection. The client's following
+  request failed at the transport level: `NetworkError when attempting to fetch
+  resource` in Firefox, with nothing in the console's log to explain it, since
+  what it recorded was the refusal that caused it and nothing else.
+- The restore form was the sharpest case. It is the one POST carrying a
+  multi-kilobyte body, and `may_restore()` refuses before reading it — so a
+  restore refused for crossing plain HTTP broke the *poll after it* rather than
+  simply saying why it was refused.
+- An unread body is now taken off the socket before the connection is reused,
+  or the connection is not reused. A body too large to be worth reading says
+  `Connection: close` in the response rather than closing unannounced, and one
+  that was promised but never sent gives up after five seconds instead of
+  holding the thread. Nothing about a request that was answered normally
+  changes.
+
 ## 1.8 — 2026-09-09
 
 Credentials can be rotated, and the console says what they can do.
