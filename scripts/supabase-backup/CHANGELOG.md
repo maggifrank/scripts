@@ -7,6 +7,35 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.9 — 2026-10-12
+
+A registration that fails now says so, instead of blaming the helper.
+
+- The console answered a failed registration with **"No result came back. The
+  privileged helper may not be installed"** — for a request the helper had
+  picked up and run. Under `set -e`, any unguarded command that failed ended
+  `register` outright: a storage API that timed out, a `pg_dump` that was not
+  installed, a missing `supabase-backup-web` group. The request file was
+  already shredded by then, so the console had nothing left to read and said
+  the only thing it could. The advice it gave sent people to inspect a `.path`
+  unit that was working perfectly.
+- `register` now answers every request, including on the paths nobody meant to
+  take — a `set -e` abort, a kill, a systemd timeout. It is the guard `keys`
+  grew when encryption changes hung on "applying" for the same reason; the
+  other spool helpers never got it. The steps are kept in the result, so how
+  far a run got is visible without reading the journal first.
+- **A registration is now all or nothing.** It wrote the project's 0600 config
+  before enabling the timer, so a failure after that point left a project that
+  the console listed, that nothing backed up, and that could not be registered
+  again — the retry was refused for already existing, with no way to clear it
+  from the console. A run that does not finish now takes its own config back
+  out. The archive directory is removed with `rmdir`, so one a backup has
+  already written into is left alone.
+- **Not reaching the storage API is no longer reported as a rejected key.** A
+  timeout, a DNS failure or a refused connection leaves the HTTP code at 000;
+  calling that "the service key was rejected" sends someone to Supabase to
+  reissue a key that was always fine. Each now says which happened.
+
 ## 1.8 — 2026-09-09
 
 Credentials can be rotated, and the console says what they can do.
