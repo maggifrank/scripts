@@ -1272,6 +1272,9 @@ async function submitRegistration(form, submit, message, output) {
 
 function pollRegistration(id, form, submit, message, output) {
   clearTimeout(registerPoll);
+  // Long enough for everything the helper proves before it writes anything: a
+  // Postgres connection, two catalog queries, and a storage call capped at 20s.
+  const deadline = Date.now() + 60_000;
   const tick = async () => {
     let result;
     try {
@@ -1282,7 +1285,17 @@ function pollRegistration(id, form, submit, message, output) {
       submit.disabled = false;
       return;
     }
-    if (result.state === "pending") {
+    if (result.state === "pending" || result.state === "running") {
+      message.textContent = result.state === "running"
+        ? "applying…" : "waiting for the helper…";
+      registerPoll = setTimeout(tick, 1500);
+      return;
+    }
+    // An id with neither a request nor a result is the helper working between
+    // the two: it shreds the request before it starts, because the request
+    // holds a service key. That gap is not a missing helper - which is only
+    // what it means if it is still saying so when the time is up.
+    if (result.state === "unknown" && Date.now() < deadline) {
       registerPoll = setTimeout(tick, 1500);
       return;
     }
