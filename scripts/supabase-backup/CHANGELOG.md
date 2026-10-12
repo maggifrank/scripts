@@ -7,6 +7,30 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.10 — 2026-10-12
+
+The console stopped giving up on a registration while it was still being applied.
+
+- Registering a project reported **"No result came back. The privileged helper
+  may not be installed"** for a helper that was running at that moment, and
+  never looked again. `register` shreds the request before it starts work — it
+  holds a service key — so between that and the result being written the
+  console can see neither, calls it `unknown`, and treated that as final.
+  Proving a project's credentials is two round trips to Supabase, so the window
+  is two to seven seconds and the first poll lands inside it. The registration
+  itself carried on and often succeeded; what was broken was being told so.
+- `register` now claims the id the moment it takes the request, so there is
+  something to find from the first poll. `reconfigure` has always done this;
+  registration never did.
+- The page tolerates the gap as well, the way the settings and upgrade pages
+  already did: `unknown` means the helper is working until it has been saying
+  so for a minute. A request that nothing picks up still reads as `stalled`
+  after two minutes and names the `.path` unit to go and look at — which is the
+  case that "may not be installed" was written for, and the only one it now
+  appears in.
+- 1.9 made the helper answer on every path out of it. This makes the console
+  stay to hear the answer.
+
 ## 1.9 — 2026-10-12
 
 A registration that fails now says so, instead of blaming the helper.

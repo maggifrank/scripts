@@ -68,7 +68,9 @@ emit() {  # emit <id> <state> <error>
   chmod 0640 "${RES_DIR}/${id}.json.tmp"
   chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
   mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
-  EMITTED=1
+  # "running" claims the id, it does not answer it. Counting it as an answer
+  # would leave on_exit silent and the console polling a placeholder for ever.
+  [ "$state" = "running" ] || EMITTED=1
 }
 
 on_exit() {
@@ -106,6 +108,14 @@ process() {
   local body project database_url supabase_url service_key keep_days run_now
   body="$(cat "$file")" || { emit "$id" failed "could not read the request"; rm -f "$file"; return 0; }
   shred -u "$file" 2>/dev/null || rm -f "$file"
+
+  # The request is gone and there is no result yet. The console reads that gap
+  # - no request, no result - as "unknown", and reports it as a helper that was
+  # never installed, which is the one thing it cannot be: something shredded
+  # the request. The gap is seconds wide and proving the credentials is two
+  # round trips to Supabase, so it was wide enough to hit every time. Claim the
+  # id now and let the real result overwrite it, the way reconfigure does.
+  emit "$id" running ""
 
   project="$(jq -r '.project // empty'      <<<"$body")"
   database_url="$(jq -r '.database_url // empty' <<<"$body")"
