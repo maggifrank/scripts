@@ -25,7 +25,37 @@ RES_DIR="${SPOOL_DIR}/results"
 WEB_USER="${WEB_USER:-supabase-backup-web}"
 
 STEPS=()
+# The console polls for a result and shows "applying" until one appears, so a
+# request that is never answered does not read as a failure - it reads as a
+# helper that was never installed, which is what the page then says. These two
+# exist so that every path out of this script answers, including the ones that
+# were never meant to be taken.
+CURRENT_ID=""
+EMITTED=0
+
+# What this run has built so far, and what undoing it means. A registration is
+# all or nothing: a config left behind by a run that died is a project the
+# console lists, nothing backs up, and nobody can re-register - the next
+# attempt is refused for already existing.
+PARTIAL_CONF=""
+PARTIAL_DIR=""
+
 note() { STEPS+=("$1"); printf '  %s\n' "$1"; }
+
+undo_partial() {
+  local conf="$PARTIAL_CONF" dir="$PARTIAL_DIR"
+  PARTIAL_CONF=""; PARTIAL_DIR=""
+  # rmdir, not rm -r. If a backup has already written in there this is no
+  # longer a half-finished registration, and nothing here should be deleting
+  # archives; rmdir refuses and leaves it, which is the right answer.
+  [ -n "$dir" ] && rmdir "$dir" 2>/dev/null || true
+  [ -n "$conf" ] || return 0
+  rm -f "$conf"
+  note "removed the half-written config - nothing is registered, so this can be retried"
+  # Explicitly. This runs from the EXIT trap, where a non-zero return would
+  # abort the trap under set -e and lose the very result it exists to write.
+  return 0
+}
 
 emit() {  # emit <id> <state> <error>
   local id="$1" state="$2" error="${3:-}"
@@ -38,7 +68,25 @@ emit() {  # emit <id> <state> <error>
   chmod 0640 "${RES_DIR}/${id}.json.tmp"
   chgrp "$WEB_USER" "${RES_DIR}/${id}.json.tmp" 2>/dev/null || true
   mv -f "${RES_DIR}/${id}.json.tmp" "${RES_DIR}/${id}.json"
+  EMITTED=1
 }
+
+on_exit() {
+  # Anything that reached here having read a request and not answered it: a
+  # set -e abort, a kill, a systemd timeout. The journal has the detail; the
+  # console gets told the attempt is over and that nothing was left behind,
+  # which is the part it cannot work out for itself. The steps are kept - how
+  # far this got is the whole diagnosis.
+  [ -n "$CURRENT_ID" ] && [ "$EMITTED" = "0" ] || return 0
+  undo_partial
+  emit "$CURRENT_ID" failed "the helper stopped without finishing - journalctl -u supabase-backup-register has the reason"
+}
+trap on_exit EXIT
+# An untrapped TERM kills the shell without running the EXIT trap, and a
+# systemd timeout or `systemctl stop` is exactly a TERM - the case where the
+# console most needs telling. Exiting from the handler is what gets it there.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 ref_of() { sed -E 's|.*://(postgres\.)?([a-z0-9-]+)[.:/].*|\2|; s|/+$||' <<<"$1"; }
 
@@ -49,6 +97,9 @@ process() {
   local id
   id="$(basename "$file" .json)"
   [[ "$id" =~ ^[0-9a-f]{32}$ ]] || { rm -f "$file"; return 0; }
+  # From here on this request is answerable, so on_exit will answer it if
+  # nothing below does.
+  CURRENT_ID="$id"; EMITTED=0; PARTIAL_CONF=""; PARTIAL_DIR=""
 
   # Read the whole request, then destroy it. Everything after this point works
   # from memory, so a crash cannot leave a service key sitting in /run.
@@ -95,7 +146,9 @@ process() {
 
   local server_major client_major
   server_major=$(( server_ver / 10000 ))
-  client_major="$(pg_dump --version | awk '{print $3}' | cut -d. -f1)"
+  client_major="$(pg_dump --version 2>/dev/null | awk '{print $3}' | cut -d. -f1)" || true
+  [[ "$client_major" =~ ^[0-9]+$ ]] \
+    || { emit "$id" failed "pg_dump is not installed on this host - apt-get install postgresql-client"; return 0; }
   if [ "$client_major" -lt "$server_major" ]; then
     emit "$id" failed "pg_dump is ${client_major}, the server is ${server_major}; install a matching postgresql-client"
     return 0
@@ -116,16 +169,37 @@ process() {
     fi
   fi
 
-  local code
+  # curl's own exit status matters as much as the HTTP code it reports. A
+  # timeout or a DNS failure leaves the code at 000, and reading that as "the
+  # key was rejected" sends someone to Supabase to reissue a key that was
+  # always fine. Worse, before this was checked at all, a non-zero curl ended
+  # the whole script under `set -e` and the console was told the helper was
+  # not installed.
+  local code rc=0
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
         "${supabase_url}/storage/v1/bucket" \
-        -H "Authorization: Bearer ${service_key}" -H "apikey: ${service_key}")"
+        -H "Authorization: Bearer ${service_key}" -H "apikey: ${service_key}")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    local why="curl exit ${rc}"
+    case "$rc" in
+      6)     why="this host cannot resolve that name" ;;
+      7)     why="the connection was refused" ;;
+      28)    why="it did not answer within 20s" ;;
+      35|60) why="the TLS handshake failed" ;;
+      127)   why="curl is not installed on this host" ;;
+    esac
+    emit "$id" failed "could not reach ${supabase_url} to check the service key: ${why}. The key itself may be fine - nothing was registered, so this can be retried."
+    return 0
+  fi
   [ "$code" = "200" ] \
     || { emit "$id" failed "the service key was rejected by storage (HTTP ${code})"; return 0; }
   note "service key accepted by the storage API"
 
   # ── Write the config ──
   umask 077
+  # Claimed before the first byte, so a write that dies partway still leaves
+  # something undo_partial knows to remove.
+  PARTIAL_CONF="${CONF_DIR}/${project}.conf"
   cat > "${CONF_DIR}/${project}.conf" <<EOF
 # supabase-backup config for '${project}'
 # Registered from the web console. Contains a service key that bypasses RLS
@@ -141,11 +215,17 @@ EOF
 
   # Group-readable from the start, so the console can see this project's
   # archives without anyone re-running the setup script.
-  install -d -m 0750 -g "$WEB_USER" "${DATA_DIR}/${project}"
+  install -d -m 0750 -g "$WEB_USER" "${DATA_DIR}/${project}" 2>/dev/null \
+    || { undo_partial
+         emit "$id" failed "could not create ${DATA_DIR}/${project} - is there a '${WEB_USER}' group on this host?"
+         return 0; }
+  PARTIAL_DIR="${DATA_DIR}/${project}"
   note "created ${DATA_DIR}/${project}, readable by ${WEB_USER}"
 
   systemctl enable --now "supabase-backup@${project}.timer" >/dev/null 2>&1 \
-    || { emit "$id" failed "could not enable supabase-backup@${project}.timer"; return 0; }
+    || { undo_partial
+         emit "$id" failed "could not enable supabase-backup@${project}.timer - journalctl -u supabase-backup-register has the reason"
+         return 0; }
   note "nightly timer enabled"
 
   if [ "$run_now" = "true" ]; then
@@ -153,6 +233,9 @@ EOF
       && note "first backup started - watch it in the run history"
   fi
 
+  # Registered. What was partial is now the project, and undoing it is no
+  # longer this script's business.
+  PARTIAL_CONF=""; PARTIAL_DIR=""
   emit "$id" ok ""
 }
 
