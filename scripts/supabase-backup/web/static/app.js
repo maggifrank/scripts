@@ -748,7 +748,7 @@ function buildCredentialsForm(container, project) {
     "Only if it changed. It must still name the same project — a rotation cannot repoint a project at another one.",
     "text", "https://<ref>.supabase.co", uid));
   form.append(field("Service key", "service_key",
-    "Bypasses RLS. Prefer a key you can revoke on its own over the shared service_role key, so revoking it does not sign out your users.",
+    "The secret key (sb_secret_…) or a legacy service_role key — not the publishable one. Prefer a key you can revoke on its own over the shared service_role key, so revoking it does not sign out your users.",
     "password", "", uid));
 
   const bar = el("div", "bar");
@@ -1204,7 +1204,7 @@ function buildRegisterForm(host) {
     "text", "https://<ref>.supabase.co"));
 
   form.append(field("Service key", "service_key",
-    "Bypasses RLS. It is written to a root-owned 0600 config and the request holding it is shredded straight after.",
+    "The secret key (sb_secret_…) or a legacy service_role key — not the publishable one. It is written to a root-owned 0600 config and the request holding it is shredded straight after.",
     "password", ""));
 
   const row = el("div", "row");

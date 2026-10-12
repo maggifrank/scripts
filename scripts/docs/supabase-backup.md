@@ -348,6 +348,17 @@ can be killed the moment a host looks wrong, and nothing else notices.
 The backup uses it for exactly two calls: listing storage objects and
 downloading them. It needs nothing else.
 
+Either shape of key works. A current secret key (`sb_secret_…`) is not a JWT,
+and Supabase's API-keys guide says to send those on the `apikey` header only —
+*"because the keys aren't JWTs, anything that tries to verify one as a JWT
+fails"*. A legacy `service_role` key (`eyJ…`) is a JWT and goes on both headers.
+Everything here picks the headers from the key it was given, so neither needs
+saying in the config.
+
+What it will not take is the **publishable** key (`sb_publishable_…`), which is
+the browser's: it cannot bypass RLS and cannot list a bucket. Registration
+refuses it by name rather than letting it fail at the storage check.
+
 ### Rotate them
 
 `supabase-restore` aside, the console can rotate a project's credentials —
