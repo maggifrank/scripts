@@ -398,6 +398,16 @@ fi
 DB_REF="$(ref_of "$TARGET_DB_URL")"
 URL_REF="$(ref_of "$TARGET_SUPABASE_URL")"
 
+# Supabase's current secret keys (sb_secret_...) are not JWTs, and the API-keys
+# guide says to send publishable and secret keys on `apikey` rather than on
+# `Authorization: Bearer`, because anything that tries to verify one as a JWT
+# fails. A legacy service_role key is a JWT and still goes on both, so a
+# restore into a project that worked before works the same way.
+TARGET_AUTH=(-H "apikey: ${TARGET_SERVICE_KEY}")
+if [[ "$TARGET_SERVICE_KEY" == eyJ* ]]; then
+  TARGET_AUTH=(-H "Authorization: Bearer ${TARGET_SERVICE_KEY}" "${TARGET_AUTH[@]}")
+fi
+
 # ── 3. Guards ──────────────────────────────────────────────────────────────
 step "Safety checks"
 
@@ -471,7 +481,7 @@ if (( RESET )); then
         m="POST"; [[ -z "$act" ]] && m="DELETE"
         sc="$(curl -s -o /dev/null -w '%{http_code}' -X "$m" \
               "${TARGET_SUPABASE_URL%/}/storage/v1/bucket/${b}${act:+/$act}" \
-              -H "Authorization: Bearer ${TARGET_SERVICE_KEY}" -H "apikey: ${TARGET_SERVICE_KEY}")"
+              "${TARGET_AUTH[@]}")"
         [[ "$sc" == 200 || "$sc" == 404 ]] || die "bucket '$b': ${m} ${act:-delete} returned HTTP $sc"
       done
       ok "bucket '$b' emptied and removed"
@@ -654,8 +664,7 @@ if [[ -d "$WORK/files" ]]; then
     path="${rel#*/}"
     sc="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
           "${TARGET_SUPABASE_URL%/}/storage/v1/object/${bucket}/${path}" \
-          -H "Authorization: Bearer ${TARGET_SERVICE_KEY}" \
-          -H "apikey: ${TARGET_SERVICE_KEY}" \
+          "${TARGET_AUTH[@]}" \
           -H "x-upsert: true" \
           --data-binary "@${f}")"
     if [[ "$sc" == 200 ]]; then UP=$((UP+1)); else

@@ -132,6 +132,12 @@ process() {
   [[ "$supabase_url" =~ ^https://[a-z0-9-]+\.supabase\.(co|com)$ ]] \
     || { emit "$id" failed "project URL is not https://<ref>.supabase.co"; return 0; }
   [[ -n "$service_key" ]] || { emit "$id" failed "no service key"; return 0; }
+  # Supabase shows two keys on the same page and only one of them can do this.
+  # The publishable key is the browser's: it cannot bypass RLS and cannot list
+  # a bucket, so it fails at the storage check a few seconds later with an
+  # HTTP code instead of an explanation.
+  [[ "$service_key" == sb_publishable_* || "$service_key" == sbp_* ]] \
+    && { emit "$id" failed "that is the publishable key. A backup needs the secret key (sb_secret_...), which is the only one that can read every bucket and bypass RLS."; return 0; }
   [[ "$keep_days" =~ ^[0-9]+$ ]] || { emit "$id" failed "keep_days is not a number"; return 0; }
   [ -f "${CONF_DIR}/${project}.conf" ] \
     && { emit "$id" failed "a project named '${project}' is already configured"; return 0; }
@@ -185,11 +191,27 @@ process() {
   # always fine. Worse, before this was checked at all, a non-zero curl ended
   # the whole script under `set -e` and the console was told the helper was
   # not installed.
+  # Supabase's current secret keys (sb_secret_...) are not JWTs, and the
+  # API-keys guide is explicit: send publishable and secret keys on `apikey`,
+  # not on `Authorization: Bearer`, because anything that tries to verify one
+  # as a JWT fails. From storage that is an HTTP 400 naming neither the header
+  # nor the key. A legacy service_role key is a JWT and still goes on both.
+  local auth=(-H "apikey: ${service_key}")
+  if [[ "$service_key" == eyJ* ]]; then
+    auth=(-H "Authorization: Bearer ${service_key}" "${auth[@]}")
+  fi
+
+  # The body, not just the code. Storage says why in it - "Invalid JWT", "Bucket
+  # not found" - and an HTTP number on its own has sent people to reissue a key
+  # that was never the problem.
+  local body said
+  body="$(mktemp)"
+
   local code rc=0
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-        "${supabase_url}/storage/v1/bucket" \
-        -H "Authorization: Bearer ${service_key}" -H "apikey: ${service_key}")" || rc=$?
+  code="$(curl -s -o "$body" -w '%{http_code}' --max-time 20 \
+        "${supabase_url}/storage/v1/bucket" "${auth[@]}")" || rc=$?
   if [ "$rc" -ne 0 ]; then
+    rm -f "$body"
     local why="curl exit ${rc}"
     case "$rc" in
       6)     why="this host cannot resolve that name" ;;
@@ -201,8 +223,18 @@ process() {
     emit "$id" failed "could not reach ${supabase_url} to check the service key: ${why}. The key itself may be fine - nothing was registered, so this can be retried."
     return 0
   fi
-  [ "$code" = "200" ] \
-    || { emit "$id" failed "the service key was rejected by storage (HTTP ${code})"; return 0; }
+  if [ "$code" != "200" ]; then
+    said="$(jq -r '[.error? // empty, .message? // empty]
+                   | map(select(type == "string" and length > 0)) | unique | join(" - ")' \
+            < "$body" 2>/dev/null)" || said=""
+    [ -n "$said" ] || said="$(head -c 200 "$body" | tr -d '\n')"
+    # It should never be in there, but a body is not ours to vouch for.
+    said="${said//"$service_key"/<the key>}"
+    rm -f "$body"
+    emit "$id" failed "the service key was rejected by storage (HTTP ${code}${said:+: ${said}})"
+    return 0
+  fi
+  rm -f "$body"
   note "service key accepted by the storage API"
 
   # ── Write the config ──

@@ -173,11 +173,29 @@ psql "$DATABASE_URL" -q -v ON_ERROR_STOP=1 \
 # ── 5. Storage ─────────────────────────────────────────────────────────────
 BUCKETS="$(psql_q "select id from storage.buckets order by id")" || fail "could not list buckets"
 
+# Supabase's current secret keys (sb_secret_...) are not JWTs, and the API-keys
+# guide is explicit: send publishable and secret keys on `apikey`, not on
+# `Authorization: Bearer`, because anything that tries to verify one as a JWT
+# fails. From storage that failure is an HTTP 400 naming neither the header nor
+# the key. A legacy service_role key *is* a JWT and still goes on both, so a
+# project already being backed up here sees no change.
+case "$SUPABASE_SERVICE_KEY" in
+  eyJ*) KEY_IS_JWT=1 ;;
+  *)    KEY_IS_JWT=0 ;;
+esac
+
+storage_curl() {  # curl, with the auth headers this key is allowed to use
+  if [ "$KEY_IS_JWT" = "1" ]; then
+    curl -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+         -H "apikey: ${SUPABASE_SERVICE_KEY}" "$@"
+  else
+    curl -H "apikey: ${SUPABASE_SERVICE_KEY}" "$@"
+  fi
+}
+
 storage_list() {  # $1 bucket, $2 prefix, $3 offset
-  curl -fsS --max-time 60 \
+  storage_curl -fsS --max-time 60 \
     -X POST "${SUPABASE_URL%/}/storage/v1/object/list/$1" \
-    -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-    -H "apikey: ${SUPABASE_SERVICE_KEY}" \
     -H "Content-Type: application/json" \
     -d "$(jq -nc --arg p "$2" --argjson o "$3" --argjson l "$PAGE" \
           '{prefix:$p, limit:$l, offset:$o, sortBy:{column:"name",order:"asc"}}')"
@@ -246,10 +264,8 @@ for b in $BUCKETS; do
     [ -z "$path" ] && continue
     dest="$WORK/files/$b/$path"
     mkdir -p "$(dirname "$dest")"
-    curl -fsS --max-time 300 \
+    storage_curl -fsS --max-time 300 \
       "${SUPABASE_URL%/}/storage/v1/object/${b}/${path}" \
-      -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
-      -H "apikey: ${SUPABASE_SERVICE_KEY}" \
       -o "$dest" || fail "download failed: ${b}/${path}"
     [ -s "$dest" ] || fail "downloaded zero bytes: ${b}/${path}"
     printf '%s/%s\n' "$b" "$path" >> "$WORK/filelist.txt"

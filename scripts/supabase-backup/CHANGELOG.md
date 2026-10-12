@@ -7,6 +7,34 @@ message is the record, and the console shows those under "What's new".
 An entry per version, newest first. `release-check` refuses a `VERSION` with no
 entry, which is what keeps this file from drifting into fiction.
 
+## 1.11 — 2026-10-12
+
+Supabase's current API keys work, and a refusal from storage says what it said.
+
+- Registering a project with a current secret key (`sb_secret_…`) failed with
+  **"the service key was rejected by storage (HTTP 400)"**, for a key that was
+  perfectly good. These keys are not JWTs, and everything here sent them on
+  `Authorization: Bearer` as well as `apikey` — and, as Supabase's API-keys
+  guide puts it, *"because the keys aren't JWTs, anything that tries to verify
+  one as a JWT fails"*. The headers are now chosen by the shape of the key.
+  A legacy `service_role` key is a JWT and still goes on both, so a project
+  already being backed up is unaffected.
+- This was in every storage call, not only registration: `backup.sh`'s object
+  listing and downloads, credential rotation, and a restore's uploads into the
+  target project. A new project could be registered — if the check had passed —
+  and then fail nightly.
+- **A rejection now carries what storage said.** "HTTP 400" on its own is the
+  reason this took a day to find; `HTTP 400: Invalid JWT - jwt malformed` names
+  it outright. The body is reported for any non-200, with the key redacted out
+  of it if it should ever appear there.
+- **The publishable key is refused by name.** It is on the same dashboard page
+  as the secret key, it cannot bypass RLS and cannot list a bucket, and it
+  previously failed several seconds later as an HTTP code rather than an
+  explanation.
+- Credential rotation also no longer dies silently when the storage API is
+  unreachable — a timeout, a DNS failure or a refused connection is reported as
+  itself, the way registration's has been since 1.9.
+
 ## 1.10 — 2026-10-12
 
 The console stopped giving up on a registration while it was still being applied.
